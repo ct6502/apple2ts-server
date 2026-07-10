@@ -1,0 +1,16 @@
+{
+  "name": "apple2ts-cli",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24",
+    "npm": ">=11"
+  },
+  "scripts": {
+    "cli": "node index.mjs",
+    "cli:help": "node index.mjs --help"
+  },
+  "bin": {
+    "apple2ts-cli": "./index.mjs"
+  }
+}

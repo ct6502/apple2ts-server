@@ -1,0 +1,18 @@
+{
+  "name": "apple2ts-server",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Apple2TS integrated server and CLI",
+  "type": "module",
+  "engines": {
+    "node": ">=24",
+    "npm": ">=11"
+  },
+  "scripts": {
+    "start": "node scripts/start.mjs",
+    "start:force": "node scripts/start.mjs --allow-missing-dist",
+    "serve": "node server/server.mjs",
+    "cli": "node cli/index.mjs",
+    "cli:help": "node cli/index.mjs --help"
+  }
+}
