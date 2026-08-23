@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url"
 import test from "node:test"
 
 import { startApple2tsServer, stopApple2tsServer } from "../server/server.mjs"
+import { statusFixture } from "./fixtures/status_fixture.mjs"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(__dirname, "..")
@@ -14,30 +15,6 @@ const fakeChromium = path.join(__dirname, "fixtures", "fake_chromium.mjs")
 const token = "test-private-token"
 const controllerToken = "test-controller-token"
 const rendererId = "test-renderer"
-
-const statusFixture = {
-  machine: {
-    runMode: -2,
-    speedMode: 1,
-    machineName: "APPLE2EE",
-    ramWorksKb: 64,
-    isDebugging: true,
-    showDebugTab: false,
-    textPage: "READY",
-    machineState: {
-      PC: 768,
-      Accum: 65,
-      XReg: 1,
-      YReg: 2,
-      StackPtr: 255,
-      flagIRQ: 0,
-      flagNMI: false,
-      PStatus: 32,
-      cycleCount: 1234,
-    },
-  },
-  drives: [],
-}
 
 const postJson = (url, body) =>
   fetch(url, {
@@ -288,6 +265,7 @@ test("non-private server routes preserve legacy access", async (t) => {
 
   const health = await fetch(new URL("/api/health", listener.url))
   assert.equal(health.status, 200)
+  assert.deepEqual(await health.json(), { status: "ok" })
   const machine = await fetch(new URL("/api/machine", listener.url))
   assert.equal(machine.status, 503)
 })

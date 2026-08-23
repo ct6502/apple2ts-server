@@ -143,16 +143,6 @@ const writePrivateControllerError = (res) => {
   )
 }
 
-const getRendererIdentity = () => {
-  const client = getConnectedClient()
-  if (!client) return null
-  return {
-    serverInstanceId,
-    rendererId: client.rendererId || client.clientId,
-    targetId: `${serverInstanceId}:${client.rendererId || client.clientId}`,
-  }
-}
-
 const runModeToApiName = (runMode) => {
   switch (runMode) {
     case 0:
@@ -764,17 +754,7 @@ const server = createServer(async (req, res) => {
       setCorsHeaders(res)
       res.statusCode = 200
       res.setHeader("Content-Type", "application/json; charset=utf-8")
-      res.end(JSON.stringify({ status: "ok", serverInstanceId }))
-      return
-    }
-
-    if (req.method === "GET" && url.pathname === "/api/control/identity") {
-      const identity = getRendererIdentity()
-      if (!identity) {
-        writeNoConnectedClientError(res)
-        return
-      }
-      writeEnvelope(res, 200, identity)
+      res.end(JSON.stringify({ status: "ok" }))
       return
     }
 
@@ -786,11 +766,6 @@ const server = createServer(async (req, res) => {
       }
 
       if (privateRenderer?.clientId) {
-        const existing = clients.get(privateRenderer.clientId)
-        if (existing?.rendererId !== body.rendererId) {
-          writePrivateRendererError(res, 409, "This private server is already bound to another renderer.")
-          return
-        }
         writeJson(res, 200, { clientId: privateRenderer.clientId })
         return
       }

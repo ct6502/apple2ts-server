@@ -3,6 +3,8 @@
 import { readFileSync, writeFileSync } from "node:fs"
 import { writeFile } from "node:fs/promises"
 
+import { statusFixture } from "./status_fixture.mjs"
+
 const profileArgument = process.argv.find((argument) => argument.startsWith("--user-data-dir="))
 const launchArgument = process.argv.find((argument) => argument.startsWith("http://"))
 if (!profileArgument || !launchArgument) process.exit(64)
@@ -43,30 +45,6 @@ eventsUrl.searchParams.set("rendererId", rendererId)
 const eventsResponse = await fetch(eventsUrl)
 if (!eventsResponse.ok) process.exit(67)
 
-const status = {
-  machine: {
-    runMode: -2,
-    speedMode: 1,
-    machineName: "APPLE2EE",
-    ramWorksKb: 64,
-    isDebugging: true,
-    showDebugTab: false,
-    textPage: "READY",
-    machineState: {
-      PC: 768,
-      Accum: 65,
-      XReg: 1,
-      YReg: 2,
-      StackPtr: 255,
-      flagIRQ: 0,
-      flagNMI: false,
-      PStatus: 32,
-      cycleCount: 1234,
-    },
-  },
-  drives: [],
-}
-
 const reader = eventsResponse.body.getReader()
 const decoder = new TextDecoder()
 let buffer = ""
@@ -105,7 +83,7 @@ while (!stopping) {
       rendererId,
       commandId: command.commandId,
       ok: command.action === "getStatus",
-      result: status,
+      result: statusFixture,
       error: command.action === "getStatus" ? undefined : "Unsupported fake command",
     })
     if (!reply.ok) process.exit(68)

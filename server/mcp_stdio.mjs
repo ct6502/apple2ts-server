@@ -51,18 +51,16 @@ const fetchEnvelope = async (baseUrl, pathname, controllerToken, signal) => {
 }
 
 export class Apple2tsObservationCore {
-  constructor(baseUrl, controllerToken, signal = new AbortController().signal) {
+  constructor(baseUrl, controllerToken, identity, signal = new AbortController().signal) {
     this.baseUrl = baseUrl
     this.controllerToken = controllerToken
+    this.identity = identity
     this.signal = signal
   }
 
   async read(pathname) {
-    const [identity, state] = await Promise.all([
-      fetchEnvelope(this.baseUrl, "/api/control/identity", this.controllerToken, this.signal),
-      fetchEnvelope(this.baseUrl, pathname, this.controllerToken, this.signal),
-    ])
-    return { emulator: identity, state }
+    const state = await fetchEnvelope(this.baseUrl, pathname, this.controllerToken, this.signal)
+    return { emulator: this.identity, state }
   }
 
   readMachine() {
@@ -291,7 +289,16 @@ export const runStdio = async (options = {}) => {
       logger: { log: (message) => process.stderr.write(`${message}\n`) },
     })
     const listener = await listenerPromise
-    const core = new Apple2tsObservationCore(listener.url, controllerToken, shutdownController.signal)
+    const core = new Apple2tsObservationCore(
+      listener.url,
+      controllerToken,
+      {
+        serverInstanceId: listener.serverInstanceId,
+        rendererId,
+        targetId: `${listener.serverInstanceId}:${rendererId}`,
+      },
+      shutdownController.signal,
+    )
     rendererPromise = launchChromium({
       executable: options.chromiumExecutable,
       bridgeUrl: listener.url,
