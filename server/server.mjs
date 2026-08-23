@@ -117,6 +117,32 @@ const writePrivateRendererError = (res, statusCode, message) => {
   writeErrorEnvelope(res, statusCode, "RENDERER_BINDING_REJECTED", message)
 }
 
+const rendererApiPaths = new Set([
+  "/api/client/connect",
+  "/api/client/events",
+  "/api/client/state",
+  "/api/client/reply",
+])
+
+const isPrivateControllerPath = (pathname) =>
+  privateRenderer &&
+  ((pathname.startsWith("/api/") && !rendererApiPaths.has(pathname)) ||
+    pathname === "/openapi.json" ||
+    pathname === "/docs" ||
+    pathname === "/docs/")
+
+const controllerRequestMatches = (req) =>
+  !privateRenderer || req.headers.authorization === `Bearer ${privateRenderer.controllerToken}`
+
+const writePrivateControllerError = (res) => {
+  writeErrorEnvelope(
+    res,
+    401,
+    "CONTROLLER_AUTH_REQUIRED",
+    "This private controller route requires the process-scoped controller token.",
+  )
+}
+
 const getRendererIdentity = () => {
   const client = getConnectedClient()
   if (!client) return null
@@ -726,6 +752,11 @@ const server = createServer(async (req, res) => {
   }
 
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`)
+
+  if (isPrivateControllerPath(url.pathname) && !controllerRequestMatches(req)) {
+    writePrivateControllerError(res)
+    return
+  }
 
   try {
     // Health check endpoint
@@ -1683,10 +1714,19 @@ export const startApple2tsServer = async (options = {}) => {
   commandTimeoutMs = Number(options.commandTimeoutMs ?? process.env.COMMAND_TIMEOUT_MS ?? 10000)
   serverInstanceId = options.serverInstanceId || randomUUID()
   logger = options.logger || console
+  if (
+    options.privateRenderer &&
+    (!options.privateRenderer.remoteControlToken ||
+      !options.privateRenderer.rendererId ||
+      !options.privateRenderer.controllerToken)
+  ) {
+    throw new Error("Private renderer mode requires renderer, remote-control, and controller identities")
+  }
   privateRenderer = options.privateRenderer
     ? {
         remoteControlToken: String(options.privateRenderer.remoteControlToken),
         rendererId: String(options.privateRenderer.rendererId),
+        controllerToken: String(options.privateRenderer.controllerToken),
         clientId: null,
       }
     : null

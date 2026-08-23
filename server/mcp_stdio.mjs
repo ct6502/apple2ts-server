@@ -37,8 +37,9 @@ const sleep = (milliseconds, signal) =>
     signal.addEventListener("abort", onAbort, { once: true })
   })
 
-const fetchEnvelope = async (baseUrl, pathname, signal) => {
+const fetchEnvelope = async (baseUrl, pathname, controllerToken, signal) => {
   const response = await fetch(new URL(pathname, baseUrl), {
+    headers: { Authorization: `Bearer ${controllerToken}` },
     signal: AbortSignal.any([signal, AbortSignal.timeout(2000)]),
   })
   const payload = await response.json().catch(() => null)
@@ -50,15 +51,16 @@ const fetchEnvelope = async (baseUrl, pathname, signal) => {
 }
 
 export class Apple2tsObservationCore {
-  constructor(baseUrl, signal = new AbortController().signal) {
+  constructor(baseUrl, controllerToken, signal = new AbortController().signal) {
     this.baseUrl = baseUrl
+    this.controllerToken = controllerToken
     this.signal = signal
   }
 
   async read(pathname) {
     const [identity, state] = await Promise.all([
-      fetchEnvelope(this.baseUrl, "/api/control/identity", this.signal),
-      fetchEnvelope(this.baseUrl, pathname, this.signal),
+      fetchEnvelope(this.baseUrl, "/api/control/identity", this.controllerToken, this.signal),
+      fetchEnvelope(this.baseUrl, pathname, this.controllerToken, this.signal),
     ])
     return { emulator: identity, state }
   }
@@ -238,6 +240,7 @@ const launchChromium = async ({ executable, bridgeUrl, remoteControlToken, rende
 export const runStdio = async (options = {}) => {
   const shutdownController = new AbortController()
   const remoteControlToken = options.remoteControlToken || randomBytes(32).toString("base64url")
+  const controllerToken = options.controllerToken || randomBytes(32).toString("base64url")
   const rendererId = options.rendererId || randomUUID()
   const startupTimeoutMs = Number(options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS)
   let stdioHandle = null
@@ -284,11 +287,11 @@ export const runStdio = async (options = {}) => {
     listenerPromise = startApple2tsServer({
       host: "127.0.0.1",
       port: Number(options.port ?? 0),
-      privateRenderer: { remoteControlToken, rendererId },
+      privateRenderer: { remoteControlToken, rendererId, controllerToken },
       logger: { log: (message) => process.stderr.write(`${message}\n`) },
     })
     const listener = await listenerPromise
-    const core = new Apple2tsObservationCore(listener.url, shutdownController.signal)
+    const core = new Apple2tsObservationCore(listener.url, controllerToken, shutdownController.signal)
     rendererPromise = launchChromium({
       executable: options.chromiumExecutable,
       bridgeUrl: listener.url,
@@ -306,6 +309,13 @@ export const runStdio = async (options = {}) => {
       throw new Error(`Owned Chromium exited before readiness (${ownedRenderer.describeExit(startup.outcome)})`)
     }
     if (shutdownController.signal.aborted) return
+
+    void ownedRenderer.exited.then((outcome) => {
+      if (stopping) return
+      process.stderr.write(`Apple2TS MCP renderer exited unexpectedly (${ownedRenderer.describeExit(outcome)}).\n`)
+      process.exitCode = 1
+      void shutdown("Owned Chromium exited unexpectedly").catch(reportFatal)
+    })
 
     stdioHandle = serveStdio(() => createMcpServer(core), {
       onerror: (error) => process.stderr.write(`Apple2TS MCP protocol error: ${error.message}\n`),

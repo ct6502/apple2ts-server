@@ -12,6 +12,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(__dirname, "..")
 const fakeChromium = path.join(__dirname, "fixtures", "fake_chromium.mjs")
 const token = "test-private-token"
+const controllerToken = "test-controller-token"
 const rendererId = "test-renderer"
 
 const statusFixture = {
@@ -236,7 +237,7 @@ const assertClosed = async (url) => {
 test("private bridge binds one renderer and rejects forged replies", async (t) => {
   const listener = await startApple2tsServer({
     port: 0,
-    privateRenderer: { remoteControlToken: token, rendererId },
+    privateRenderer: { remoteControlToken: token, rendererId, controllerToken },
     logger: { log() {} },
   })
   t.after(stopApple2tsServer)
@@ -263,7 +264,15 @@ test("private bridge binds one renderer and rejects forged replies", async (t) =
   const duplicateEvents = await fetch(duplicateEventsUrl)
   assert.equal(duplicateEvents.status, 409)
 
-  const machineRequest = fetch(new URL("/api/machine", listener.url))
+  const unauthenticatedRead = await fetch(new URL("/api/machine", listener.url))
+  assert.equal(unauthenticatedRead.status, 401)
+  assert.equal(unauthenticatedRead.headers.get("access-control-allow-headers"), "Content-Type")
+  const unauthenticatedMutation = await fetch(new URL("/api/machine/pause", listener.url), { method: "POST" })
+  assert.equal(unauthenticatedMutation.status, 401)
+
+  const machineRequest = fetch(new URL("/api/machine", listener.url), {
+    headers: { Authorization: `Bearer ${controllerToken}` },
+  })
   const command = await renderer.nextCommand()
   const forged = await renderer.reply(command, { remoteControlToken: "wrong" })
   assert.equal(forged.status, 403)
@@ -271,6 +280,16 @@ test("private bridge binds one renderer and rejects forged replies", async (t) =
   assert.equal(accepted.status, 200)
   const machine = await machineRequest.then((response) => response.json())
   assert.equal(machine.data.machineName, "APPLE2EE")
+})
+
+test("non-private server routes preserve legacy access", async (t) => {
+  const listener = await startApple2tsServer({ port: 0, logger: { log() {} } })
+  t.after(stopApple2tsServer)
+
+  const health = await fetch(new URL("/api/health", listener.url))
+  assert.equal(health.status, 200)
+  const machine = await fetch(new URL("/api/machine", listener.url))
+  assert.equal(machine.status, 503)
 })
 
 test("stdio discovery and reads use one renderer and EOF cleans up", async () => {
@@ -284,6 +303,7 @@ test("stdio discovery and reads use one renderer and EOF cleans up", async () =>
   assert.equal(launchUrl.searchParams.get("remoteControl"), "1")
   assert.equal(launchUrl.searchParams.get("remoteControlToken"), token)
   assert.equal(launchUrl.searchParams.get("rendererId"), rendererId)
+  assert.equal(launchUrl.searchParams.get("controllerToken"), null)
   assert.doesNotThrow(() => process.kill(receipt.pid, 0))
   await access(receipt.profilePath)
 
@@ -323,6 +343,24 @@ test("stdio discovery and reads use one renderer and EOF cleans up", async () =>
   await assert.rejects(access(receipt.profilePath))
   await assertClosed(bridgeUrl)
   await processState.cleanup()
+})
+
+test("unexpected renderer exit closes stdio and owned resources", async () => {
+  const crashed = await launchMcp({ APPLE2TS_FAKE_CHROMIUM_MODE: "crash-after-ready" })
+  const bridgeLine = await crashed.waitForStderr((line) => line.includes("private bridge listening"))
+  const bridgeUrl = parseBridgeUrl(bridgeLine)
+  await crashed.waitForStderr((line) => line.includes("MCP ready"))
+  const receipt = await crashed.readReceipt()
+  const outcome = await crashed.waitForExit()
+
+  assert.equal(outcome.error, null)
+  assert.equal(outcome.code, 1)
+  assert.match(crashed.getStderr(), /renderer exited unexpectedly \(exit code 43\)/)
+  assert.equal(crashed.getStdout(), "")
+  assert.throws(() => process.kill(receipt.pid, 0), { code: "ESRCH" })
+  await assert.rejects(access(receipt.profilePath))
+  await assertClosed(bridgeUrl)
+  await crashed.cleanup()
 })
 
 test("SIGTERM and startup timeout release the private listener", async () => {

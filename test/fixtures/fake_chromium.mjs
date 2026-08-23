@@ -71,6 +71,7 @@ const reader = eventsResponse.body.getReader()
 const decoder = new TextDecoder()
 let buffer = ""
 let stopping = false
+let statusReplies = 0
 
 const stop = () => {
   if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "ignore-term") {
@@ -108,5 +109,11 @@ while (!stopping) {
       error: command.action === "getStatus" ? undefined : "Unsupported fake command",
     })
     if (!reply.ok) process.exit(68)
+    if (command.action === "getStatus") {
+      statusReplies += 1
+      if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "crash-after-ready" && statusReplies >= 2) {
+        setTimeout(() => process.exit(43), 50)
+      }
+    }
   }
 }
