@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { readFileSync, writeFileSync } from "node:fs"
 import { writeFile } from "node:fs/promises"
 
 const profileArgument = process.argv.find((argument) => argument.startsWith("--user-data-dir="))
@@ -72,6 +73,13 @@ let buffer = ""
 let stopping = false
 
 const stop = () => {
+  if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "ignore-term") {
+    if (receiptPath) {
+      const receipt = JSON.parse(readFileSync(receiptPath, "utf8"))
+      writeFileSync(receiptPath, JSON.stringify({ ...receipt, sigtermSeen: true }))
+    }
+    return
+  }
   stopping = true
   void reader.cancel().finally(() => process.exit(0))
 }

@@ -167,9 +167,16 @@ const launchChromium = async ({ executable, bridgeUrl, remoteControlToken, rende
     childStderr += chunk.slice(0, CHILD_STDERR_LIMIT - childStderr.length)
   })
 
+  let childError = null
+  child.once("error", (error) => {
+    childError = error
+  })
   const exited = new Promise((resolve) => {
-    child.once("error", (error) => resolve({ error, code: null, signal: null }))
-    child.once("exit", (code, signal) => resolve({ error: null, code, signal }))
+    child.once("close", (code, signal) => resolve({ error: childError, code, signal }))
+  })
+  let exitOutcome = null
+  void exited.then((outcome) => {
+    exitOutcome = outcome
   })
   let stopped = false
 
@@ -180,23 +187,38 @@ const launchChromium = async ({ executable, bridgeUrl, remoteControlToken, rende
       if (stopped) return
       stopped = true
       let failure = null
+      let exitConfirmed = exitOutcome !== null
       try {
-        if (child.exitCode === null && child.signalCode === null) {
+        if (!exitConfirmed && (child.exitCode !== null || child.signalCode !== null)) {
+          exitConfirmed = await waitFor(exited, BROWSER_EXIT_TIMEOUT_MS)
+        }
+        if (!exitConfirmed && child.exitCode === null && child.signalCode === null) {
           child.kill("SIGTERM")
-          if (!(await waitFor(exited, BROWSER_EXIT_TIMEOUT_MS))) {
+          exitConfirmed = await waitFor(exited, BROWSER_EXIT_TIMEOUT_MS)
+          if (!exitConfirmed) {
             child.kill("SIGKILL")
-            if (!(await waitFor(exited, BROWSER_EXIT_TIMEOUT_MS))) {
-              failure = new Error("Owned Chromium did not exit after SIGTERM and SIGKILL")
+            exitConfirmed = await waitFor(exited, BROWSER_EXIT_TIMEOUT_MS)
+            if (!exitConfirmed) {
+              failure = new Error(
+                `Owned Chromium did not exit after SIGTERM and SIGKILL; retained profile ${profilePath}`,
+              )
             }
           }
         }
-        const outcome = await exited
-        if (outcome.error && !failure) failure = outcome.error
+        if (exitConfirmed) {
+          const outcome = exitOutcome || await exited
+          if (outcome.error && !failure) failure = outcome.error
+        } else {
+          child.stderr.destroy()
+          child.unref()
+        }
       } finally {
-        try {
-          await rm(profilePath, { recursive: true, force: true })
-        } catch (error) {
-          if (!failure) failure = error
+        if (exitConfirmed) {
+          try {
+            await rm(profilePath, { recursive: true, force: true })
+          } catch (error) {
+            if (!failure) failure = error
+          }
         }
       }
       if (failure) throw failure
@@ -294,7 +316,7 @@ export const runStdio = async (options = {}) => {
       process.stderr.write(`Apple2TS MCP startup failed: ${error instanceof Error ? error.message : String(error)}\n`)
       process.exitCode = 1
     }
-    await shutdown("Startup ended")
+    await shutdown("Startup ended").catch(reportFatal)
   }
 }
 
