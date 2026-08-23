@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
-import { once } from "node:events"
+import { access, mkdtemp, readFile, rm } from "node:fs/promises"
+import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import test from "node:test"
@@ -9,6 +10,7 @@ import { startApple2tsServer, stopApple2tsServer } from "../server/server.mjs"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(__dirname, "..")
+const fakeChromium = path.join(__dirname, "fixtures", "fake_chromium.mjs")
 const token = "test-private-token"
 const rendererId = "test-renderer"
 
@@ -136,20 +138,25 @@ const connectFakeRenderer = async (baseUrl, options = {}) => {
   }
 }
 
-const waitForLine = (stream, predicate, timeoutMs = 5000) =>
+const waitForLine = (stream, predicate, timeoutMs = 5000, getHistory = () => "") =>
   new Promise((resolve, reject) => {
     let buffer = ""
     const timeout = setTimeout(() => finish(new Error("Timed out waiting for process output")), timeoutMs)
+    const inspect = (text) => {
+      for (const line of text.split("\n")) {
+        if (!line) continue
+        if (predicate(line)) {
+          finish(null, line)
+          return true
+        }
+      }
+      return false
+    }
     const onData = (chunk) => {
       buffer += chunk.toString("utf8")
       const lines = buffer.split("\n")
       buffer = lines.pop()
-      for (const line of lines) {
-        if (predicate(line)) {
-          finish(null, line)
-          return
-        }
-      }
+      inspect(lines.join("\n"))
     }
     const finish = (error, value) => {
       clearTimeout(timeout)
@@ -158,9 +165,12 @@ const waitForLine = (stream, predicate, timeoutMs = 5000) =>
       else resolve(value)
     }
     stream.on("data", onData)
+    inspect(getHistory())
   })
 
-const launchMcp = (overrides = {}) => {
+const launchMcp = async (overrides = {}) => {
+  const testRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-mcp-test-"))
+  const receiptPath = path.join(testRoot, "chromium.json")
   const child = spawn(process.execPath, ["server/mcp_stdio.mjs"], {
     cwd: repoRoot,
     stdio: ["pipe", "pipe", "pipe"],
@@ -170,14 +180,47 @@ const launchMcp = (overrides = {}) => {
       APPLE2TS_REMOTE_CONTROL_TOKEN: token,
       APPLE2TS_RENDERER_ID: rendererId,
       APPLE2TS_STARTUP_TIMEOUT_MS: "3000",
+      APPLE2TS_CHROMIUM_EXECUTABLE: fakeChromium,
+      APPLE2TS_FAKE_CHROMIUM_RECEIPT: receiptPath,
       ...overrides,
     },
+  })
+  const exitPromise = new Promise((resolve) => {
+    let settled = false
+    const settle = (outcome) => {
+      if (settled) return
+      settled = true
+      resolve(outcome)
+    }
+    child.once("error", (error) => settle({ code: null, signal: null, error }))
+    child.once("exit", (code, signal) => settle({ code, signal, error: null }))
   })
   let stdout = ""
   let stderr = ""
   child.stdout.on("data", (chunk) => (stdout += chunk.toString("utf8")))
   child.stderr.on("data", (chunk) => (stderr += chunk.toString("utf8")))
-  return { child, getStdout: () => stdout, getStderr: () => stderr }
+  const readReceipt = async () => {
+    const deadline = Date.now() + 2000
+    while (Date.now() < deadline) {
+      try {
+        return JSON.parse(await readFile(receiptPath, "utf8"))
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+    }
+    throw new Error("Timed out waiting for fake Chromium launch receipt")
+  }
+  return {
+    child,
+    getStdout: () => stdout,
+    getStderr: () => stderr,
+    waitForStdout: (predicate, timeoutMs) => waitForLine(child.stdout, predicate, timeoutMs, () => stdout),
+    waitForStderr: (predicate, timeoutMs) => waitForLine(child.stderr, predicate, timeoutMs, () => stderr),
+    waitForExit: () => exitPromise,
+    readReceipt,
+    cleanup: () => rm(testRoot, { recursive: true, force: true }),
+  }
 }
 
 const parseBridgeUrl = (line) => {
@@ -231,11 +274,18 @@ test("private bridge binds one renderer and rejects forged replies", async (t) =
 })
 
 test("stdio discovery and reads use one renderer and EOF cleans up", async () => {
-  const processState = launchMcp()
-  const bridgeLine = await waitForLine(processState.child.stderr, (line) => line.includes("private bridge listening"))
+  const processState = await launchMcp()
+  const bridgeLine = await processState.waitForStderr((line) => line.includes("private bridge listening"))
   const bridgeUrl = parseBridgeUrl(bridgeLine)
-  const renderer = await connectFakeRenderer(bridgeUrl)
-  await waitForLine(processState.child.stderr, (line) => line.includes("MCP ready"))
+  await processState.waitForStderr((line) => line.includes("MCP ready"))
+  const receipt = await processState.readReceipt()
+  const launchUrl = new URL(receipt.launchUrl)
+  assert.equal(launchUrl.origin, bridgeUrl)
+  assert.equal(launchUrl.searchParams.get("remoteControl"), "1")
+  assert.equal(launchUrl.searchParams.get("remoteControlToken"), token)
+  assert.equal(launchUrl.searchParams.get("rendererId"), rendererId)
+  assert.doesNotThrow(() => process.kill(receipt.pid, 0))
+  await access(receipt.profilePath)
 
   processState.child.stdin.write(`${JSON.stringify({
     jsonrpc: "2.0",
@@ -247,10 +297,10 @@ test("stdio discovery and reads use one renderer and EOF cleans up", async () =>
       clientInfo: { name: "test", version: "1" },
     },
   })}\n`)
-  await waitForLine(processState.child.stdout, (line) => JSON.parse(line).id === 1)
+  await processState.waitForStdout((line) => JSON.parse(line).id === 1)
   processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`)
   processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/list" })}\n`)
-  const listed = JSON.parse(await waitForLine(processState.child.stdout, (line) => JSON.parse(line).id === 2))
+  const listed = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 2))
   assert.deepEqual(listed.result.resources.map((resource) => resource.uri), ["apple2ts://machine", "apple2ts://cpu"])
 
   processState.child.stdin.write(`${JSON.stringify({
@@ -259,25 +309,28 @@ test("stdio discovery and reads use one renderer and EOF cleans up", async () =>
     method: "resources/read",
     params: { uri: "apple2ts://cpu" },
   })}\n`)
-  const read = JSON.parse(await waitForLine(processState.child.stdout, (line) => JSON.parse(line).id === 3))
+  const read = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 3))
   const payload = JSON.parse(read.result.contents[0].text)
   assert.equal(payload.emulator.rendererId, rendererId)
   assert.equal(payload.state.PC, 768)
 
   processState.child.stdin.end()
-  const [exitCode] = await once(processState.child, "exit")
-  assert.equal(exitCode, 0, processState.getStderr())
+  const processExit = await processState.waitForExit()
+  assert.equal(processExit.error, null)
+  assert.equal(processExit.code, 0, processState.getStderr())
   for (const line of processState.getStdout().trim().split("\n")) assert.doesNotThrow(() => JSON.parse(line))
-  await renderer.stop()
+  assert.throws(() => process.kill(receipt.pid, 0), { code: "ESRCH" })
+  await assert.rejects(access(receipt.profilePath))
   await assertClosed(bridgeUrl)
+  await processState.cleanup()
 })
 
 test("SIGTERM and startup timeout release the private listener", async () => {
-  const running = launchMcp()
-  const bridgeLine = await waitForLine(running.child.stderr, (line) => line.includes("private bridge listening"))
+  const running = await launchMcp()
+  const bridgeLine = await running.waitForStderr((line) => line.includes("private bridge listening"))
   const bridgeUrl = parseBridgeUrl(bridgeLine)
-  const renderer = await connectFakeRenderer(bridgeUrl)
-  await waitForLine(running.child.stderr, (line) => line.includes("MCP ready"))
+  await running.waitForStderr((line) => line.includes("MCP ready"))
+  const runningReceipt = await running.readReceipt()
   running.child.stdin.write(`${JSON.stringify({
     jsonrpc: "2.0",
     id: "discover-1",
@@ -291,22 +344,30 @@ test("SIGTERM and startup timeout release the private listener", async () => {
     },
   })}\n`)
   const discovery = JSON.parse(
-    await waitForLine(running.child.stdout, (line) => JSON.parse(line).id === "discover-1"),
+    await running.waitForStdout((line) => JSON.parse(line).id === "discover-1"),
   )
   assert.deepEqual(discovery.result.supportedVersions, ["2026-07-28"])
   assert.ok(discovery.result.capabilities.resources)
   running.child.kill("SIGTERM")
-  const [signalExitCode] = await once(running.child, "exit")
-  assert.equal(signalExitCode, 0, running.getStderr())
-  await renderer.stop()
+  const signalExit = await running.waitForExit()
+  assert.equal(signalExit.error, null)
+  assert.equal(signalExit.code, 0, running.getStderr())
+  assert.throws(() => process.kill(runningReceipt.pid, 0), { code: "ESRCH" })
+  await assert.rejects(access(runningReceipt.profilePath))
   await assertClosed(bridgeUrl)
+  await running.cleanup()
 
-  const failing = launchMcp({ APPLE2TS_STARTUP_TIMEOUT_MS: "100" })
-  const failingBridgeLine = await waitForLine(failing.child.stderr, (line) => line.includes("private bridge listening"))
+  const failing = await launchMcp({ APPLE2TS_FAKE_CHROMIUM_MODE: "exit" })
+  const failingBridgeLine = await failing.waitForStderr((line) => line.includes("private bridge listening"))
   const failingUrl = parseBridgeUrl(failingBridgeLine)
-  const [failureExitCode] = await once(failing.child, "exit")
-  assert.equal(failureExitCode, 1)
-  assert.match(failing.getStderr(), /startup failed: Timed out/)
+  const failingReceipt = await failing.readReceipt()
+  const failureExit = await failing.waitForExit()
+  assert.equal(failureExit.error, null)
+  assert.equal(failureExit.code, 1)
+  assert.match(failing.getStderr(), /startup failed: Owned Chromium exited before readiness/)
   assert.equal(failing.getStdout(), "")
+  assert.throws(() => process.kill(failingReceipt.pid, 0), { code: "ESRCH" })
+  await assert.rejects(access(failingReceipt.profilePath))
   await assertClosed(failingUrl)
+  await failing.cleanup()
 })

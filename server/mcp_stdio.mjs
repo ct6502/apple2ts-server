@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 
 import { randomBytes, randomUUID } from "node:crypto"
+import { spawn } from "node:child_process"
+import { constants as fsConstants } from "node:fs"
+import { access, mkdtemp, rm } from "node:fs/promises"
+import os from "node:os"
 import path from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 
@@ -12,6 +16,8 @@ import { startApple2tsServer, stopApple2tsServer } from "./server.mjs"
 const SERVER_NAME = "apple2ts"
 const SERVER_VERSION = "0.1.0"
 const DEFAULT_STARTUP_TIMEOUT_MS = 10000
+const BROWSER_EXIT_TIMEOUT_MS = 2000
+const CHILD_STDERR_LIMIT = 8192
 
 const sleep = (milliseconds, signal) =>
   new Promise((resolve, reject) => {
@@ -116,6 +122,97 @@ const waitForRenderer = async (core, timeoutMs, signal) => {
   throw new Error(`Timed out waiting for the private renderer: ${lastError.message}`)
 }
 
+const waitFor = (promise, timeoutMs) =>
+  new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve(false), timeoutMs)
+    promise.then(() => {
+      clearTimeout(timeout)
+      resolve(true)
+    })
+  })
+
+const launchChromium = async ({ executable, bridgeUrl, remoteControlToken, rendererId }) => {
+  if (!executable) throw new Error("APPLE2TS_CHROMIUM_EXECUTABLE is required")
+  await access(executable, fsConstants.X_OK)
+
+  const profilePath = await mkdtemp(path.join(os.tmpdir(), "apple2ts-mcp-chromium-"))
+  const launchUrl = new URL("/", bridgeUrl)
+  launchUrl.searchParams.set("remoteControl", "1")
+  launchUrl.searchParams.set("remoteControlToken", remoteControlToken)
+  launchUrl.searchParams.set("rendererId", rendererId)
+
+  let child
+  try {
+    child = spawn(
+      executable,
+      [
+        "--headless=new",
+        "--disable-background-networking",
+        "--no-default-browser-check",
+        "--no-first-run",
+        `--user-data-dir=${profilePath}`,
+        launchUrl.href,
+      ],
+      { stdio: ["ignore", "ignore", "pipe"] },
+    )
+  } catch (error) {
+    await rm(profilePath, { recursive: true, force: true })
+    throw error
+  }
+
+  let childStderr = ""
+  child.stderr.setEncoding("utf8")
+  child.stderr.on("data", (chunk) => {
+    if (childStderr.length >= CHILD_STDERR_LIMIT) return
+    childStderr += chunk.slice(0, CHILD_STDERR_LIMIT - childStderr.length)
+  })
+
+  const exited = new Promise((resolve) => {
+    child.once("error", (error) => resolve({ error, code: null, signal: null }))
+    child.once("exit", (code, signal) => resolve({ error: null, code, signal }))
+  })
+  let stopped = false
+
+  return {
+    profilePath,
+    exited,
+    async stop() {
+      if (stopped) return
+      stopped = true
+      let failure = null
+      try {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGTERM")
+          if (!(await waitFor(exited, BROWSER_EXIT_TIMEOUT_MS))) {
+            child.kill("SIGKILL")
+            if (!(await waitFor(exited, BROWSER_EXIT_TIMEOUT_MS))) {
+              failure = new Error("Owned Chromium did not exit after SIGTERM and SIGKILL")
+            }
+          }
+        }
+        const outcome = await exited
+        if (outcome.error && !failure) failure = outcome.error
+      } finally {
+        try {
+          await rm(profilePath, { recursive: true, force: true })
+        } catch (error) {
+          if (!failure) failure = error
+        }
+      }
+      if (failure) throw failure
+    },
+    describeExit(outcome) {
+      const detail = outcome.error
+        ? outcome.error.message
+        : outcome.signal
+          ? `signal ${outcome.signal}`
+          : `exit code ${outcome.code}`
+      const stderrDetail = childStderr.trim() ? `: ${childStderr.trim()}` : ""
+      return `${detail}${stderrDetail}`
+    },
+  }
+}
+
 export const runStdio = async (options = {}) => {
   const shutdownController = new AbortController()
   const remoteControlToken = options.remoteControlToken || randomBytes(32).toString("base64url")
@@ -123,15 +220,26 @@ export const runStdio = async (options = {}) => {
   const startupTimeoutMs = Number(options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS)
   let stdioHandle = null
   let listenerPromise = Promise.resolve()
+  let rendererPromise = Promise.resolve(null)
+  let ownedRenderer = null
   let stopping = null
 
   const shutdown = (reason) => {
     if (stopping) return stopping
     stopping = (async () => {
+      const failures = []
       shutdownController.abort(new Error(reason))
       await listenerPromise.catch(() => {})
-      await stdioHandle?.close()
-      await stopApple2tsServer()
+      ownedRenderer ||= await rendererPromise.catch(() => null)
+      await stdioHandle?.close().catch((error) => failures.push(error))
+      await ownedRenderer?.stop().catch((error) => failures.push(error))
+      await stopApple2tsServer().catch((error) => failures.push(error))
+      process.stdin.off("end", onStdinEnd)
+      process.stdin.off("close", onStdinEnd)
+      process.stdin.pause()
+      process.off("SIGINT", onSigint)
+      process.off("SIGTERM", onSigterm)
+      if (failures.length) throw new AggregateError(failures, "Apple2TS MCP cleanup failed")
     })()
     return stopping
   }
@@ -150,6 +258,7 @@ export const runStdio = async (options = {}) => {
   process.once("SIGTERM", onSigterm)
 
   try {
+    if (!options.chromiumExecutable) throw new Error("APPLE2TS_CHROMIUM_EXECUTABLE is required")
     listenerPromise = startApple2tsServer({
       host: "127.0.0.1",
       port: Number(options.port ?? 0),
@@ -158,9 +267,22 @@ export const runStdio = async (options = {}) => {
     })
     const listener = await listenerPromise
     const core = new Apple2tsObservationCore(listener.url, shutdownController.signal)
+    rendererPromise = launchChromium({
+      executable: options.chromiumExecutable,
+      bridgeUrl: listener.url,
+      remoteControlToken,
+      rendererId,
+    })
+    ownedRenderer = await rendererPromise
 
     process.stderr.write(`Apple2TS MCP private bridge listening at ${listener.url}; waiting for renderer ${rendererId}.\n`)
-    await waitForRenderer(core, startupTimeoutMs, shutdownController.signal)
+    const startup = await Promise.race([
+      waitForRenderer(core, startupTimeoutMs, shutdownController.signal).then(() => ({ ready: true })),
+      ownedRenderer.exited.then((outcome) => ({ ready: false, outcome })),
+    ])
+    if (!startup.ready) {
+      throw new Error(`Owned Chromium exited before readiness (${ownedRenderer.describeExit(startup.outcome)})`)
+    }
     if (shutdownController.signal.aborted) return
 
     stdioHandle = serveStdio(() => createMcpServer(core), {
@@ -183,5 +305,6 @@ if (isMain) {
     remoteControlToken: process.env.APPLE2TS_REMOTE_CONTROL_TOKEN,
     rendererId: process.env.APPLE2TS_RENDERER_ID,
     startupTimeoutMs: process.env.APPLE2TS_STARTUP_TIMEOUT_MS,
+    chromiumExecutable: process.env.APPLE2TS_CHROMIUM_EXECUTABLE,
   })
 }

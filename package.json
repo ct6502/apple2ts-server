@@ -15,7 +15,7 @@
     "mcp:stdio": "node server/mcp_stdio.mjs",
     "cli": "node cli/index.mjs",
     "cli:help": "node cli/index.mjs --help",
-    "test": "node --test"
+    "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0"
