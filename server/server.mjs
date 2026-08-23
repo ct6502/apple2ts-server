@@ -2,16 +2,19 @@ import { createServer } from "node:http"
 import { randomUUID } from "node:crypto"
 import { promises as fs } from "node:fs"
 import path from "node:path"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const repoRoot = path.resolve(__dirname, "..")
 const distDir = path.join(repoRoot, "dist")
 const serverDir = __dirname
-const host = "127.0.0.1"
-const port = Number(process.env.PORT || 6502)
-const commandTimeoutMs = Number(process.env.COMMAND_TIMEOUT_MS || 10000)
+let host = "127.0.0.1"
+let port = Number(process.env.PORT || 6502)
+let commandTimeoutMs = Number(process.env.COMMAND_TIMEOUT_MS || 10000)
+let serverInstanceId = randomUUID()
+let privateRenderer = null
+let logger = console
 
 const clients = new Map()
 const pendingCommands = new Map()
@@ -81,6 +84,11 @@ const writeNoConnectedClientError = (res) => {
 }
 
 const getConnectedClient = () => {
+  if (privateRenderer) {
+    const client = clients.get(privateRenderer.clientId)
+    return client?.eventStream ? client : null
+  }
+
   let client = null
   for (const candidate of clients.values()) {
     if (!candidate.eventStream) continue
@@ -92,6 +100,31 @@ const getConnectedClient = () => {
     return null
   }
   return client
+}
+
+const rendererCredentialsMatch = (value) =>
+  !privateRenderer ||
+  (value?.remoteControlToken === privateRenderer.remoteControlToken &&
+    value?.rendererId === privateRenderer.rendererId)
+
+const rendererRequestMatches = (url, client) =>
+  !privateRenderer ||
+  (client?.rendererId === privateRenderer.rendererId &&
+    url.searchParams.get("remoteControlToken") === privateRenderer.remoteControlToken &&
+    url.searchParams.get("rendererId") === privateRenderer.rendererId)
+
+const writePrivateRendererError = (res, statusCode, message) => {
+  writeErrorEnvelope(res, statusCode, "RENDERER_BINDING_REJECTED", message)
+}
+
+const getRendererIdentity = () => {
+  const client = getConnectedClient()
+  if (!client) return null
+  return {
+    serverInstanceId,
+    rendererId: client.rendererId || client.clientId,
+    targetId: `${serverInstanceId}:${client.rendererId || client.clientId}`,
+  }
 }
 
 const runModeToApiName = (runMode) => {
@@ -700,15 +733,41 @@ const server = createServer(async (req, res) => {
       setCorsHeaders(res)
       res.statusCode = 200
       res.setHeader("Content-Type", "application/json; charset=utf-8")
-      res.end(JSON.stringify({ status: "ok" }))
+      res.end(JSON.stringify({ status: "ok", serverInstanceId }))
+      return
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/control/identity") {
+      const identity = getRendererIdentity()
+      if (!identity) {
+        writeNoConnectedClientError(res)
+        return
+      }
+      writeEnvelope(res, 200, identity)
       return
     }
 
     if (req.method === "POST" && url.pathname === "/api/client/connect") {
       const body = await readJsonBody(req)
+      if (!rendererCredentialsMatch(body)) {
+        writePrivateRendererError(res, 403, "Renderer credentials do not match this private server.")
+        return
+      }
+
+      if (privateRenderer?.clientId) {
+        const existing = clients.get(privateRenderer.clientId)
+        if (existing?.rendererId !== body.rendererId) {
+          writePrivateRendererError(res, 409, "This private server is already bound to another renderer.")
+          return
+        }
+        writeJson(res, 200, { clientId: privateRenderer.clientId })
+        return
+      }
+
       const clientId = randomUUID()
       clients.set(clientId, {
         clientId,
+        rendererId: privateRenderer ? body.rendererId : clientId,
         connectedAt: Date.now(),
         lastSeenAt: Date.now(),
         pathname: body.pathname || "/",
@@ -717,6 +776,7 @@ const server = createServer(async (req, res) => {
         eventStream: null,
         heartbeat: null,
       })
+      if (privateRenderer) privateRenderer.clientId = clientId
       writeJson(res, 200, { clientId })
       return
     }
@@ -726,6 +786,14 @@ const server = createServer(async (req, res) => {
       const client = clientId ? clients.get(clientId) : null
       if (!client) {
         writeJson(res, 404, { error: "Unknown client" })
+        return
+      }
+      if (!rendererRequestMatches(url, client)) {
+        writePrivateRendererError(res, 403, "Renderer credentials do not match this private server.")
+        return
+      }
+      if (client.eventStream) {
+        writePrivateRendererError(res, 409, "The renderer already has an active event stream.")
         return
       }
 
@@ -761,6 +829,10 @@ const server = createServer(async (req, res) => {
         writeJson(res, 404, { error: "Unknown client" })
         return
       }
+      if (!rendererCredentialsMatch(body) || (privateRenderer && client.clientId !== privateRenderer.clientId)) {
+        writePrivateRendererError(res, 403, "Renderer credentials do not match this private server.")
+        return
+      }
       client.lastSeenAt = Date.now()
       client.latestState = body.state || null
       writeJson(res, 200, { ok: true })
@@ -769,9 +841,18 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/api/client/reply") {
       const body = await readJsonBody(req)
+      const client = clients.get(body.clientId)
+      if (!client || !rendererCredentialsMatch(body) || (privateRenderer && client.clientId !== privateRenderer.clientId)) {
+        writePrivateRendererError(res, 403, "Renderer credentials do not match this private server.")
+        return
+      }
       const pending = pendingCommands.get(body.commandId)
       if (!pending) {
         writeJson(res, 404, { error: "Unknown command" })
+        return
+      }
+      if (pending.clientId !== body.clientId) {
+        writePrivateRendererError(res, 403, "The command belongs to another renderer.")
         return
       }
 
@@ -1581,7 +1662,7 @@ const server = createServer(async (req, res) => {
   }
 })
 
-server.listen(port, host, async () => {
+const checkDist = async () => {
   let hasDist = true
   try {
     await fs.access(path.join(distDir, "index.html"))
@@ -1589,9 +1670,78 @@ server.listen(port, host, async () => {
     hasDist = false
   }
 
-  const url = `http://${host}:${port}`
-  console.log(`Apple2TS server listening on ${url} (localhost only)`)
-  if (!hasDist) {
-    console.log("Build output not found. Run 'npm run build' before 'npm run serve'.")
+  return hasDist
+}
+
+export const startApple2tsServer = async (options = {}) => {
+  if (server.listening) {
+    throw new Error("Apple2TS server is already listening")
   }
-})
+
+  host = options.host || "127.0.0.1"
+  port = Number(options.port ?? process.env.PORT ?? 6502)
+  commandTimeoutMs = Number(options.commandTimeoutMs ?? process.env.COMMAND_TIMEOUT_MS ?? 10000)
+  serverInstanceId = options.serverInstanceId || randomUUID()
+  logger = options.logger || console
+  privateRenderer = options.privateRenderer
+    ? {
+        remoteControlToken: String(options.privateRenderer.remoteControlToken),
+        rendererId: String(options.privateRenderer.rendererId),
+        clientId: null,
+      }
+    : null
+
+  await new Promise((resolve, reject) => {
+    const onError = (error) => {
+      server.off("listening", onListening)
+      reject(error)
+    }
+    const onListening = () => {
+      server.off("error", onError)
+      resolve()
+    }
+    server.once("error", onError)
+    server.once("listening", onListening)
+    server.listen(port, host)
+  })
+
+  const address = server.address()
+  if (!address || typeof address === "string") {
+    await stopApple2tsServer()
+    throw new Error("Apple2TS server did not acquire a TCP listener")
+  }
+
+  const url = `http://${address.address}:${address.port}`
+  logger.log?.(`Apple2TS server listening on ${url} (localhost only)`)
+  if (!(await checkDist())) {
+    logger.log?.("Build output not found. Run 'npm run build' before 'npm run serve'.")
+  }
+
+  return { url, host: address.address, port: address.port, serverInstanceId }
+}
+
+export const stopApple2tsServer = async () => {
+  for (const client of clients.values()) {
+    if (client.heartbeat) clearInterval(client.heartbeat)
+    client.heartbeat = null
+    if (client.eventStream && !client.eventStream.destroyed) client.eventStream.destroy()
+    client.eventStream = null
+    failPendingCommandsForClient(client.clientId, "Apple2TS server stopped")
+  }
+  clients.clear()
+  privateRenderer = null
+
+  if (!server.listening) return
+  await new Promise((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()))
+    server.closeAllConnections?.()
+  })
+}
+
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href
+if (isMain) {
+  startApple2tsServer().catch((error) => {
+    process.stderr.write(`Failed to start Apple2TS server: ${error instanceof Error ? error.message : String(error)}\n`)
+    process.exitCode = 1
+  })
+}
