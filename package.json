@@ -12,7 +12,12 @@
     "start": "node scripts/start.mjs",
     "start:force": "node scripts/start.mjs --allow-missing-dist",
     "serve": "node server/server.mjs",
+    "mcp:stdio": "node server/mcp_stdio.mjs",
     "cli": "node cli/index.mjs",
-    "cli:help": "node cli/index.mjs --help"
+    "cli:help": "node cli/index.mjs --help",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0"
   }
 }
