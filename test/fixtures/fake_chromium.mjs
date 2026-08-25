@@ -16,7 +16,12 @@ const rendererId = launchUrl.searchParams.get("rendererId")
 const receiptPath = process.env.APPLE2TS_FAKE_CHROMIUM_RECEIPT
 
 if (receiptPath) {
-  await writeFile(receiptPath, JSON.stringify({ pid: process.pid, profilePath, launchUrl: launchUrl.href }))
+  await writeFile(receiptPath, JSON.stringify({
+    pid: process.pid,
+    profilePath,
+    launchUrl: launchUrl.href,
+    headless: process.argv.includes("--headless=new"),
+  }))
 }
 
 if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "exit") process.exit(42)

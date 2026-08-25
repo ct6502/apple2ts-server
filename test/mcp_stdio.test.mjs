@@ -159,6 +159,7 @@ const launchMcp = async (overrides = {}) => {
       APPLE2TS_RENDERER_ID: rendererId,
       APPLE2TS_STARTUP_TIMEOUT_MS: "3000",
       APPLE2TS_CHROMIUM_EXECUTABLE: fakeChromium,
+      APPLE2TS_CHROMIUM_MODE: "headless",
       APPLE2TS_FAKE_CHROMIUM_RECEIPT: receiptPath,
       ...overrides,
     },
@@ -282,6 +283,7 @@ test("stdio discovery and reads use one renderer and EOF cleans up", async () =>
   assert.equal(launchUrl.searchParams.get("remoteControlToken"), token)
   assert.equal(launchUrl.searchParams.get("rendererId"), rendererId)
   assert.equal(launchUrl.searchParams.get("controllerToken"), null)
+  assert.equal(receipt.headless, true)
   assert.doesNotThrow(() => process.kill(receipt.pid, 0))
   await access(receipt.profilePath)
 
@@ -321,6 +323,38 @@ test("stdio discovery and reads use one renderer and EOF cleans up", async () =>
   await assert.rejects(access(receipt.profilePath))
   await assertClosed(bridgeUrl)
   await processState.cleanup()
+})
+
+test("visible Chromium uses the same owned session and cleanup", async () => {
+  const visible = await launchMcp({ APPLE2TS_CHROMIUM_MODE: "visible" })
+  const bridgeLine = await visible.waitForStderr((line) => line.includes("private bridge listening"))
+  const bridgeUrl = parseBridgeUrl(bridgeLine)
+  await visible.waitForStderr((line) => line.includes("MCP ready"))
+  const receipt = await visible.readReceipt()
+
+  assert.equal(receipt.headless, false)
+  assert.doesNotThrow(() => process.kill(receipt.pid, 0))
+  await access(receipt.profilePath)
+
+  visible.child.stdin.end()
+  const outcome = await visible.waitForExit()
+  assert.equal(outcome.error, null)
+  assert.equal(outcome.code, 0, visible.getStderr())
+  assert.throws(() => process.kill(receipt.pid, 0), { code: "ESRCH" })
+  await assert.rejects(access(receipt.profilePath))
+  await assertClosed(bridgeUrl)
+  await visible.cleanup()
+})
+
+test("invalid Chromium mode fails before launch", async () => {
+  const invalid = await launchMcp({ APPLE2TS_CHROMIUM_MODE: "sideways" })
+  const outcome = await invalid.waitForExit()
+
+  assert.equal(outcome.error, null)
+  assert.equal(outcome.code, 1)
+  assert.match(invalid.getStderr(), /APPLE2TS_CHROMIUM_MODE must be 'headless' or 'visible'/)
+  assert.equal(invalid.getStdout(), "")
+  await invalid.cleanup()
 })
 
 test("unexpected renderer exit closes stdio and owned resources", async () => {

@@ -131,7 +131,7 @@ const waitFor = (promise, timeoutMs) =>
     })
   })
 
-const launchChromium = async ({ executable, bridgeUrl, remoteControlToken, rendererId }) => {
+const launchChromium = async ({ executable, bridgeUrl, remoteControlToken, rendererId, mode }) => {
   if (!executable) throw new Error("APPLE2TS_CHROMIUM_EXECUTABLE is required")
   await access(executable, fsConstants.X_OK)
 
@@ -143,10 +143,11 @@ const launchChromium = async ({ executable, bridgeUrl, remoteControlToken, rende
 
   let child
   try {
+    const modeArguments = mode === "headless" ? ["--headless=new"] : []
     child = spawn(
       executable,
       [
-        "--headless=new",
+        ...modeArguments,
         "--disable-background-networking",
         "--no-default-browser-check",
         "--no-first-run",
@@ -282,6 +283,10 @@ export const runStdio = async (options = {}) => {
 
   try {
     if (!options.chromiumExecutable) throw new Error("APPLE2TS_CHROMIUM_EXECUTABLE is required")
+    const chromiumMode = options.chromiumMode ?? "headless"
+    if (chromiumMode !== "headless" && chromiumMode !== "visible") {
+      throw new Error("APPLE2TS_CHROMIUM_MODE must be 'headless' or 'visible'")
+    }
     listenerPromise = startApple2tsServer({
       host: "127.0.0.1",
       port: Number(options.port ?? 0),
@@ -304,6 +309,7 @@ export const runStdio = async (options = {}) => {
       bridgeUrl: listener.url,
       remoteControlToken,
       rendererId,
+      mode: chromiumMode,
     })
     ownedRenderer = await rendererPromise
 
@@ -345,5 +351,6 @@ if (isMain) {
     rendererId: process.env.APPLE2TS_RENDERER_ID,
     startupTimeoutMs: process.env.APPLE2TS_STARTUP_TIMEOUT_MS,
     chromiumExecutable: process.env.APPLE2TS_CHROMIUM_EXECUTABLE,
+    chromiumMode: process.env.APPLE2TS_CHROMIUM_MODE,
   })
 }
