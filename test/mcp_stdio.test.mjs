@@ -23,6 +23,13 @@ const postJson = (url, body) =>
     body: JSON.stringify(body),
   })
 
+const readPrivateJson = async (baseUrl, pathname) => {
+  const response = await fetch(new URL(pathname, baseUrl), {
+    headers: { Authorization: `Bearer ${controllerToken}` },
+  })
+  return { response, body: await response.json() }
+}
+
 const connectFakeRenderer = async (baseUrl, options = {}) => {
   const activeToken = options.token || token
   const activeRendererId = options.rendererId || rendererId
@@ -259,6 +266,91 @@ test("private bridge binds one renderer and rejects forged replies", async (t) =
   assert.equal(machine.data.machineName, "APPLE2EE")
 })
 
+test("private bridge reads bounded memory in byte and hex formats", async (t) => {
+  const listener = await startApple2tsServer({
+    port: 0,
+    privateRenderer: { remoteControlToken: token, rendererId, controllerToken },
+    logger: { log() {} },
+  })
+  t.after(stopApple2tsServer)
+
+  const renderer = await connectFakeRenderer(listener.url, { autoServe: false })
+  t.after(() => renderer.stop())
+  const memoryDump = new Array(65536).fill(0)
+  memoryDump[0] = 17
+  memoryDump[1] = 34
+  memoryDump[65534] = 171
+  memoryDump[65535] = 205
+
+  const maximumRequest = readPrivateJson(
+    listener.url,
+    "/api/debug/memory?start=0&length=65536",
+  )
+  const maximumCommand = await renderer.nextCommand()
+  assert.deepEqual(
+    { action: maximumCommand.action, payload: maximumCommand.payload },
+    { action: "getMemory", payload: {} },
+  )
+  assert.equal((await renderer.reply(maximumCommand, { result: { memoryDump } })).status, 200)
+  const maximum = await maximumRequest
+  assert.equal(maximum.response.status, 200)
+  assert.equal(maximum.body.data.start, 0)
+  assert.equal(maximum.body.data.length, 65536)
+  assert.equal(maximum.body.data.format, "bytes")
+  assert.equal(maximum.body.data.data.length, 65536)
+  assert.deepEqual(maximum.body.data.data.slice(0, 2), [17, 34])
+  assert.equal(maximum.body.data.data.at(-1), 205)
+
+  const hexRequest = readPrivateJson(
+    listener.url,
+    "/api/debug/memory?start=65534&length=2&format=hex",
+  )
+  const hexCommand = await renderer.nextCommand()
+  assert.equal(hexCommand.action, "getMemory")
+  assert.equal((await renderer.reply(hexCommand, { result: { memoryDump } })).status, 200)
+  const hex = await hexRequest
+  assert.equal(hex.response.status, 200)
+  assert.deepEqual(hex.body, {
+    ok: true,
+    data: { start: 65534, length: 2, format: "hex", data: "AB CD" },
+  })
+})
+
+test("private bridge rejects invalid and unavailable memory ranges", async (t) => {
+  const listener = await startApple2tsServer({
+    port: 0,
+    privateRenderer: { remoteControlToken: token, rendererId, controllerToken },
+    logger: { log() {} },
+  })
+  t.after(stopApple2tsServer)
+
+  const renderer = await connectFakeRenderer(listener.url, { autoServe: false })
+  t.after(() => renderer.stop())
+
+  for (const pathname of [
+    "/api/debug/memory?start=-1&length=1",
+    "/api/debug/memory?start=0&length=0",
+    "/api/debug/memory?start=65535&length=2",
+    "/api/debug/memory?start=0&length=1&format=raw",
+  ]) {
+    const result = await readPrivateJson(listener.url, pathname)
+    assert.equal(result.response.status, 400, pathname)
+    assert.equal(result.body.error.code, "BAD_REQUEST", pathname)
+  }
+
+  const unavailableRequest = readPrivateJson(
+    listener.url,
+    "/api/debug/memory?start=3&length=2",
+  )
+  const command = await renderer.nextCommand()
+  assert.equal(command.action, "getMemory")
+  assert.equal((await renderer.reply(command, { result: { memoryDump: [0, 1, 2, 3] } })).status, 200)
+  const unavailable = await unavailableRequest
+  assert.equal(unavailable.response.status, 400)
+  assert.equal(unavailable.body.ok, false)
+  assert.equal(unavailable.body.error.code, "BAD_REQUEST")
+})
+
 test("non-private server routes preserve legacy access", async (t) => {
   const listener = await startApple2tsServer({ port: 0, logger: { log() {} } })
   t.after(stopApple2tsServer)
@@ -268,6 +360,8 @@ test("non-private server routes preserve legacy access", async (t) => {
   assert.deepEqual(await health.json(), { status: "ok" })
   const machine = await fetch(new URL("/api/machine", listener.url))
   assert.equal(machine.status, 503)
+  const memory = await fetch(new URL("/api/debug/memory?start=0&length=1", listener.url))
+  assert.equal(memory.status, 503)
 })
 
 test("stdio discovery and reads use one renderer and EOF cleans up", async () => {
