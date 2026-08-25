@@ -406,6 +406,58 @@ test("stdio discovery and reads use one renderer and EOF cleans up", async () =>
   assert.equal(payload.emulator.rendererId, rendererId)
   assert.equal(payload.state.PC, 768)
 
+  processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/list" })}\n`)
+  const tools = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 4))
+  assert.deepEqual(tools.result.tools.map((tool) => tool.name), ["read_memory"])
+  assert.deepEqual(tools.result.tools[0].inputSchema, {
+    type: "object",
+    properties: {
+      address: { type: "integer", minimum: 0, maximum: 65535 },
+      length: { type: "integer", minimum: 1, maximum: 4096 },
+    },
+    required: ["address", "length"],
+    additionalProperties: false,
+  })
+  assert.equal(tools.result.tools[0].outputSchema.type, "object")
+  assert.deepEqual(tools.result.tools[0].outputSchema.properties.value.properties.bytes, {
+    type: "array",
+    items: { type: "integer", minimum: 0, maximum: 255 },
+    minItems: 1,
+    maxItems: 4096,
+  })
+  assert.deepEqual(tools.result.tools[0].annotations, {
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  })
+
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: 5,
+    method: "tools/call",
+    params: { name: "read_memory", arguments: { address: 65534, length: 2 } },
+  })}\n`)
+  const memory = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 5))
+  assert.equal(memory.result.isError, undefined)
+  assert.deepEqual(memory.result.structuredContent, {
+    emulator: payload.emulator,
+    value: { address: 65534, length: 2, bytes: [171, 205] },
+  })
+  assert.deepEqual(JSON.parse(memory.result.content[0].text), memory.result.structuredContent)
+
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: 6,
+    method: "tools/call",
+    params: { name: "read_memory", arguments: { address: 65535, length: 2 } },
+  })}\n`)
+  const invalidRange = JSON.parse(
+    await processState.waitForStdout((line) => JSON.parse(line).id === 6),
+  )
+  assert.equal(invalidRange.result.isError, true)
+  assert.notEqual(invalidRange.result.content[0].text, "")
+
   processState.child.stdin.end()
   const processExit = await processState.waitForExit()
   assert.equal(processExit.error, null)

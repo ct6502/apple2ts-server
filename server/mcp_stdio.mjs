@@ -8,7 +8,7 @@ import os from "node:os"
 import path from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 
-import { McpServer } from "@modelcontextprotocol/server"
+import { fromJsonSchema, McpServer } from "@modelcontextprotocol/server"
 import { serveStdio } from "@modelcontextprotocol/server/stdio"
 
 import { startApple2tsServer, stopApple2tsServer } from "./server.mjs"
@@ -18,6 +18,49 @@ const SERVER_VERSION = "0.1.0"
 const DEFAULT_STARTUP_TIMEOUT_MS = 10000
 const BROWSER_EXIT_TIMEOUT_MS = 2000
 const CHILD_STDERR_LIMIT = 8192
+
+const memoryReadInputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    address: { type: "integer", minimum: 0, maximum: 65535 },
+    length: { type: "integer", minimum: 1, maximum: 4096 },
+  },
+  required: ["address", "length"],
+  additionalProperties: false,
+})
+
+const memoryReadOutputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    emulator: {
+      type: "object",
+      properties: {
+        serverInstanceId: { type: "string" },
+        rendererId: { type: "string" },
+        targetId: { type: "string" },
+      },
+      required: ["serverInstanceId", "rendererId", "targetId"],
+      additionalProperties: false,
+    },
+    value: {
+      type: "object",
+      properties: {
+        address: { type: "integer", minimum: 0, maximum: 65535 },
+        length: { type: "integer", minimum: 1, maximum: 4096 },
+        bytes: {
+          type: "array",
+          items: { type: "integer", minimum: 0, maximum: 255 },
+          minItems: 1,
+          maxItems: 4096,
+        },
+      },
+      required: ["address", "length", "bytes"],
+      additionalProperties: false,
+    },
+  },
+  required: ["emulator", "value"],
+  additionalProperties: false,
+})
 
 const sleep = (milliseconds, signal) =>
   new Promise((resolve, reject) => {
@@ -70,6 +113,32 @@ export class Apple2tsObservationCore {
   readCpu() {
     return this.read("/api/debug/cpu")
   }
+
+  async readMemory({ address, length }) {
+    if (!Number.isInteger(address) || address < 0 || address > 65535) {
+      throw new Error("address must be an integer between 0 and 65535")
+    }
+    if (!Number.isInteger(length) || length < 1 || length > 4096) {
+      throw new Error("length must be an integer between 1 and 4096")
+    }
+    if (address + length > 65536) {
+      throw new Error("Requested memory range exceeds 64 KB address space")
+    }
+    const query = new URLSearchParams({
+      start: String(address),
+      length: String(length),
+      format: "bytes",
+    })
+    const result = await this.read(`/api/debug/memory?${query}`)
+    return {
+      emulator: result.emulator,
+      value: {
+        address: result.state.start,
+        length: result.state.length,
+        bytes: result.state.data,
+      },
+    }
+  }
 }
 
 export const createMcpServer = (core) => {
@@ -99,6 +168,36 @@ export const createMcpServer = (core) => {
     async (uri) => ({
       contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(await core.readCpu()) }],
     }),
+  )
+
+  server.registerTool(
+    "read_memory",
+    {
+      title: "Read Apple II memory",
+      description: "Read a bounded memory range from the emulator bound to this process.",
+      inputSchema: memoryReadInputSchema,
+      outputSchema: memoryReadOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async (input) => {
+      try {
+        const result = await core.readMemory(input)
+        return {
+          content: [{ type: "text", text: JSON.stringify(result) }],
+          structuredContent: result,
+        }
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+        }
+      }
+    },
   )
 
   return server
