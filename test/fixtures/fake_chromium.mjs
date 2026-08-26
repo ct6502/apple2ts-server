@@ -58,6 +58,7 @@ memoryDump[65535] = 205
 let buffer = ""
 let stopping = false
 let statusReplies = 0
+const status = structuredClone(statusFixture)
 
 const stop = () => {
   if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "ignore-term") {
@@ -85,11 +86,20 @@ while (!stopping) {
     const data = frame.split("\n").find((line) => line.startsWith("data: "))
     if (!event || !data) continue
     const command = JSON.parse(data.slice(6))
-    const result = command.action === "getStatus"
-      ? statusFixture
-      : command.action === "getMemory"
-        ? { memoryDump }
-        : undefined
+    let result
+    if (command.action === "setRunMode") {
+      status.machine.runMode = command.payload.runMode === -4 || command.payload.runMode === -3
+        ? -1
+        : command.payload.runMode
+      result = status
+    } else if (command.action === "setSpeedMode") {
+      status.machine.speedMode = command.payload.speedMode
+      result = status
+    } else if (command.action === "getStatus") {
+      result = status
+    } else if (command.action === "getMemory") {
+      result = { memoryDump }
+    }
     const reply = await postJson("/api/client/reply", {
       clientId,
       remoteControlToken,

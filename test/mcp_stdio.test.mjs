@@ -2,11 +2,13 @@ import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 import { access, mkdtemp, readFile, rm } from "node:fs/promises"
+import { createServer } from "node:http"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import test from "node:test"
 
+import { Apple2tsCore } from "../server/mcp_stdio.mjs"
 import { startApple2tsServer, stopApple2tsServer } from "../server/server.mjs"
 import { statusFixture } from "./fixtures/status_fixture.mjs"
 
@@ -487,7 +489,87 @@ test("non-private server routes preserve legacy access", async (t) => {
   assert.equal(binary.status, 404)
 })
 
-test("stdio discovery and reads use one renderer and EOF cleans up", async () => {
+test("machine changes wait for prior callers and the mutation deadline", async (t) => {
+  let activeRequests = 0
+  let maxActiveRequests = 0
+  const bridge = createServer(async (req, res) => {
+    activeRequests += 1
+    maxActiveRequests = Math.max(maxActiveRequests, activeRequests)
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    const { speedMode } = JSON.parse(Buffer.concat(chunks).toString("utf8"))
+    if (speedMode === 4) await new Promise((resolve) => setTimeout(resolve, 2100))
+    res.setHeader("Content-Type", "application/json")
+    res.end(JSON.stringify({ ok: true, data: { runMode: "paused", speedMode } }))
+    activeRequests -= 1
+  })
+  await new Promise((resolve) => bridge.listen(0, "127.0.0.1", resolve))
+  t.after(() => new Promise((resolve) => bridge.close(resolve)))
+  const address = bridge.address()
+  const core = new Apple2tsCore(
+    `http://127.0.0.1:${address.port}`,
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+
+  const [accelerated, normalized] = await Promise.all([core.setSpeed(4), core.setSpeed(0)])
+  assert.equal(maxActiveRequests, 1)
+  assert.equal(accelerated.state.speedMode, 4)
+  assert.equal(normalized.state.speedMode, 0)
+})
+
+test("a failed mutation prevents later mutations in the same session", async (t) => {
+  let requests = 0
+  const bridge = createServer((_req, res) => {
+    requests += 1
+    res.setHeader("Content-Type", "application/json")
+    res.statusCode = 500
+    res.end(JSON.stringify({ ok: false, error: "uncertain mutation" }))
+  })
+  await new Promise((resolve) => bridge.listen(0, "127.0.0.1", resolve))
+  t.after(() => new Promise((resolve) => bridge.close(resolve)))
+  const address = bridge.address()
+  const core = new Apple2tsCore(
+    `http://127.0.0.1:${address.port}`,
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+
+  await assert.rejects(core.pause(), /uncertain mutation/)
+  await assert.rejects(core.resume(), /restart this MCP session/)
+  assert.equal(requests, 1)
+})
+
+test("cancelling an active mutation prevents later mutations in the same session", async (t) => {
+  let release
+  let started
+  const startedPromise = new Promise((resolve) => (started = resolve))
+  const releasePromise = new Promise((resolve) => (release = resolve))
+  const bridge = createServer(async (_req, res) => {
+    started()
+    await releasePromise
+    res.setHeader("Content-Type", "application/json")
+    res.end(JSON.stringify({ ok: true, data: { runMode: "paused", speedMode: 0 } }))
+  })
+  await new Promise((resolve) => bridge.listen(0, "127.0.0.1", resolve))
+  t.after(() => new Promise((resolve) => bridge.close(resolve)))
+  const address = bridge.address()
+  const core = new Apple2tsCore(
+    `http://127.0.0.1:${address.port}`,
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  const cancellation = new AbortController()
+
+  const pause = core.pause(cancellation.signal)
+  await startedPromise
+  cancellation.abort()
+  release()
+  await pause
+  await assert.rejects(core.resume(), /restart this MCP session/)
+})
+
+test("stdio reads and controls one renderer and EOF cleans up", async () => {
   const processState = await launchMcp()
   const bridgeLine = await processState.waitForStderr((line) => line.includes("private bridge listening"))
   const bridgeUrl = parseBridgeUrl(bridgeLine)
@@ -532,7 +614,10 @@ test("stdio discovery and reads use one renderer and EOF cleans up", async () =>
 
   processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/list" })}\n`)
   const tools = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 4))
-  assert.deepEqual(tools.result.tools.map((tool) => tool.name), ["read_memory"])
+  assert.deepEqual(
+    tools.result.tools.map((tool) => tool.name),
+    ["read_memory", "boot", "reset", "pause", "resume", "set_speed"],
+  )
   assert.deepEqual(tools.result.tools[0].inputSchema, {
     type: "object",
     properties: {
@@ -581,6 +666,37 @@ test("stdio discovery and reads use one renderer and EOF cleans up", async () =>
   )
   assert.equal(invalidRange.result.isError, true)
   assert.notEqual(invalidRange.result.content[0].text, "")
+
+  const callTool = async (id, name, args = {}) => {
+    processState.child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: { name, arguments: args },
+    })}\n`)
+    const response = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === id))
+    assert.equal(response.result.isError, undefined)
+    return response.result.structuredContent
+  }
+
+  const booted = await callTool(7, "boot")
+  assert.equal(booted.state.runMode, "running")
+
+  const paused = await callTool(8, "pause")
+  assert.equal(paused.emulator.rendererId, rendererId)
+  assert.equal(paused.state.runMode, "paused")
+
+  const accelerated = await callTool(9, "set_speed", { speed: 4 })
+  assert.equal(accelerated.state.runMode, "paused")
+  assert.equal(accelerated.state.speedMode, 4)
+
+  const resumed = await callTool(10, "resume")
+  assert.equal(resumed.state.runMode, "running")
+  assert.equal(resumed.state.speedMode, 4)
+
+  const reset = await callTool(11, "reset")
+  assert.equal(reset.state.runMode, "running")
+  assert.equal(reset.state.speedMode, 4)
 
   processState.child.stdin.end()
   const processExit = await processState.waitForExit()
