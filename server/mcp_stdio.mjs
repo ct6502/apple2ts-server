@@ -18,6 +18,52 @@ const SERVER_VERSION = "0.1.0"
 const DEFAULT_STARTUP_TIMEOUT_MS = 10000
 const BROWSER_EXIT_TIMEOUT_MS = 2000
 const CHILD_STDERR_LIMIT = 8192
+const READ_TIMEOUT_MS = 2000
+const MUTATION_RESPONSE_MARGIN_MS = 1000
+const MUTATION_TIMEOUT_MS = Number(process.env.COMMAND_TIMEOUT_MS || 10000)
+  + MUTATION_RESPONSE_MARGIN_MS
+
+const noInputSchema = fromJsonSchema({
+  type: "object",
+  properties: {},
+  additionalProperties: false,
+})
+
+const speedInputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    speed: { type: "integer", enum: [-2, -1, 0, 1, 2, 3, 4] },
+  },
+  required: ["speed"],
+  additionalProperties: false,
+})
+
+const machineResultSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    emulator: {
+      type: "object",
+      properties: {
+        serverInstanceId: { type: "string" },
+        rendererId: { type: "string" },
+        targetId: { type: "string" },
+      },
+      required: ["serverInstanceId", "rendererId", "targetId"],
+      additionalProperties: false,
+    },
+    state: {
+      type: "object",
+      properties: {
+        runMode: { type: "string", enum: ["idle", "booting", "running", "paused", "resetting"] },
+        speedMode: { type: "integer" },
+      },
+      required: ["runMode", "speedMode"],
+      additionalProperties: false,
+    },
+  },
+  required: ["emulator", "state"],
+  additionalProperties: false,
+})
 
 const memoryReadInputSchema = fromJsonSchema({
   type: "object",
@@ -80,38 +126,104 @@ const sleep = (milliseconds, signal) =>
     signal.addEventListener("abort", onAbort, { once: true })
   })
 
-const fetchEnvelope = async (baseUrl, pathname, controllerToken, signal) => {
+const fetchEnvelope = async (baseUrl, pathname, controllerToken, signal, options = {}) => {
+  const headers = { Authorization: `Bearer ${controllerToken}` }
+  if (options.body !== undefined) headers["Content-Type"] = "application/json"
+  const method = options.method || "GET"
   const response = await fetch(new URL(pathname, baseUrl), {
-    headers: { Authorization: `Bearer ${controllerToken}` },
-    signal: AbortSignal.any([signal, AbortSignal.timeout(2000)]),
+    method,
+    headers,
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    signal: AbortSignal.any([
+      signal,
+      AbortSignal.timeout(method === "GET" ? READ_TIMEOUT_MS : MUTATION_TIMEOUT_MS),
+    ]),
   })
   const payload = await response.json().catch(() => null)
   if (!response.ok || payload?.ok !== true) {
-    const detail = payload?.error?.code || payload?.error || `HTTP ${response.status}`
+    const detail = payload?.error?.message || payload?.error?.code || payload?.error || `HTTP ${response.status}`
     throw new Error(`Apple2TS bridge request ${pathname} failed: ${detail}`)
   }
   return payload.data
 }
 
-export class Apple2tsObservationCore {
+export class Apple2tsCore {
   constructor(baseUrl, controllerToken, identity, signal = new AbortController().signal) {
     this.baseUrl = baseUrl
     this.controllerToken = controllerToken
     this.identity = identity
     this.signal = signal
+    this.mutations = Promise.resolve()
+    this.mutationFailure = null
   }
 
-  async read(pathname) {
-    const state = await fetchEnvelope(this.baseUrl, pathname, this.controllerToken, this.signal)
+  async request(pathname, options) {
+    const state = await fetchEnvelope(this.baseUrl, pathname, this.controllerToken, this.signal, options)
     return { emulator: this.identity, state }
   }
 
   readMachine() {
-    return this.read("/api/machine")
+    return this.request("/api/machine")
   }
 
   readCpu() {
-    return this.read("/api/debug/cpu")
+    return this.request("/api/debug/cpu")
+  }
+
+  serializeMutation(operation, signal) {
+    const mutation = this.mutations.then(async () => {
+      if (this.mutationFailure) throw this.mutationFailure
+      if (signal?.aborted) throw signal.reason
+      const markUncertain = () => {
+        this.mutationFailure ||= new Error(
+          "The previous mutation did not complete cleanly; restart this MCP session",
+        )
+      }
+      signal?.addEventListener("abort", markUncertain, { once: true })
+      try {
+        return await operation()
+      } catch (error) {
+        markUncertain()
+        throw error
+      } finally {
+        signal?.removeEventListener("abort", markUncertain)
+      }
+    })
+    this.mutations = mutation.catch(() => {})
+    return mutation
+  }
+
+  changeMachine(pathname, options, signal) {
+    return this.serializeMutation(async () => {
+      const result = await this.request(pathname, options)
+      return {
+        emulator: result.emulator,
+        state: {
+          runMode: result.state.runMode,
+          speedMode: result.state.speedMode,
+        },
+      }
+    }, signal)
+  }
+
+  reset(signal) {
+    return this.changeMachine("/api/machine/reset", { method: "POST" }, signal)
+  }
+
+  boot(signal) {
+    return this.changeMachine("/api/machine/boot", { method: "POST" }, signal)
+  }
+
+  pause(signal) {
+    return this.changeMachine("/api/machine/pause", { method: "POST" }, signal)
+  }
+
+  resume(signal) {
+    return this.changeMachine("/api/machine/resume", { method: "POST" }, signal)
+  }
+
+  setSpeed(speed, signal) {
+    return this.changeMachine("/api/machine", { method: "PATCH", body: { speedMode: speed } }, signal)
   }
 
   async readMemory({ address, length }) {
@@ -129,7 +241,7 @@ export class Apple2tsObservationCore {
       length: String(length),
       format: "bytes",
     })
-    const result = await this.read(`/api/debug/memory?${query}`)
+    const result = await this.request(`/api/debug/memory?${query}`)
     return {
       emulator: result.emulator,
       value: {
@@ -140,6 +252,59 @@ export class Apple2tsObservationCore {
     }
   }
 }
+
+const machineTools = [
+  {
+    name: "boot",
+    title: "Boot Apple II",
+    description: "Boot the emulator and return its confirmed machine state.",
+    inputSchema: noInputSchema,
+    destructiveHint: true,
+    idempotentHint: false,
+    execute: (core, _input, signal) => core.boot(signal),
+  },
+  {
+    name: "reset",
+    title: "Reset Apple II",
+    description: "Reset the emulator and return its confirmed machine state.",
+    inputSchema: noInputSchema,
+    destructiveHint: true,
+    idempotentHint: false,
+    execute: (core, _input, signal) => core.reset(signal),
+  },
+  {
+    name: "pause",
+    title: "Pause Apple II",
+    description: "Pause the emulator and return its confirmed machine state.",
+    inputSchema: noInputSchema,
+    destructiveHint: false,
+    idempotentHint: true,
+    execute: (core, _input, signal) => core.pause(signal),
+  },
+  {
+    name: "resume",
+    title: "Resume Apple II",
+    description: "Resume the emulator and return its confirmed machine state.",
+    inputSchema: noInputSchema,
+    destructiveHint: false,
+    idempotentHint: true,
+    execute: (core, _input, signal) => core.resume(signal),
+  },
+  {
+    name: "set_speed",
+    title: "Set Apple II speed",
+    description: "Set speed from -2 (0.1 MHz) through 4 (maximum) and return the confirmed machine state.",
+    inputSchema: speedInputSchema,
+    destructiveHint: false,
+    idempotentHint: true,
+    execute: (core, input, signal) => core.setSpeed(input.speed, signal),
+  },
+]
+
+const toolResult = (result) => ({
+  content: [{ type: "text", text: JSON.stringify(result) }],
+  structuredContent: result,
+})
 
 export const createMcpServer = (core) => {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION })
@@ -186,11 +351,7 @@ export const createMcpServer = (core) => {
     },
     async (input) => {
       try {
-        const result = await core.readMemory(input)
-        return {
-          content: [{ type: "text", text: JSON.stringify(result) }],
-          structuredContent: result,
-        }
+        return toolResult(await core.readMemory(input))
       } catch (error) {
         return {
           isError: true,
@@ -199,6 +360,25 @@ export const createMcpServer = (core) => {
       }
     },
   )
+
+  for (const tool of machineTools) {
+    server.registerTool(
+      tool.name,
+      {
+        title: tool.title,
+        description: tool.description,
+        inputSchema: tool.inputSchema,
+        outputSchema: machineResultSchema,
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: tool.destructiveHint,
+          idempotentHint: tool.idempotentHint,
+          openWorldHint: false,
+        },
+      },
+      async (input, context) => toolResult(await tool.execute(core, input, context.mcpReq.signal)),
+    )
+  }
 
   return server
 }
@@ -393,7 +573,7 @@ export const runStdio = async (options = {}) => {
       logger: { log: (message) => process.stderr.write(`${message}\n`) },
     })
     const listener = await listenerPromise
-    const core = new Apple2tsObservationCore(
+    const core = new Apple2tsCore(
       listener.url,
       controllerToken,
       {
