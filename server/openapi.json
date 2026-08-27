@@ -425,6 +425,56 @@
         }
       }
     },
+    "/api/debug/binary": {
+      "put": {
+        "tags": ["Debug"],
+        "summary": "Load a binary into main RAM",
+        "description": "Available only in a process-owned private emulator session. Loads the bytes into main RAM independently of the active soft-switch mapping. The complete range must fit within $0000-$BFFF.",
+        "parameters": [
+          {
+            "name": "address",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 49151
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary",
+                "contentMediaType": "application/octet-stream",
+                "minLength": 1,
+                "maxLength": 49152
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/BinaryLoadReceiptResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
     "/api/debug/memory/full": {
       "get": {
         "tags": ["Debug"],
@@ -819,6 +869,16 @@
           }
         }
       },
+      "BinaryLoadReceiptResponse": {
+        "description": "Completed binary load",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/BinaryLoadReceiptEnvelope"
+            }
+          }
+        }
+      },
       "MemoryFullResponse": {
         "description": "Full memory dump",
         "content": {
@@ -909,8 +969,28 @@
           }
         }
       },
+      "Unauthorized": {
+        "description": "Controller authorization is required",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            }
+          }
+        }
+      },
       "NotFound": {
         "description": "Requested resource was not found",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            }
+          }
+        }
+      },
+      "ServiceUnavailable": {
+        "description": "No browser emulator is connected",
         "content": {
           "application/json": {
             "schema": {
@@ -1236,6 +1316,28 @@
         "required": ["start", "data"],
         "additionalProperties": false
       },
+      "BinaryLoadReceipt": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 49151
+          },
+          "bytesWritten": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 49152
+          },
+          "sha256": {
+            "type": "string",
+            "description": "SHA-256 digest of the accepted source bytes after the browser worker completed the write.",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "required": ["address", "bytesWritten", "sha256"],
+        "additionalProperties": false
+      },
       "SoftSwitchState": {
         "type": "object",
         "properties": {
@@ -1554,6 +1656,18 @@
           },
           "data": {
             "$ref": "#/components/schemas/MemoryRange"
+          }
+        },
+        "required": ["ok", "data"]
+      },
+      "BinaryLoadReceiptEnvelope": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "data": {
+            "$ref": "#/components/schemas/BinaryLoadReceipt"
           }
         },
         "required": ["ok", "data"]

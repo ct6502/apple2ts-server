@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
+import { createHash } from "node:crypto"
 import { access, mkdtemp, readFile, rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -352,6 +353,121 @@ test("private bridge rejects invalid and unavailable memory ranges", async (t) =
   assert.equal(unavailable.body.error.code, "BAD_REQUEST")
 })
 
+test("private bridge loads a binary into main RAM and returns a completion receipt", async (t) => {
+  const listener = await startApple2tsServer({
+    port: 0,
+    privateRenderer: { remoteControlToken: token, rendererId, controllerToken },
+    logger: { log() {} },
+  })
+  t.after(stopApple2tsServer)
+
+  const renderer = await connectFakeRenderer(listener.url, { autoServe: false })
+  t.after(() => renderer.stop())
+  const bytes = Buffer.from([0xA9, 0x42, 0x60])
+
+  const loadRequest = fetch(new URL("/api/debug/binary?address=24576", listener.url), {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${controllerToken}`,
+      "Content-Type": "application/octet-stream",
+    },
+    body: bytes,
+  })
+  const loadCommand = await renderer.nextCommand()
+  assert.deepEqual(
+    { action: loadCommand.action, payload: loadCommand.payload },
+    { action: "loadBinary", payload: { address: 0x6000, dataBase64: bytes.toString("base64") } },
+  )
+  assert.equal((await renderer.reply(loadCommand)).status, 200)
+
+  const response = await loadRequest
+  assert.equal(response.status, 200)
+  assert.deepEqual(await response.json(), {
+    ok: true,
+    data: {
+      address: 0x6000,
+      bytesWritten: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    },
+  })
+
+  const rejectedResponse = await fetch(new URL("/api/debug/binary?address=49151", listener.url), {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${controllerToken}`,
+      "Content-Type": "application/octet-stream",
+    },
+    body: Buffer.from([1, 2]),
+  })
+  assert.equal(rejectedResponse.status, 400)
+  assert.equal((await rejectedResponse.json()).error.message, "Binary block must fit within main RAM at $0000-$BFFF")
+})
+
+test("private bridge rejects invalid binary input", async (t) => {
+  const listener = await startApple2tsServer({
+    port: 0,
+    privateRenderer: { remoteControlToken: token, rendererId, controllerToken },
+    logger: { log() {} },
+  })
+  t.after(stopApple2tsServer)
+
+  const renderer = await connectFakeRenderer(listener.url, { autoServe: false })
+  t.after(() => renderer.stop())
+
+  for (const request of [
+    new Request(new URL("/api/debug/binary?address=0", listener.url), {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${controllerToken}`, "Content-Type": "text/plain" },
+      body: "x",
+    }),
+    new Request(new URL("/api/debug/binary", listener.url), {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${controllerToken}`, "Content-Type": "application/octet-stream" },
+      body: Buffer.from([1]),
+    }),
+    new Request(new URL("/api/debug/binary?address=65535", listener.url), {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${controllerToken}`, "Content-Type": "application/octet-stream" },
+      body: Buffer.from([1, 2]),
+    }),
+    new Request(new URL("/api/debug/binary?address=49151", listener.url), {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${controllerToken}`, "Content-Type": "application/octet-stream" },
+      body: Buffer.from([1, 2]),
+    }),
+    new Request(new URL("/api/debug/binary?address=0", listener.url), {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${controllerToken}`, "Content-Type": "application/octet-stream" },
+      body: Buffer.alloc(0),
+    }),
+  ]) {
+    const response = await fetch(request)
+    assert.equal(response.status, 400)
+    assert.equal((await response.json()).error.code, "BAD_REQUEST")
+  }
+
+  const uploadController = new AbortController()
+  const uploadTimeout = setTimeout(() => uploadController.abort(), 1000)
+  try {
+    const streamedResponse = await fetch(new URL("/api/debug/binary?address=0", listener.url), {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${controllerToken}`, "Content-Type": "application/octet-stream" },
+      body: (async function* () {
+        yield Buffer.alloc(40000)
+        yield Buffer.alloc(40000)
+        await new Promise((resolve) => uploadController.signal.addEventListener("abort", resolve, { once: true }))
+      })(),
+      duplex: "half",
+      signal: uploadController.signal,
+    })
+    assert.equal(streamedResponse.status, 400)
+    assert.equal((await streamedResponse.json()).error.code, "BAD_REQUEST")
+  } finally {
+    clearTimeout(uploadTimeout)
+    uploadController.abort()
+  }
+})
+
 test("non-private server routes preserve legacy access", async (t) => {
   const listener = await startApple2tsServer({ port: 0, logger: { log() {} } })
   t.after(stopApple2tsServer)
@@ -363,6 +479,12 @@ test("non-private server routes preserve legacy access", async (t) => {
   assert.equal(machine.status, 503)
   const memory = await fetch(new URL("/api/debug/memory?start=0&length=1", listener.url))
   assert.equal(memory.status, 503)
+  const binary = await fetch(new URL("/api/debug/binary?address=768", listener.url), {
+    method: "PUT",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: Buffer.from([0x60]),
+  })
+  assert.equal(binary.status, 404)
 })
 
 test("stdio discovery and reads use one renderer and EOF cleans up", async () => {

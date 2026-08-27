@@ -1,5 +1,5 @@
 import { createServer } from "node:http"
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { promises as fs } from "node:fs"
 import path from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
@@ -18,6 +18,7 @@ let logger = console
 
 const clients = new Map()
 const pendingCommands = new Map()
+const MAX_BINARY_BYTES = 0xC000
 
 const MIME_TYPES = {
   ".css": "text/css; charset=utf-8",
@@ -58,6 +59,20 @@ const readJsonBody = async (req) => {
   }
   const raw = Buffer.concat(chunks).toString("utf8")
   return raw.length ? JSON.parse(raw) : {}
+}
+
+const readBinaryBody = async (req) => {
+  const chunks = []
+  let length = 0
+  for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+    length += chunk.length
+    if (length > MAX_BINARY_BYTES) {
+      req.resume()
+      throw new Error(`Binary input cannot exceed ${MAX_BINARY_BYTES} bytes`)
+    }
+    chunks.push(chunk)
+  }
+  return Buffer.concat(chunks)
 }
 
 const writeEnvelope = (res, statusCode, data) => {
@@ -603,6 +618,7 @@ const dispatchAcceptedInput = async (client, action, payload) => {
 }
 
 const parseInteger = (value) => {
+  if (value === null || value === "") return null
   const parsed = Number(value)
   return Number.isInteger(parsed) ? parsed : null
 }
@@ -616,6 +632,29 @@ const validateMemoryBounds = (start, length) => {
   }
   if (start + length > 65536) {
     throw new Error("Requested memory range exceeds 64 KB address space")
+  }
+}
+
+const loadBinaryBlock = async (client, start, bytes) => {
+  if (bytes.length === 0) {
+    throw new Error("data must contain at least one byte")
+  }
+  validateMemoryBounds(start, bytes.length)
+  if (start + bytes.length > 0xC000) {
+    throw new Error("Binary block must fit within main RAM at $0000-$BFFF")
+  }
+
+  const reply = await dispatchCommand(client, "loadBinary", {
+    address: start,
+    dataBase64: bytes.toString("base64"),
+  }, true)
+  const status = getStatusFromCommandResult(reply.result)
+  if (status) client.latestState = status
+  client.lastSeenAt = Date.now()
+
+  return {
+    bytesWritten: bytes.length,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
   }
 }
 
@@ -1182,6 +1221,49 @@ const server = createServer(async (req, res) => {
 
         writeEnvelope(res, 200, getMemoryRangeResource(memoryDump.data, start, bytes.length, "bytes"))
       } catch (error) {
+        writeErrorEnvelope(
+          res,
+          400,
+          "BAD_REQUEST",
+          error instanceof Error ? error.message : String(error),
+        )
+      }
+      return
+    }
+
+    const isBinaryInput = req.method === "PUT" && url.pathname === "/api/debug/binary"
+
+    if (isBinaryInput && !privateRenderer) {
+      req.resume()
+      writeErrorEnvelope(res, 404, "NOT_FOUND", "Binary loading requires a private emulator session.")
+      return
+    }
+
+    if (isBinaryInput) {
+      const client = getConnectedClient()
+      if (!client) {
+        writeNoConnectedClientError(res)
+        return
+      }
+
+      try {
+        const contentType = req.headers["content-type"]?.split(";", 1)[0].trim().toLowerCase()
+        if (contentType !== "application/octet-stream") {
+          throw new Error("Content-Type must be application/octet-stream")
+        }
+        const address = parseInteger(url.searchParams.get("address"))
+        if (address === null) {
+          throw new Error("address query parameter is required")
+        }
+        const bytes = await readBinaryBody(req)
+        const result = await loadBinaryBlock(client, address, bytes)
+        writeEnvelope(res, 200, {
+          address,
+          bytesWritten: result.bytesWritten,
+          sha256: result.sha256,
+        })
+      } catch (error) {
+        req.resume()
         writeErrorEnvelope(
           res,
           400,
