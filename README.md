@@ -52,15 +52,41 @@ Use `?remoteControl=1` so the browser client auto-registers with the integrated 
 
 ## MCP over stdio
 
-The stdio server needs the Apple2TS browser build at `dist/index.html`. Build
-Apple2TS in its source repository, then copy its generated `dist/` directory
-into this server root.
+The stdio server needs an Apple2TS browser build. Build it in an Apple2TS
+checkout, then copy it into this repository:
+
+```bash
+cd /path/to/apple2ts
+npm ci --ignore-scripts
+npm run build
+
+cd /path/to/apple2ts-server
+npm ci
+rm -rf ./dist
+cp -R /path/to/apple2ts/dist ./dist
+```
 
 `npm run mcp:stdio` starts one private Apple2TS browser session owned by the
-MCP process. Set `APPLE2TS_CHROMIUM_EXECUTABLE` to the Chromium or Chrome
-executable. The browser runs headlessly by default; set
-`APPLE2TS_CHROMIUM_MODE=visible` to open its window. Closing MCP stdin stops
-the server and browser and removes the private browser profile.
+MCP process. A host whose configuration uses an `mcpServers` object can start
+it with an entry like this:
+
+```json
+{
+  "mcpServers": {
+    "apple2ts": {
+      "command": "npm",
+      "args": ["--prefix", "/path/to/apple2ts-server", "run", "mcp:stdio"],
+      "env": {
+        "APPLE2TS_CHROMIUM_EXECUTABLE": "/path/to/chrome"
+      }
+    }
+  }
+}
+```
+
+Replace the paths for your installation. To open the browser window, add
+`"APPLE2TS_CHROMIUM_MODE": "visible"` to `env`. When the host closes the stdio
+connection, the server stops the browser and removes its private profile.
 
 ### Server Docs URLs
 
