@@ -50,6 +50,14 @@ The emulator does not run on the server. It runs in the browser client.
 
 Use `?remoteControl=1` so the browser client auto-registers with the integrated API bridge.
 
+## MCP over stdio
+
+`npm run mcp:stdio` starts one private Apple2TS browser session owned by the
+MCP process. Set `APPLE2TS_CHROMIUM_EXECUTABLE` to the Chromium or Chrome
+executable. The browser runs headlessly by default; set
+`APPLE2TS_CHROMIUM_MODE=visible` to open its window. Closing MCP stdin stops
+the server and browser and removes the private browser profile.
+
 ### Server Docs URLs
 
 - OpenAPI: `/openapi.json`
