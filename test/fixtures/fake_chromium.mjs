@@ -99,6 +99,8 @@ while (!stopping) {
       result = status
     } else if (command.action === "getMemory") {
       result = { memoryDump }
+    } else if (command.action === "loadBinary") {
+      result = status
     }
     const reply = await postJson("/api/client/reply", {
       clientId,

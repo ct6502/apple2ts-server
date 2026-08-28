@@ -3,7 +3,7 @@
 import { randomBytes, randomUUID } from "node:crypto"
 import { spawn } from "node:child_process"
 import { constants as fsConstants } from "node:fs"
-import { access, mkdtemp, rm } from "node:fs/promises"
+import { access, lstat, mkdtemp, open, realpath, rm, stat } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
@@ -27,6 +27,7 @@ const READ_TIMEOUT_MS = 2000
 const MUTATION_RESPONSE_MARGIN_MS = 1000
 const MUTATION_TIMEOUT_MS = Number(process.env.COMMAND_TIMEOUT_MS || 10000)
   + MUTATION_RESPONSE_MARGIN_MS
+const MAX_BINARY_BYTES = 0xC000
 
 const noInputSchema = fromJsonSchema({
   type: "object",
@@ -43,19 +44,21 @@ const speedInputSchema = fromJsonSchema({
   additionalProperties: false,
 })
 
+const emulatorIdentitySchema = {
+  type: "object",
+  properties: {
+    serverInstanceId: { type: "string" },
+    rendererId: { type: "string" },
+    targetId: { type: "string" },
+  },
+  required: ["serverInstanceId", "rendererId", "targetId"],
+  additionalProperties: false,
+}
+
 const machineResultSchema = fromJsonSchema({
   type: "object",
   properties: {
-    emulator: {
-      type: "object",
-      properties: {
-        serverInstanceId: { type: "string" },
-        rendererId: { type: "string" },
-        targetId: { type: "string" },
-      },
-      required: ["serverInstanceId", "rendererId", "targetId"],
-      additionalProperties: false,
-    },
+    emulator: emulatorIdentitySchema,
     state: {
       type: "object",
       properties: {
@@ -83,16 +86,7 @@ const memoryReadInputSchema = fromJsonSchema({
 const memoryReadOutputSchema = fromJsonSchema({
   type: "object",
   properties: {
-    emulator: {
-      type: "object",
-      properties: {
-        serverInstanceId: { type: "string" },
-        rendererId: { type: "string" },
-        targetId: { type: "string" },
-      },
-      required: ["serverInstanceId", "rendererId", "targetId"],
-      additionalProperties: false,
-    },
+    emulator: emulatorIdentitySchema,
     value: {
       type: "object",
       properties: {
@@ -110,6 +104,28 @@ const memoryReadOutputSchema = fromJsonSchema({
     },
   },
   required: ["emulator", "value"],
+  additionalProperties: false,
+})
+
+const binaryLoadInputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    path: { type: "string", minLength: 1 },
+    address: { type: "integer", minimum: 0, maximum: 49151 },
+  },
+  required: ["path", "address"],
+  additionalProperties: false,
+})
+
+const binaryLoadOutputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    emulator: emulatorIdentitySchema,
+    address: { type: "integer", minimum: 0, maximum: 49151 },
+    bytesWritten: { type: "integer", minimum: 1, maximum: MAX_BINARY_BYTES },
+    sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
+  },
+  required: ["emulator", "address", "bytesWritten", "sha256"],
   additionalProperties: false,
 })
 
@@ -133,12 +149,18 @@ const sleep = (milliseconds, signal) =>
 
 const fetchEnvelope = async (baseUrl, pathname, controllerToken, signal, options = {}) => {
   const headers = { Authorization: `Bearer ${controllerToken}` }
-  if (options.body !== undefined) headers["Content-Type"] = "application/json"
+  if (options.body !== undefined) {
+    headers["Content-Type"] = options.contentType || "application/json"
+  }
   const method = options.method || "GET"
   const response = await fetch(new URL(pathname, baseUrl), {
     method,
     headers,
-    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    body: options.body === undefined
+      ? undefined
+      : options.contentType
+        ? options.body
+        : JSON.stringify(options.body),
     signal: AbortSignal.any([
       signal,
       AbortSignal.timeout(method === "GET" ? READ_TIMEOUT_MS : MUTATION_TIMEOUT_MS),
@@ -152,12 +174,98 @@ const fetchEnvelope = async (baseUrl, pathname, controllerToken, signal, options
   return payload.data
 }
 
+const resolveBinaryRoot = async (configuredRoot) => {
+  if (!configuredRoot) return null
+  try {
+    const root = await realpath(path.resolve(configuredRoot))
+    if (!(await stat(root)).isDirectory()) throw new Error()
+    await access(root, fsConstants.R_OK | fsConstants.X_OK)
+    return root
+  } catch {
+    throw new Error("APPLE2TS_BINARY_ROOT must name a readable directory")
+  }
+}
+
+const readAtMost = async (handle, limit) => {
+  const buffer = Buffer.allocUnsafe(limit)
+  let length = 0
+  while (length < limit) {
+    const { bytesRead } = await handle.read(buffer, length, limit - length)
+    if (bytesRead === 0) break
+    length += bytesRead
+  }
+  return buffer.subarray(0, length)
+}
+
+const readBinaryFile = async (root, filePath, address) => {
+  if (typeof filePath !== "string" || filePath.length === 0 || path.isAbsolute(filePath)) {
+    throw new Error("path must be a non-empty path relative to APPLE2TS_BINARY_ROOT")
+  }
+  if (!Number.isInteger(address) || address < 0 || address >= MAX_BINARY_BYTES) {
+    throw new Error("address must be an integer between 0 and 49151")
+  }
+
+  const candidate = path.resolve(root, filePath)
+  const relative = path.relative(root, candidate)
+  if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error("path must stay within APPLE2TS_BINARY_ROOT")
+  }
+
+  let pathInfo
+  try {
+    pathInfo = await lstat(candidate)
+  } catch {
+    throw new Error("binary file is unavailable or unreadable")
+  }
+  if (pathInfo.isSymbolicLink()) throw new Error("symbolic links are not allowed")
+  if (!pathInfo.isFile()) throw new Error("path must name a regular file")
+
+  let resolvedFile
+  try {
+    resolvedFile = await realpath(candidate)
+  } catch {
+    throw new Error("binary file is unavailable or unreadable")
+  }
+  if (resolvedFile !== candidate) throw new Error("symbolic links are not allowed")
+
+  let handle
+  try {
+    try {
+      handle = await open(
+        candidate,
+        fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+      )
+    } catch {
+      throw new Error("binary file is unavailable or unreadable")
+    }
+    const fileInfo = await handle.stat()
+    if (!fileInfo.isFile()) throw new Error("path must name a regular file")
+    if (fileInfo.size === 0) throw new Error("binary file must not be empty")
+    if (fileInfo.size > MAX_BINARY_BYTES) {
+      throw new Error(`binary file cannot exceed ${MAX_BINARY_BYTES} bytes`)
+    }
+    if (address + fileInfo.size > MAX_BINARY_BYTES) {
+      throw new Error("binary block must fit within main RAM at $0000-$BFFF")
+    }
+
+    const bytes = await readAtMost(handle, MAX_BINARY_BYTES - address + 1)
+    if (bytes.length === 0) throw new Error("binary file must not be empty")
+    if (bytes.length > MAX_BINARY_BYTES || address + bytes.length > MAX_BINARY_BYTES) {
+      throw new Error("binary block must fit within main RAM at $0000-$BFFF")
+    }
+    return bytes
+  } finally {
+    await handle?.close()
+  }
+}
+
 export class Apple2tsCore {
-  constructor(baseUrl, controllerToken, identity, signal = new AbortController().signal) {
+  constructor(baseUrl, controllerToken, identity, signal = new AbortController().signal, binaryRoot = null) {
     this.baseUrl = baseUrl
     this.controllerToken = controllerToken
     this.identity = identity
     this.signal = signal
+    this.binaryRoot = binaryRoot
     this.mutations = Promise.resolve()
     this.mutationFailure = null
   }
@@ -175,18 +283,24 @@ export class Apple2tsCore {
     return this.request("/api/debug/cpu")
   }
 
-  serializeMutation(operation, signal) {
+  serializeMutation(operation, signal, { prepare = false } = {}) {
     const mutation = this.mutations.then(async () => {
       if (this.mutationFailure) throw this.mutationFailure
       if (signal?.aborted) throw signal.reason
+      let mutationStarted = !prepare
       const markUncertain = () => {
+        if (!mutationStarted) return
         this.mutationFailure ||= new Error(
           "The previous mutation did not complete cleanly; restart this MCP session",
         )
       }
+      const startMutation = () => {
+        if (signal?.aborted) throw signal.reason
+        mutationStarted = true
+      }
       signal?.addEventListener("abort", markUncertain, { once: true })
       try {
-        return await operation()
+        return await operation(startMutation)
       } catch (error) {
         markUncertain()
         throw error
@@ -255,6 +369,19 @@ export class Apple2tsCore {
         bytes: result.state.data,
       },
     }
+  }
+
+  loadBinary({ path: filePath, address }, signal) {
+    return this.serializeMutation(async (startMutation) => {
+      const bytes = await readBinaryFile(this.binaryRoot, filePath, address)
+      startMutation()
+      const query = new URLSearchParams({ address: String(address) })
+      const receipt = await this.request(
+        `/api/debug/binary?${query}`,
+        { method: "PUT", body: bytes, contentType: "application/octet-stream" },
+      )
+      return { emulator: receipt.emulator, ...receipt.state }
+    }, signal, { prepare: true })
   }
 }
 
@@ -365,6 +492,34 @@ export const createMcpServer = (core) => {
       }
     },
   )
+
+  if (core.binaryRoot) {
+    server.registerTool(
+      "load_binary",
+      {
+        title: "Load an Apple II binary",
+        description: "Load one file from the configured trusted binary root into main RAM.",
+        inputSchema: binaryLoadInputSchema,
+        outputSchema: binaryLoadOutputSchema,
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async (input, context) => {
+        try {
+          return toolResult(await core.loadBinary(input, context.mcpReq.signal))
+        } catch (error) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+          }
+        }
+      },
+    )
+  }
 
   for (const tool of machineTools) {
     server.registerTool(
@@ -567,6 +722,7 @@ export const runStdio = async (options = {}) => {
 
   try {
     if (!options.chromiumExecutable) throw new Error("APPLE2TS_CHROMIUM_EXECUTABLE is required")
+    const binaryRoot = await resolveBinaryRoot(options.binaryRoot)
     const chromiumMode = options.chromiumMode ?? "headless"
     if (chromiumMode !== "headless" && chromiumMode !== "visible") {
       throw new Error("APPLE2TS_CHROMIUM_MODE must be 'headless' or 'visible'")
@@ -591,6 +747,7 @@ export const runStdio = async (options = {}) => {
         targetId: `${listener.serverInstanceId}:${rendererId}`,
       },
       shutdownController.signal,
+      binaryRoot,
     )
     rendererPromise = launchChromium({
       executable: options.chromiumExecutable,
@@ -640,5 +797,6 @@ if (isMain) {
     startupTimeoutMs: process.env.APPLE2TS_STARTUP_TIMEOUT_MS,
     chromiumExecutable: process.env.APPLE2TS_CHROMIUM_EXECUTABLE,
     chromiumMode: process.env.APPLE2TS_CHROMIUM_MODE,
+    binaryRoot: process.env.APPLE2TS_BINARY_ROOT,
   })
 }

@@ -77,7 +77,8 @@ it with an entry like this:
       "command": "npm",
       "args": ["--prefix", "/path/to/apple2ts-server", "run", "mcp:stdio"],
       "env": {
-        "APPLE2TS_CHROMIUM_EXECUTABLE": "/path/to/chrome"
+        "APPLE2TS_CHROMIUM_EXECUTABLE": "/path/to/chrome",
+        "APPLE2TS_BINARY_ROOT": "/path/to/apple2-binaries"
       }
     }
   }
@@ -87,6 +88,12 @@ it with an entry like this:
 Replace the paths for your installation. To open the browser window, add
 `"APPLE2TS_CHROMIUM_MODE": "visible"` to `env`. When the host closes the stdio
 connection, the server stops the browser and removes its private profile.
+
+To enable `load_binary`, create or choose a directory containing Apple II
+binary files and set `APPLE2TS_BINARY_ROOT` to its path before startup. The
+tool accepts paths relative to that directory and is hidden when the setting
+is absent. Do not change the directory while the server runs. A file can be
+up to 49,152 bytes and must fit in main RAM at `$0000-$BFFF`.
 
 ### Server Docs URLs
 

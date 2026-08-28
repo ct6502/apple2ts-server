@@ -1,11 +1,12 @@
 import assert from "node:assert/strict"
-import { spawn } from "node:child_process"
+import { execFile, spawn } from "node:child_process"
 import { createHash } from "node:crypto"
-import { access, mkdtemp, readFile, rm } from "node:fs/promises"
+import { access, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises"
 import { createServer } from "node:http"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { promisify } from "node:util"
 import test from "node:test"
 
 import { Apple2tsCore } from "../server/mcp_stdio.mjs"
@@ -22,6 +23,7 @@ const controllerToken = "test-controller-token"
 const rendererId = "test-renderer"
 const cleanupGraceTimeoutMs = 5000
 const cleanupKillTimeoutMs = 1000
+const execFileAsync = promisify(execFile)
 
 const postJson = (url, body) =>
   fetch(url, {
@@ -183,6 +185,7 @@ const launchMcp = async (overrides = {}, runner = mcpTestRunner) => {
       APPLE2TS_STARTUP_TIMEOUT_MS: "3000",
       APPLE2TS_CHROMIUM_EXECUTABLE: fakeChromium,
       APPLE2TS_CHROMIUM_MODE: "headless",
+      APPLE2TS_BINARY_ROOT: "",
       APPLE2TS_FAKE_CHROMIUM_RECEIPT: receiptPath,
       ...overrides,
     },
@@ -572,6 +575,87 @@ test("a failed mutation prevents later mutations in the same session", async (t)
   assert.equal(requests, 1)
 })
 
+test("configured binary loading validates and serializes one local file", async (t) => {
+  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-binary-root-"))
+  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
+  await writeFile(path.join(binaryRoot, "valid.bin"), Buffer.from([0xA9, 0x42, 0x60]))
+  await writeFile(path.join(binaryRoot, "empty.bin"), Buffer.alloc(0))
+  await writeFile(path.join(binaryRoot, "large.bin"), Buffer.alloc(0xC001))
+  await mkdir(path.join(binaryRoot, "directory"))
+  await symlink(path.join(binaryRoot, "valid.bin"), path.join(binaryRoot, "link.bin"))
+  if (process.platform !== "win32") {
+    await execFileAsync("mkfifo", [path.join(binaryRoot, "pipe.bin")])
+  }
+
+  const requestPaths = []
+  const bridge = createServer(async (req, res) => {
+    requestPaths.push(req.url)
+    assert.equal(req.headers.authorization, `Bearer ${controllerToken}`)
+    if (req.url === "/api/machine/resume") {
+      assert.equal(req.method, "POST")
+      res.setHeader("Content-Type", "application/json")
+      res.end(JSON.stringify({ ok: true, data: { runMode: "running", speedMode: 0 } }))
+      return
+    }
+    assert.equal(req.method, "PUT")
+    assert.equal(req.url, "/api/debug/binary?address=24576")
+    assert.equal(req.headers["content-type"], "application/octet-stream")
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    const bytes = Buffer.concat(chunks)
+    assert.deepEqual(bytes, Buffer.from([0xA9, 0x42, 0x60]))
+    res.setHeader("Content-Type", "application/json")
+    res.end(JSON.stringify({
+      ok: true,
+      data: {
+        address: 0x6000,
+        bytesWritten: bytes.length,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+      },
+    }))
+  })
+  await new Promise((resolve) => bridge.listen(0, "127.0.0.1", resolve))
+  t.after(() => new Promise((resolve) => bridge.close(resolve)))
+  const address = bridge.address()
+  const identity = { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" }
+  const core = new Apple2tsCore(
+    `http://127.0.0.1:${address.port}`,
+    controllerToken,
+    identity,
+    new AbortController().signal,
+    await realpath(binaryRoot),
+  )
+
+  const [loaded, resumed] = await Promise.all([
+    core.loadBinary({ path: "valid.bin", address: 0x6000 }),
+    core.resume(),
+  ])
+  assert.deepEqual(loaded, {
+    emulator: identity,
+    address: 0x6000,
+    bytesWritten: 3,
+    sha256: createHash("sha256").update(Buffer.from([0xA9, 0x42, 0x60])).digest("hex"),
+  })
+  assert.equal(resumed.state.runMode, "running")
+  assert.deepEqual(requestPaths, ["/api/debug/binary?address=24576", "/api/machine/resume"])
+  const invalidInputs = [
+    { path: "", address: 0 },
+    { path: path.join(binaryRoot, "valid.bin"), address: 0 },
+    { path: "../valid.bin", address: 0 },
+    { path: "link.bin", address: 0 },
+    { path: "directory", address: 0 },
+    { path: "empty.bin", address: 0 },
+    { path: "large.bin", address: 0 },
+    { path: "valid.bin", address: 0xBFFE },
+    { path: "missing.bin", address: 0 },
+  ]
+  if (process.platform !== "win32") invalidInputs.push({ path: "pipe.bin", address: 0 })
+  for (const input of invalidInputs) {
+    await assert.rejects(core.loadBinary(input))
+  }
+  assert.equal(requestPaths.length, 2)
+})
+
 test("cancelling an active mutation prevents later mutations in the same session", async (t) => {
   let release
   let started
@@ -755,6 +839,55 @@ test("stdio test cleanup escalates when its child ignores EOF", async (t) => {
   await wedged.cleanup()
 })
 
+test("configured stdio advertises and loads a local binary", async (t) => {
+  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-mcp-binaries-"))
+  await writeFile(path.join(binaryRoot, "fixture.bin"), Buffer.from([0xA9, 0x42, 0x60]))
+  const processState = await launchMcp({ APPLE2TS_BINARY_ROOT: binaryRoot })
+  t.after(processState.cleanup)
+  try {
+    await processState.waitForStderr((line) => line.includes("MCP ready"))
+    processState.child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-11-25",
+        capabilities: {},
+        clientInfo: { name: "test", version: "1" },
+      },
+    })}\n`)
+    await processState.waitForStdout((line) => JSON.parse(line).id === 1)
+    processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`)
+    processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" })}\n`)
+    const tools = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 2))
+    assert.ok(tools.result.tools.some((tool) => tool.name === "load_binary"))
+
+    processState.child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "load_binary", arguments: { path: "fixture.bin", address: 0x6000 } },
+    })}\n`)
+    const loaded = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 3))
+    assert.equal(loaded.result.isError, undefined)
+    assert.equal(loaded.result.structuredContent.emulator.rendererId, rendererId)
+    assert.equal(loaded.result.structuredContent.address, 0x6000)
+    assert.equal(loaded.result.structuredContent.bytesWritten, 3)
+    assert.equal(loaded.result.structuredContent.sha256.length, 64)
+
+    processState.child.stdin.end()
+    const outcome = await processState.waitForExit()
+    assert.equal(outcome.code, 0, processState.getStderr())
+  } finally {
+    if (processState.child.exitCode === null) processState.child.kill("SIGTERM")
+    await processState.waitForExit()
+    await Promise.all([
+      processState.cleanup(),
+      rm(binaryRoot, { recursive: true, force: true }),
+    ])
+  }
+})
+
 test("visible Chromium uses the same owned session and cleanup", async (t) => {
   const visible = await launchMcp({ APPLE2TS_CHROMIUM_MODE: "visible" })
   t.after(visible.cleanup)
@@ -802,6 +935,20 @@ test("missing browser build fails before private resources start", async (t) => 
   assert.equal(missing.getStdout(), "")
   await assert.rejects(access(missing.receiptPath))
   await missing.cleanup()
+})
+
+test("invalid binary root fails before private resources start", async (t) => {
+  const missingRoot = path.join(os.tmpdir(), `apple2ts-missing-binary-root-${process.pid}`)
+  const invalid = await launchMcp({ APPLE2TS_BINARY_ROOT: missingRoot })
+  t.after(invalid.cleanup)
+  const outcome = await invalid.waitForExit()
+
+  assert.equal(outcome.error, null)
+  assert.equal(outcome.code, 1)
+  assert.match(invalid.getStderr(), /APPLE2TS_BINARY_ROOT must name a readable directory/)
+  assert.doesNotMatch(invalid.getStderr(), /private bridge listening/)
+  assert.equal(invalid.getStdout(), "")
+  await invalid.cleanup()
 })
 
 test("unexpected renderer exit closes stdio and owned resources", async (t) => {
