@@ -524,7 +524,7 @@ test("non-private server routes preserve legacy access", async (t) => {
   assert.equal(binary.status, 404)
 })
 
-test("machine changes wait for prior callers and the mutation deadline", async (t) => {
+test("mutations wait for prior callers and the mutation deadline", async (t) => {
   let activeRequests = 0
   let maxActiveRequests = 0
   const bridge = createServer(async (req, res) => {
@@ -532,10 +532,15 @@ test("machine changes wait for prior callers and the mutation deadline", async (
     maxActiveRequests = Math.max(maxActiveRequests, activeRequests)
     const chunks = []
     for await (const chunk of req) chunks.push(chunk)
-    const { speedMode } = JSON.parse(Buffer.concat(chunks).toString("utf8"))
-    if (speedMode === 4) await new Promise((resolve) => setTimeout(resolve, 2100))
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"))
+    if (body.speedMode === 4) await new Promise((resolve) => setTimeout(resolve, 2100))
     res.setHeader("Content-Type", "application/json")
-    res.end(JSON.stringify({ ok: true, data: { runMode: "paused", speedMode } }))
+    res.end(JSON.stringify({
+      ok: true,
+      data: req.url === "/api/debug/cpu"
+        ? { PC: body.PC, PStatus: body.PStatus }
+        : { runMode: "paused", speedMode: body.speedMode },
+    }))
     activeRequests -= 1
   })
   await new Promise((resolve) => bridge.listen(0, "127.0.0.1", resolve))
@@ -547,9 +552,14 @@ test("machine changes wait for prior callers and the mutation deadline", async (
     { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
   )
 
-  const [accelerated, normalized] = await Promise.all([core.setSpeed(4), core.setSpeed(0)])
+  const [accelerated, cpu, normalized] = await Promise.all([
+    core.setSpeed(4),
+    core.setCpu({ PC: 0x6000, PStatus: 0x20 }),
+    core.setSpeed(0),
+  ])
   assert.equal(maxActiveRequests, 1)
   assert.equal(accelerated.state.speedMode, 4)
+  assert.deepEqual(cpu.value, { PC: 0x6000, PStatus: 0x20 })
   assert.equal(normalized.state.speedMode, 0)
 })
 
@@ -743,6 +753,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
       "set_breakpoint",
       "clear_breakpoint",
       "clear_all_breakpoints",
+      "set_cpu",
     ],
   )
   assert.deepEqual(tools.result.tools[0].inputSchema, {
@@ -777,6 +788,16 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.equal(clearBreakpointTool.outputSchema.properties.value.properties.cleared.type, "boolean")
   assert.equal(clearBreakpointTool.annotations.destructiveHint, true)
   assert.equal(clearBreakpointTool.annotations.idempotentHint, true)
+  const setCpuTool = tools.result.tools.find((tool) => tool.name === "set_cpu")
+  assert.deepEqual(setCpuTool.inputSchema, {
+    type: "object",
+    properties: {
+      PC: { type: "integer", minimum: 0, maximum: 65535 },
+      PStatus: { type: "integer", minimum: 0, maximum: 255 },
+    },
+    anyOf: [{ required: ["PC"] }, { required: ["PStatus"] }],
+    additionalProperties: false,
+  })
 
   processState.child.stdin.write(`${JSON.stringify({
     jsonrpc: "2.0",
@@ -830,36 +851,58 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.equal(accelerated.state.runMode, "paused")
   assert.equal(accelerated.state.speedMode, 4)
 
-  const breakpoint = await callTool(10, "set_breakpoint", { address: 0x6003 })
+  const emptyCpu = await requestTool(10, "set_cpu")
+  assert.equal(emptyCpu.result.isError, true)
+  assert.match(emptyCpu.result.content[0].text, /Input validation error/)
+
+  const pcOnly = await callTool(11, "set_cpu", { PC: 0x6000 })
+  assert.deepEqual(pcOnly, {
+    emulator: payload.emulator,
+    value: { PC: 0x6000, PStatus: 0x20 },
+  })
+
+  const statusOnly = await callTool(12, "set_cpu", { PStatus: 0x24 })
+  assert.deepEqual(statusOnly, {
+    emulator: payload.emulator,
+    value: { PC: 0x6000, PStatus: 0x24 },
+  })
+
+  const cpu = await callTool(13, "set_cpu", { PC: 0x6001, PStatus: 0x20 })
+  assert.deepEqual(cpu, {
+    emulator: payload.emulator,
+    value: { PC: 0x6001, PStatus: 0x20 },
+  })
+
+  const breakpoint = await callTool(14, "set_breakpoint", { address: 0x6003 })
   assert.deepEqual(breakpoint, {
     emulator: payload.emulator,
     value: { address: 0x6003, breakpointId: "bp:24579" },
   })
-  const occupied = await callTool(11, "set_breakpoint", { address: 0x6003 })
+  const occupied = await callTool(15, "set_breakpoint", { address: 0x6003 })
   assert.deepEqual(occupied, breakpoint)
-  await callTool(12, "set_breakpoint", { address: 0x6006 })
-  const cleared = await callTool(13, "clear_breakpoint", { address: 0x6003 })
+  await callTool(16, "set_breakpoint", { address: 0x6006 })
+  const cleared = await callTool(17, "clear_breakpoint", { address: 0x6003 })
   assert.deepEqual(cleared.value, {
     address: 0x6003,
     breakpointId: "bp:24579",
     cleared: true,
   })
-  const absent = await callTool(14, "clear_breakpoint", { address: 0x6003 })
+  const absent = await callTool(18, "clear_breakpoint", { address: 0x6003 })
   assert.equal(absent.value.cleared, false)
-  const clearedAll = await callTool(15, "clear_all_breakpoints")
+  const clearedAll = await callTool(19, "clear_all_breakpoints")
   assert.equal(clearedAll.value.count, 1)
-  const clearedEmpty = await callTool(16, "clear_all_breakpoints")
+  const clearedEmpty = await callTool(20, "clear_all_breakpoints")
   assert.equal(clearedEmpty.value.count, 0)
 
-  const invalidBreakpoint = await requestTool(17, "set_breakpoint", { address: 65536 })
+  const invalidBreakpoint = await requestTool(21, "set_breakpoint", { address: 65536 })
   assert.equal(invalidBreakpoint.result.isError, true)
   assert.match(invalidBreakpoint.result.content[0].text, /Input validation error/)
 
-  const resumed = await callTool(18, "resume")
+  const resumed = await callTool(22, "resume")
   assert.equal(resumed.state.runMode, "running")
   assert.equal(resumed.state.speedMode, 4)
 
-  const reset = await callTool(19, "reset")
+  const reset = await callTool(23, "reset")
   assert.equal(reset.state.runMode, "running")
   assert.equal(reset.state.speedMode, 4)
 

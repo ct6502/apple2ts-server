@@ -118,6 +118,9 @@ while (!stopping) {
         breakpoints = structuredClone(nextBreakpoints)
         result = { breakpoints }
       }
+    } else if (command.action === "setCpuState") {
+      status.machine.machineState = command.payload.state
+      result = status
     }
     const reply = await postJson("/api/client/reply", {
       clientId,
