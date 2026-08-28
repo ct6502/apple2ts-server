@@ -129,6 +129,71 @@ const binaryLoadOutputSchema = fromJsonSchema({
   additionalProperties: false,
 })
 
+const breakpointInputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    address: { type: "integer", minimum: 0, maximum: 65535 },
+  },
+  required: ["address"],
+  additionalProperties: false,
+})
+
+const breakpointResultSchema = (extraProperties = {}, extraRequired = []) => fromJsonSchema({
+  type: "object",
+  properties: {
+    emulator: emulatorIdentitySchema,
+    value: {
+      type: "object",
+      properties: {
+        address: { type: "integer", minimum: 0, maximum: 65535 },
+        breakpointId: { type: "string" },
+        ...extraProperties,
+      },
+      required: ["address", "breakpointId", ...extraRequired],
+      additionalProperties: false,
+    },
+  },
+  required: ["emulator", "value"],
+  additionalProperties: false,
+})
+
+const breakpointClearAllResultSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    emulator: emulatorIdentitySchema,
+    value: {
+      type: "object",
+      properties: { count: { type: "integer", minimum: 0 } },
+      required: ["count"],
+      additionalProperties: false,
+    },
+  },
+  required: ["emulator", "value"],
+  additionalProperties: false,
+})
+
+const executionBreakpoint = (address) => ({
+  address,
+  watchpoint: false,
+  instruction: false,
+  disabled: false,
+  hidden: false,
+  once: false,
+  memget: false,
+  memset: true,
+  expression1: { register: "", address: 0x300, operator: "==", value: 0x80 },
+  expression2: { register: "", address: 0x300, operator: "==", value: 0x80 },
+  expressionOperator: "",
+  hexvalue: -1,
+  hitcount: 1,
+  nhits: 0,
+  memoryBank: "",
+  action1: { action: "", register: "A", address: 0x300, value: 0 },
+  action2: { action: "", register: "A", address: 0x300, value: 0 },
+  halt: false,
+  basic: false,
+})
+
 const sleep = (milliseconds, signal) =>
   new Promise((resolve, reject) => {
     if (signal.aborted) {
@@ -345,6 +410,63 @@ export class Apple2tsCore {
     return this.changeMachine("/api/machine", { method: "PATCH", body: { speedMode: speed } }, signal)
   }
 
+  setBreakpoint(address, signal) {
+    return this.serializeMutation(async () => {
+      const before = await this.request("/api/debug/breakpoints")
+      const existing = before.state.find((breakpoint) => breakpoint.address === address)
+      if (existing) {
+        return {
+          emulator: before.emulator,
+          value: { address, breakpointId: existing.breakpointId || `bp:${address}` },
+        }
+      }
+      const result = await this.request("/api/debug/breakpoints", {
+        method: "POST",
+        body: executionBreakpoint(address),
+      })
+      if (result.state?.address !== address) {
+        throw new Error("Apple2TS did not confirm the requested breakpoint")
+      }
+      return {
+        emulator: result.emulator,
+        value: { address, breakpointId: result.state.breakpointId },
+      }
+    }, signal)
+  }
+
+  clearBreakpoint(address, signal) {
+    return this.serializeMutation(async () => {
+      const before = await this.request("/api/debug/breakpoints")
+      const cleared = before.state.some((breakpoint) => breakpoint.address === address)
+      const result = cleared
+        ? await this.request(`/api/debug/breakpoints/bp:${address}`, { method: "DELETE" })
+        : before
+      if (result.state.some((breakpoint) => breakpoint.address === address)) {
+        throw new Error("Apple2TS did not confirm breakpoint removal")
+      }
+      return {
+        emulator: result.emulator,
+        value: { address, breakpointId: `bp:${address}`, cleared },
+      }
+    }, signal)
+  }
+
+  clearAllBreakpoints(signal) {
+    return this.serializeMutation(async () => {
+      const before = await this.request("/api/debug/breakpoints")
+      const result = before.state.length === 0
+        ? before
+        : await this.request("/api/debug/breakpoints", { method: "DELETE" })
+      if (result.state.length !== 0) {
+        throw new Error("Apple2TS did not confirm breakpoint removal")
+      }
+      return {
+        emulator: result.emulator,
+        value: { count: before.state.length },
+      }
+    }, signal)
+  }
+
   async readMemory({ address, length }) {
     if (!Number.isInteger(address) || address < 0 || address > 65535) {
       throw new Error("address must be an integer between 0 and 65535")
@@ -385,12 +507,13 @@ export class Apple2tsCore {
   }
 }
 
-const machineTools = [
+const mutationTools = [
   {
     name: "boot",
     title: "Boot Apple II",
     description: "Boot the emulator and return its confirmed machine state.",
     inputSchema: noInputSchema,
+    outputSchema: machineResultSchema,
     destructiveHint: true,
     idempotentHint: false,
     execute: (core, _input, signal) => core.boot(signal),
@@ -400,6 +523,7 @@ const machineTools = [
     title: "Reset Apple II",
     description: "Reset the emulator and return its confirmed machine state.",
     inputSchema: noInputSchema,
+    outputSchema: machineResultSchema,
     destructiveHint: true,
     idempotentHint: false,
     execute: (core, _input, signal) => core.reset(signal),
@@ -409,6 +533,7 @@ const machineTools = [
     title: "Pause Apple II",
     description: "Pause the emulator and return its confirmed machine state.",
     inputSchema: noInputSchema,
+    outputSchema: machineResultSchema,
     destructiveHint: false,
     idempotentHint: true,
     execute: (core, _input, signal) => core.pause(signal),
@@ -418,6 +543,7 @@ const machineTools = [
     title: "Resume Apple II",
     description: "Resume the emulator and return its confirmed machine state.",
     inputSchema: noInputSchema,
+    outputSchema: machineResultSchema,
     destructiveHint: false,
     idempotentHint: true,
     execute: (core, _input, signal) => core.resume(signal),
@@ -427,9 +553,40 @@ const machineTools = [
     title: "Set Apple II speed",
     description: "Set speed from -2 (0.1 MHz) through 4 (maximum) and return the confirmed machine state.",
     inputSchema: speedInputSchema,
+    outputSchema: machineResultSchema,
     destructiveHint: false,
     idempotentHint: true,
     execute: (core, input, signal) => core.setSpeed(input.speed, signal),
+  },
+  {
+    name: "set_breakpoint",
+    title: "Set Apple II breakpoint",
+    description: "Set an instruction breakpoint and return its confirmed identity.",
+    inputSchema: breakpointInputSchema,
+    outputSchema: breakpointResultSchema(),
+    destructiveHint: false,
+    idempotentHint: true,
+    execute: (core, input, signal) => core.setBreakpoint(input.address, signal),
+  },
+  {
+    name: "clear_breakpoint",
+    title: "Clear Apple II breakpoint",
+    description: "Clear an instruction breakpoint by address and report whether it existed.",
+    inputSchema: breakpointInputSchema,
+    outputSchema: breakpointResultSchema({ cleared: { type: "boolean" } }, ["cleared"]),
+    destructiveHint: true,
+    idempotentHint: true,
+    execute: (core, input, signal) => core.clearBreakpoint(input.address, signal),
+  },
+  {
+    name: "clear_all_breakpoints",
+    title: "Clear all Apple II breakpoints",
+    description: "Clear every breakpoint and return the number removed.",
+    inputSchema: noInputSchema,
+    outputSchema: breakpointClearAllResultSchema,
+    destructiveHint: true,
+    idempotentHint: true,
+    execute: (core, _input, signal) => core.clearAllBreakpoints(signal),
   },
 ]
 
@@ -521,14 +678,14 @@ export const createMcpServer = (core) => {
     )
   }
 
-  for (const tool of machineTools) {
+  for (const tool of mutationTools) {
     server.registerTool(
       tool.name,
       {
         title: tool.title,
         description: tool.description,
         inputSchema: tool.inputSchema,
-        outputSchema: machineResultSchema,
+        outputSchema: tool.outputSchema,
         annotations: {
           readOnlyHint: false,
           destructiveHint: tool.destructiveHint,

@@ -55,10 +55,19 @@ const decoder = new TextDecoder()
 const memoryDump = new Array(65536).fill(0)
 memoryDump[65534] = 171
 memoryDump[65535] = 205
+let breakpoints = []
 let buffer = ""
 let stopping = false
 let statusReplies = 0
 const status = structuredClone(statusFixture)
+const canHaltAtAddress = (breakpoint) => breakpoint.watchpoint === false
+  && breakpoint.instruction === false
+  && breakpoint.disabled === false
+  && breakpoint.basic === false
+  && breakpoint.expression1?.register === ""
+  && breakpoint.hitcount === 1
+  && breakpoint.action1?.action === ""
+  && breakpoint.action2?.action === ""
 
 const stop = () => {
   if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "ignore-term") {
@@ -101,6 +110,14 @@ while (!stopping) {
       result = { memoryDump }
     } else if (command.action === "loadBinary") {
       result = status
+    } else if (command.action === "getBreakpoints") {
+      result = { breakpoints }
+    } else if (command.action === "setBreakpoints") {
+      const nextBreakpoints = command.payload.breakpoints
+      if (nextBreakpoints.every(canHaltAtAddress)) {
+        breakpoints = structuredClone(nextBreakpoints)
+        result = { breakpoints }
+      }
     }
     const reply = await postJson("/api/client/reply", {
       clientId,

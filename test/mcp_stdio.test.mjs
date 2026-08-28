@@ -733,7 +733,17 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   const tools = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 4))
   assert.deepEqual(
     tools.result.tools.map((tool) => tool.name),
-    ["read_memory", "boot", "reset", "pause", "resume", "set_speed"],
+    [
+      "read_memory",
+      "boot",
+      "reset",
+      "pause",
+      "resume",
+      "set_speed",
+      "set_breakpoint",
+      "clear_breakpoint",
+      "clear_all_breakpoints",
+    ],
   )
   assert.deepEqual(tools.result.tools[0].inputSchema, {
     type: "object",
@@ -757,6 +767,16 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     idempotentHint: true,
     openWorldHint: false,
   })
+  const clearBreakpointTool = tools.result.tools.find((tool) => tool.name === "clear_breakpoint")
+  assert.deepEqual(clearBreakpointTool.inputSchema, {
+    type: "object",
+    properties: { address: { type: "integer", minimum: 0, maximum: 65535 } },
+    required: ["address"],
+    additionalProperties: false,
+  })
+  assert.equal(clearBreakpointTool.outputSchema.properties.value.properties.cleared.type, "boolean")
+  assert.equal(clearBreakpointTool.annotations.destructiveHint, true)
+  assert.equal(clearBreakpointTool.annotations.idempotentHint, true)
 
   processState.child.stdin.write(`${JSON.stringify({
     jsonrpc: "2.0",
@@ -784,14 +804,17 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.equal(invalidRange.result.isError, true)
   assert.notEqual(invalidRange.result.content[0].text, "")
 
-  const callTool = async (id, name, args = {}) => {
+  const requestTool = async (id, name, args = {}) => {
     processState.child.stdin.write(`${JSON.stringify({
       jsonrpc: "2.0",
       id,
       method: "tools/call",
       params: { name, arguments: args },
     })}\n`)
-    const response = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === id))
+    return JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === id))
+  }
+  const callTool = async (id, name, args = {}) => {
+    const response = await requestTool(id, name, args)
     assert.equal(response.result.isError, undefined)
     return response.result.structuredContent
   }
@@ -807,11 +830,36 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.equal(accelerated.state.runMode, "paused")
   assert.equal(accelerated.state.speedMode, 4)
 
-  const resumed = await callTool(10, "resume")
+  const breakpoint = await callTool(10, "set_breakpoint", { address: 0x6003 })
+  assert.deepEqual(breakpoint, {
+    emulator: payload.emulator,
+    value: { address: 0x6003, breakpointId: "bp:24579" },
+  })
+  const occupied = await callTool(11, "set_breakpoint", { address: 0x6003 })
+  assert.deepEqual(occupied, breakpoint)
+  await callTool(12, "set_breakpoint", { address: 0x6006 })
+  const cleared = await callTool(13, "clear_breakpoint", { address: 0x6003 })
+  assert.deepEqual(cleared.value, {
+    address: 0x6003,
+    breakpointId: "bp:24579",
+    cleared: true,
+  })
+  const absent = await callTool(14, "clear_breakpoint", { address: 0x6003 })
+  assert.equal(absent.value.cleared, false)
+  const clearedAll = await callTool(15, "clear_all_breakpoints")
+  assert.equal(clearedAll.value.count, 1)
+  const clearedEmpty = await callTool(16, "clear_all_breakpoints")
+  assert.equal(clearedEmpty.value.count, 0)
+
+  const invalidBreakpoint = await requestTool(17, "set_breakpoint", { address: 65536 })
+  assert.equal(invalidBreakpoint.result.isError, true)
+  assert.match(invalidBreakpoint.result.content[0].text, /Input validation error/)
+
+  const resumed = await callTool(18, "resume")
   assert.equal(resumed.state.runMode, "running")
   assert.equal(resumed.state.speedMode, 4)
 
-  const reset = await callTool(11, "reset")
+  const reset = await callTool(19, "reset")
   assert.equal(reset.state.runMode, "running")
   assert.equal(reset.state.speedMode, 4)
 
