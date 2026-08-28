@@ -1040,6 +1040,31 @@ const server = createServer(async (req, res) => {
           return
         }
 
+        if (body.type === "keyState") {
+          const keyCode = typeof body.key === "string" && body.key.length === 1
+            ? body.key.charCodeAt(0)
+            : 0
+          if (keyCode < 1 || keyCode > 255) {
+            throw new Error("key must be one character with a code from 1 through 255 for type 'keyState'")
+          }
+          if (typeof body.isDown !== "boolean") {
+            throw new Error("isDown is required for type 'keyState'")
+          }
+          if (body.repeat !== undefined && typeof body.repeat !== "boolean") {
+            throw new Error("repeat must be a boolean for type 'keyState'")
+          }
+          writeEnvelope(
+            res,
+            200,
+            await dispatchAcceptedInput(client, "setKeyboardState", {
+              key: body.key,
+              isDown: body.isDown,
+              repeat: body.repeat === true,
+            }),
+          )
+          return
+        }
+
         if (body.type === "text") {
           if (typeof body.text !== "string") {
             throw new Error("text is required for type 'text'")
@@ -1048,7 +1073,7 @@ const server = createServer(async (req, res) => {
           return
         }
 
-        throw new Error("type must be one of 'key', 'keyCode', or 'text'")
+        throw new Error("type must be one of 'key', 'keyCode', 'keyState', or 'text'")
       } catch (error) {
         writeErrorEnvelope(
           res,

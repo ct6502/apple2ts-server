@@ -303,6 +303,19 @@ test("private bridge binds one renderer and rejects forged replies", async (t) =
   assert.equal(accepted.status, 200)
   const machine = await machineRequest.then((response) => response.json())
   assert.equal(machine.data.machineName, "APPLE2EE")
+
+  for (const key of ["\u0000", "\u0100", "😀"]) {
+    const response = await fetch(new URL("/api/input/keys", listener.url), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${controllerToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ type: "keyState", key, isDown: true }),
+    })
+    assert.equal(response.status, 400)
+    assert.match((await response.json()).error.message, /code from 1 through 255/)
+  }
 })
 
 test("private bridge reads bounded memory in byte and hex formats", async (t) => {
@@ -585,6 +598,122 @@ test("a failed mutation prevents later mutations in the same session", async (t)
   assert.equal(requests, 1)
 })
 
+test("keyboard cleanup releases a key whose press response failed", async () => {
+  const requests = []
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  core.request = async (_pathname, { body }) => {
+    requests.push(body)
+    if (body.isDown) throw new Error("response lost after key-down")
+  }
+
+  await assert.rejects(core.setKeyboardKey("j"), /response lost after key-down/)
+
+  assert.deepEqual(requests, [
+    { type: "keyState", key: "j", isDown: true, repeat: false },
+    { type: "keyState", key: "j", isDown: false, repeat: false },
+  ])
+})
+
+test("keyboard cleanup retries an uncertain old-key release", async () => {
+  const requests = []
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  core.request = async (_pathname, { body }) => {
+    requests.push(body)
+    if (requests.length === 2) throw new Error("response lost after key-up")
+  }
+
+  await core.setKeyboardKey("j")
+  await assert.rejects(core.setKeyboardKey("l"), /response lost after key-up/)
+
+  assert.deepEqual(requests, [
+    { type: "keyState", key: "j", isDown: true, repeat: false },
+    { type: "keyState", key: "j", isDown: false, repeat: false },
+    { type: "keyState", key: "j", isDown: false, repeat: false },
+  ])
+})
+
+test("a later mutation failure releases the held key", async () => {
+  const requests = []
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  core.request = async (pathname, options = {}) => {
+    requests.push({ pathname, body: options.body })
+    if (pathname === "/api/machine/pause") throw new Error("pause response lost")
+    return { emulator: core.identity, state: {} }
+  }
+
+  await core.setKeyboardKey("j")
+  await assert.rejects(core.pause(), /pause response lost/)
+
+  assert.deepEqual(requests, [
+    {
+      pathname: "/api/input/keys",
+      body: { type: "keyState", key: "j", isDown: true, repeat: false },
+    },
+    { pathname: "/api/machine/pause", body: undefined },
+    {
+      pathname: "/api/input/keys",
+      body: { type: "keyState", key: "j", isDown: false, repeat: false },
+    },
+  ])
+})
+
+test("an aborted mutation releases the held key after completing", async () => {
+  let finishPause
+  let pauseStarted
+  const pauseFinished = new Promise((resolve) => (finishPause = resolve))
+  const started = new Promise((resolve) => (pauseStarted = resolve))
+  const requests = []
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  core.request = async (pathname, options = {}) => {
+    requests.push({ pathname, body: options.body })
+    if (pathname === "/api/machine/pause") {
+      pauseStarted()
+      await pauseFinished
+    }
+    return {
+      emulator: core.identity,
+      state: { runMode: "paused", speedMode: 0 },
+    }
+  }
+
+  await core.setKeyboardKey("j")
+  const cancellation = new AbortController()
+  const pause = core.pause(cancellation.signal)
+  await started
+  cancellation.abort()
+  finishPause()
+  await pause
+
+  assert.deepEqual(requests, [
+    {
+      pathname: "/api/input/keys",
+      body: { type: "keyState", key: "j", isDown: true, repeat: false },
+    },
+    { pathname: "/api/machine/pause", body: undefined },
+    {
+      pathname: "/api/input/keys",
+      body: { type: "keyState", key: "j", isDown: false, repeat: false },
+    },
+  ])
+  await assert.rejects(core.resume(), /restart this MCP session/)
+})
+
 test("configured binary loading validates and serializes one local file", async (t) => {
   const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-binary-root-"))
   t.after(() => rm(binaryRoot, { recursive: true, force: true }))
@@ -751,6 +880,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     tools.result.tools.map((tool) => tool.name),
     [
       "read_memory",
+      "set_keyboard_key",
       "boot",
       "reset",
       "pause",
@@ -784,6 +914,13 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     idempotentHint: true,
     openWorldHint: false,
   })
+  const keyboardTool = tools.result.tools.find((tool) => tool.name === "set_keyboard_key")
+  assert.deepEqual(keyboardTool.inputSchema.properties.key.type, ["string", "null"])
+  assert.equal(keyboardTool.inputSchema.properties.key.minLength, 1)
+  assert.equal(keyboardTool.inputSchema.properties.key.maxLength, 1)
+  assert.equal(keyboardTool.inputSchema.properties.key.pattern, "^[\\u0001-\\u00FF]$")
+  assert.equal(keyboardTool.annotations.idempotentHint, false)
+  assert.match(keyboardTool.description, /null to release/)
   const clearBreakpointTool = tools.result.tools.find((tool) => tool.name === "clear_breakpoint")
   assert.deepEqual(clearBreakpointTool.inputSchema, {
     type: "object",
@@ -966,11 +1103,80 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.equal(reset.state.runMode, "running")
   assert.equal(reset.state.speedMode, 4)
 
+  assert.equal((await callTool(24, "set_keyboard_key", { key: "j" })).value.heldKey, "j")
+  assert.equal((await callTool(25, "set_keyboard_key", { key: "j", repeat: true })).value.heldKey, "j")
+  assert.equal((await callTool(26, "set_keyboard_key", { key: "l" })).value.heldKey, "l")
+  assert.equal((await callTool(27, "set_keyboard_key", { key: null })).value.heldKey, null)
+  assert.equal((await callTool(28, "set_keyboard_key", { key: " " })).value.heldKey, " ")
+
   processState.child.stdin.end()
   const processExit = await processState.waitForExit()
   assert.equal(processExit.error, null)
   assert.equal(processExit.code, 0, processState.getStderr())
   for (const line of processState.getStdout().trim().split("\n")) assert.doesNotThrow(() => JSON.parse(line))
+  assert.throws(() => process.kill(receipt.pid, 0), { code: "ESRCH" })
+  assert.deepEqual((await processState.readReceipt()).keyboardStates, [
+    { key: "j", isDown: true, repeat: false },
+    { key: "j", isDown: true, repeat: true },
+    { key: "j", isDown: false, repeat: false },
+    { key: "l", isDown: true, repeat: false },
+    { key: "l", isDown: false, repeat: false },
+    { key: " ", isDown: true, repeat: false },
+    { key: " ", isDown: false, repeat: false },
+  ])
+  await assert.rejects(access(receipt.profilePath))
+  await assertClosed(bridgeUrl)
+})
+
+test("EOF cancels a stalled mutation before releasing its held key", async (t) => {
+  const processState = await launchMcp({ APPLE2TS_FAKE_CHROMIUM_MODE: "stall-run-mode" })
+  t.after(processState.cleanup)
+  const bridgeLine = await processState.waitForStderr((line) => line.includes("private bridge listening"))
+  const bridgeUrl = parseBridgeUrl(bridgeLine)
+  await processState.waitForStderr((line) => line.includes("MCP ready"))
+  const receipt = await processState.readReceipt()
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: 30,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-11-25",
+      capabilities: {},
+      clientInfo: { name: "test", version: "1" },
+    },
+  })}\n`)
+  await processState.waitForStdout((line) => JSON.parse(line).id === 30)
+  processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`)
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: 31,
+    method: "tools/call",
+    params: { name: "set_keyboard_key", arguments: { key: "j" } },
+  })}\n`)
+  await processState.waitForStdout((line) => JSON.parse(line).id === 31)
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: 32,
+    method: "tools/call",
+    params: { name: "pause", arguments: {} },
+  })}\n`)
+
+  const stallDeadline = Date.now() + 1000
+  while (!(await processState.readReceipt()).stalledRunMode) {
+    if (Date.now() >= stallDeadline) throw new Error("Timed out waiting for stalled mutation")
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+
+  processState.child.stdin.end()
+  const outcome = await Promise.race([
+    processState.waitForExit(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("EOF cleanup was not prompt")), 1000)),
+  ])
+  assert.equal(outcome.code, 0, processState.getStderr())
+  assert.deepEqual((await processState.readReceipt()).keyboardStates, [
+    { key: "j", isDown: true, repeat: false },
+    { key: "j", isDown: false, repeat: false },
+  ])
   assert.throws(() => process.kill(receipt.pid, 0), { code: "ESRCH" })
   await assert.rejects(access(receipt.profilePath))
   await assertClosed(bridgeUrl)
