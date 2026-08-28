@@ -15,6 +15,7 @@ import { statusFixture } from "./fixtures/status_fixture.mjs"
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(__dirname, "..")
 const fakeChromium = path.join(__dirname, "fixtures", "fake_chromium.mjs")
+const mcpTestRunner = path.join(__dirname, "fixtures", "mcp_stdio_runner.mjs")
 const token = "test-private-token"
 const controllerToken = "test-controller-token"
 const rendererId = "test-renderer"
@@ -159,7 +160,7 @@ const waitForLine = (stream, predicate, timeoutMs = 5000, getHistory = () => "")
 const launchMcp = async (overrides = {}) => {
   const testRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-mcp-test-"))
   const receiptPath = path.join(testRoot, "chromium.json")
-  const child = spawn(process.execPath, ["server/mcp_stdio.mjs"], {
+  const child = spawn(process.execPath, [mcpTestRunner], {
     cwd: repoRoot,
     stdio: ["pipe", "pipe", "pipe"],
     env: {
@@ -202,6 +203,7 @@ const launchMcp = async (overrides = {}) => {
   }
   return {
     child,
+    receiptPath,
     getStdout: () => stdout,
     getStderr: () => stderr,
     waitForStdout: (predicate, timeoutMs) => waitForLine(child.stdout, predicate, timeoutMs, () => stdout),
@@ -739,6 +741,20 @@ test("invalid Chromium mode fails before launch", async () => {
   assert.match(invalid.getStderr(), /APPLE2TS_CHROMIUM_MODE must be 'headless' or 'visible'/)
   assert.equal(invalid.getStdout(), "")
   await invalid.cleanup()
+})
+
+test("missing browser build fails before private resources start", async () => {
+  const missing = await launchMcp({ APPLE2TS_TEST_MISSING_BROWSER_BUILD: "1" })
+  const outcome = await missing.waitForExit()
+
+  assert.equal(outcome.error, null)
+  assert.equal(outcome.code, 1)
+  assert.match(missing.getStderr(), /missing dist\/index\.html/)
+  assert.match(missing.getStderr(), /Build Apple2TS in its source repository/)
+  assert.doesNotMatch(missing.getStderr(), /private bridge listening/)
+  assert.equal(missing.getStdout(), "")
+  await assert.rejects(access(missing.receiptPath))
+  await missing.cleanup()
 })
 
 test("unexpected renderer exit closes stdio and owned resources", async () => {

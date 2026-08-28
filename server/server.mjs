@@ -1750,7 +1750,11 @@ const server = createServer(async (req, res) => {
   }
 })
 
-const checkDist = async () => {
+export const MISSING_BROWSER_BUILD_MESSAGE =
+  "Cannot start the Apple2TS browser: missing dist/index.html. "
+  + "Build Apple2TS in its source repository and copy its dist/ directory into this server root."
+
+export const hasBrowserBuild = async () => {
   let hasDist = true
   try {
     await fs.access(path.join(distDir, "index.html"))
@@ -1810,8 +1814,8 @@ export const startApple2tsServer = async (options = {}) => {
 
   const url = `http://${address.address}:${address.port}`
   logger.log?.(`Apple2TS server listening on ${url} (localhost only)`)
-  if (!(await checkDist())) {
-    logger.log?.("Build output not found. Run 'npm run build' before 'npm run serve'.")
+  if (!(await hasBrowserBuild())) {
+    logger.log?.(MISSING_BROWSER_BUILD_MESSAGE)
   }
 
   return { url, host: address.address, port: address.port, serverInstanceId }

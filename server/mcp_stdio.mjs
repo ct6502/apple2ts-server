@@ -11,7 +11,12 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 import { fromJsonSchema, McpServer } from "@modelcontextprotocol/server"
 import { serveStdio } from "@modelcontextprotocol/server/stdio"
 
-import { startApple2tsServer, stopApple2tsServer } from "./server.mjs"
+import {
+  hasBrowserBuild,
+  MISSING_BROWSER_BUILD_MESSAGE,
+  startApple2tsServer,
+  stopApple2tsServer,
+} from "./server.mjs"
 
 const SERVER_NAME = "apple2ts"
 const SERVER_VERSION = "0.1.0"
@@ -565,6 +570,10 @@ export const runStdio = async (options = {}) => {
     const chromiumMode = options.chromiumMode ?? "headless"
     if (chromiumMode !== "headless" && chromiumMode !== "visible") {
       throw new Error("APPLE2TS_CHROMIUM_MODE must be 'headless' or 'visible'")
+    }
+    const browserBuildAvailable = options.hasBrowserBuild || hasBrowserBuild
+    if (options.requireBrowserBuild !== false && !(await browserBuildAvailable())) {
+      throw new Error(MISSING_BROWSER_BUILD_MESSAGE)
     }
     listenerPromise = startApple2tsServer({
       host: "127.0.0.1",
