@@ -47,6 +47,9 @@ if (!eventsResponse.ok) process.exit(67)
 
 const reader = eventsResponse.body.getReader()
 const decoder = new TextDecoder()
+const memoryDump = new Array(65536).fill(0)
+memoryDump[65534] = 171
+memoryDump[65535] = 205
 let buffer = ""
 let stopping = false
 let statusReplies = 0
@@ -77,14 +80,19 @@ while (!stopping) {
     const data = frame.split("\n").find((line) => line.startsWith("data: "))
     if (!event || !data) continue
     const command = JSON.parse(data.slice(6))
+    const result = command.action === "getStatus"
+      ? statusFixture
+      : command.action === "getMemory"
+        ? { memoryDump }
+        : undefined
     const reply = await postJson("/api/client/reply", {
       clientId,
       remoteControlToken,
       rendererId,
       commandId: command.commandId,
-      ok: command.action === "getStatus",
-      result: statusFixture,
-      error: command.action === "getStatus" ? undefined : "Unsupported fake command",
+      ok: result !== undefined,
+      result,
+      error: result === undefined ? "Unsupported fake command" : undefined,
     })
     if (!reply.ok) process.exit(68)
     if (command.action === "getStatus") {
