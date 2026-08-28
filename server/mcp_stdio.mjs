@@ -172,6 +172,34 @@ const breakpointClearAllResultSchema = fromJsonSchema({
   additionalProperties: false,
 })
 
+const cpuPatchInputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    PC: { type: "integer", minimum: 0, maximum: 65535 },
+    PStatus: { type: "integer", minimum: 0, maximum: 255 },
+  },
+  anyOf: [{ required: ["PC"] }, { required: ["PStatus"] }],
+  additionalProperties: false,
+})
+
+const cpuResultSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    emulator: emulatorIdentitySchema,
+    value: {
+      type: "object",
+      properties: {
+        PC: { type: "integer", minimum: 0, maximum: 65535 },
+        PStatus: { type: "integer", minimum: 0, maximum: 255 },
+      },
+      required: ["PC", "PStatus"],
+      additionalProperties: false,
+    },
+  },
+  required: ["emulator", "value"],
+  additionalProperties: false,
+})
+
 const executionBreakpoint = (address) => ({
   address,
   watchpoint: false,
@@ -467,6 +495,33 @@ export class Apple2tsCore {
     }, signal)
   }
 
+  setCpu(patch, signal) {
+    const fields = Object.keys(patch)
+    if (fields.length < 1 || fields.some((field) => field !== "PC" && field !== "PStatus")) {
+      throw new Error("set_cpu accepts PC and PStatus")
+    }
+    if ("PC" in patch && (!Number.isInteger(patch.PC) || patch.PC < 0 || patch.PC > 65535)) {
+      throw new Error("PC must be an integer between 0 and 65535")
+    }
+    if (
+      "PStatus" in patch
+      && (!Number.isInteger(patch.PStatus) || patch.PStatus < 0 || patch.PStatus > 255)
+    ) {
+      throw new Error("PStatus must be an integer between 0 and 255")
+    }
+
+    return this.serializeMutation(async () => {
+      const result = await this.request("/api/debug/cpu", { method: "PATCH", body: patch })
+      return {
+        emulator: result.emulator,
+        value: {
+          PC: result.state.PC,
+          PStatus: result.state.PStatus,
+        },
+      }
+    }, signal)
+  }
+
   async readMemory({ address, length }) {
     if (!Number.isInteger(address) || address < 0 || address > 65535) {
       throw new Error("address must be an integer between 0 and 65535")
@@ -587,6 +642,16 @@ const mutationTools = [
     destructiveHint: true,
     idempotentHint: true,
     execute: (core, _input, signal) => core.clearAllBreakpoints(signal),
+  },
+  {
+    name: "set_cpu",
+    title: "Set Apple II CPU state",
+    description: "Set the program counter or processor status and return both confirmed values.",
+    inputSchema: cpuPatchInputSchema,
+    outputSchema: cpuResultSchema,
+    destructiveHint: true,
+    idempotentHint: true,
+    execute: (core, input, signal) => core.setCpu(input, signal),
   },
 ]
 
