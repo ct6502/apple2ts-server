@@ -52,6 +52,10 @@ Use `?remoteControl=1` so the browser client auto-registers with the integrated 
 
 ## MCP over stdio
 
+The stdio server needs the Apple2TS browser build at `dist/index.html`. Build
+Apple2TS in its source repository, then copy its generated `dist/` directory
+into this server root.
+
 `npm run mcp:stdio` starts one private Apple2TS browser session owned by the
 MCP process. Set `APPLE2TS_CHROMIUM_EXECUTABLE` to the Chromium or Chrome
 executable. The browser runs headlessly by default; set
