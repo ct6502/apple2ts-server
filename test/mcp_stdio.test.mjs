@@ -16,9 +16,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(__dirname, "..")
 const fakeChromium = path.join(__dirname, "fixtures", "fake_chromium.mjs")
 const mcpTestRunner = path.join(__dirname, "fixtures", "mcp_stdio_runner.mjs")
+const wedgedRunner = path.join(__dirname, "fixtures", "wedged_runner.mjs")
 const token = "test-private-token"
 const controllerToken = "test-controller-token"
 const rendererId = "test-renderer"
+const cleanupGraceTimeoutMs = 5000
+const cleanupKillTimeoutMs = 1000
 
 const postJson = (url, body) =>
   fetch(url, {
@@ -157,10 +160,19 @@ const waitForLine = (stream, predicate, timeoutMs = 5000, getHistory = () => "")
     inspect(getHistory())
   })
 
-const launchMcp = async (overrides = {}) => {
+const waitFor = (promise, timeoutMs) =>
+  new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve(false), timeoutMs)
+    promise.then(() => {
+      clearTimeout(timeout)
+      resolve(true)
+    })
+  })
+
+const launchMcp = async (overrides = {}, runner = mcpTestRunner) => {
   const testRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-mcp-test-"))
   const receiptPath = path.join(testRoot, "chromium.json")
-  const child = spawn(process.execPath, [mcpTestRunner], {
+  const child = spawn(process.execPath, [runner], {
     cwd: repoRoot,
     stdio: ["pipe", "pipe", "pipe"],
     env: {
@@ -187,6 +199,7 @@ const launchMcp = async (overrides = {}) => {
   })
   let stdout = ""
   let stderr = ""
+  let cleanupPromise
   child.stdout.on("data", (chunk) => (stdout += chunk.toString("utf8")))
   child.stderr.on("data", (chunk) => (stderr += chunk.toString("utf8")))
   const readReceipt = async () => {
@@ -210,7 +223,24 @@ const launchMcp = async (overrides = {}) => {
     waitForStderr: (predicate, timeoutMs) => waitForLine(child.stderr, predicate, timeoutMs, () => stderr),
     waitForExit: () => exitPromise,
     readReceipt,
-    cleanup: () => rm(testRoot, { recursive: true, force: true }),
+    cleanup: () => cleanupPromise ||= (async () => {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.stdin.end()
+        if (!await waitFor(exitPromise, cleanupGraceTimeoutMs)) {
+          child.kill("SIGTERM")
+          if (!await waitFor(exitPromise, cleanupGraceTimeoutMs)) {
+            child.kill("SIGKILL")
+            if (!await waitFor(exitPromise, cleanupKillTimeoutMs)) {
+              throw new Error(
+                `Test MCP child ${child.pid} did not exit after EOF, SIGTERM, and SIGKILL; `
+                  + `retained test root ${testRoot}`,
+              )
+            }
+          }
+        }
+      }
+      await rm(testRoot, { recursive: true, force: true })
+    })(),
   }
 }
 
@@ -571,8 +601,9 @@ test("cancelling an active mutation prevents later mutations in the same session
   await assert.rejects(core.resume(), /restart this MCP session/)
 })
 
-test("stdio reads and controls one renderer and EOF cleans up", async () => {
+test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   const processState = await launchMcp()
+  t.after(processState.cleanup)
   const bridgeLine = await processState.waitForStderr((line) => line.includes("private bridge listening"))
   const bridgeUrl = parseBridgeUrl(bridgeLine)
   await processState.waitForStderr((line) => line.includes("MCP ready"))
@@ -708,11 +739,25 @@ test("stdio reads and controls one renderer and EOF cleans up", async () => {
   assert.throws(() => process.kill(receipt.pid, 0), { code: "ESRCH" })
   await assert.rejects(access(receipt.profilePath))
   await assertClosed(bridgeUrl)
-  await processState.cleanup()
 })
 
-test("visible Chromium uses the same owned session and cleanup", async () => {
+test("stdio test cleanup escalates when its child ignores EOF", async (t) => {
+  const wedged = await launchMcp({}, wedgedRunner)
+  t.after(wedged.cleanup)
+  await wedged.waitForStderr((line) => line === "test runner wedged")
+  const childPid = wedged.child.pid
+  const testRoot = path.dirname(wedged.receiptPath)
+
+  await wedged.cleanup()
+
+  assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" })
+  await assert.rejects(access(testRoot))
+  await wedged.cleanup()
+})
+
+test("visible Chromium uses the same owned session and cleanup", async (t) => {
   const visible = await launchMcp({ APPLE2TS_CHROMIUM_MODE: "visible" })
+  t.after(visible.cleanup)
   const bridgeLine = await visible.waitForStderr((line) => line.includes("private bridge listening"))
   const bridgeUrl = parseBridgeUrl(bridgeLine)
   await visible.waitForStderr((line) => line.includes("MCP ready"))
@@ -732,8 +777,9 @@ test("visible Chromium uses the same owned session and cleanup", async () => {
   await visible.cleanup()
 })
 
-test("invalid Chromium mode fails before launch", async () => {
+test("invalid Chromium mode fails before launch", async (t) => {
   const invalid = await launchMcp({ APPLE2TS_CHROMIUM_MODE: "sideways" })
+  t.after(invalid.cleanup)
   const outcome = await invalid.waitForExit()
 
   assert.equal(outcome.error, null)
@@ -743,8 +789,9 @@ test("invalid Chromium mode fails before launch", async () => {
   await invalid.cleanup()
 })
 
-test("missing browser build fails before private resources start", async () => {
+test("missing browser build fails before private resources start", async (t) => {
   const missing = await launchMcp({ APPLE2TS_TEST_MISSING_BROWSER_BUILD: "1" })
+  t.after(missing.cleanup)
   const outcome = await missing.waitForExit()
 
   assert.equal(outcome.error, null)
@@ -757,8 +804,9 @@ test("missing browser build fails before private resources start", async () => {
   await missing.cleanup()
 })
 
-test("unexpected renderer exit closes stdio and owned resources", async () => {
+test("unexpected renderer exit closes stdio and owned resources", async (t) => {
   const crashed = await launchMcp({ APPLE2TS_FAKE_CHROMIUM_MODE: "crash-after-ready" })
+  t.after(crashed.cleanup)
   const bridgeLine = await crashed.waitForStderr((line) => line.includes("private bridge listening"))
   const bridgeUrl = parseBridgeUrl(bridgeLine)
   await crashed.waitForStderr((line) => line.includes("MCP ready"))
@@ -775,8 +823,9 @@ test("unexpected renderer exit closes stdio and owned resources", async () => {
   await crashed.cleanup()
 })
 
-test("SIGTERM and startup timeout release the private listener", async () => {
+test("SIGTERM and startup timeout release the private listener", async (t) => {
   const running = await launchMcp()
+  t.after(running.cleanup)
   const bridgeLine = await running.waitForStderr((line) => line.includes("private bridge listening"))
   const bridgeUrl = parseBridgeUrl(bridgeLine)
   await running.waitForStderr((line) => line.includes("MCP ready"))
@@ -808,6 +857,7 @@ test("SIGTERM and startup timeout release the private listener", async () => {
   await running.cleanup()
 
   const escalated = await launchMcp({ APPLE2TS_FAKE_CHROMIUM_MODE: "ignore-term" })
+  t.after(escalated.cleanup)
   const escalatedBridgeLine = await escalated.waitForStderr((line) => line.includes("private bridge listening"))
   const escalatedUrl = parseBridgeUrl(escalatedBridgeLine)
   await escalated.waitForStderr((line) => line.includes("MCP ready"))
@@ -824,6 +874,7 @@ test("SIGTERM and startup timeout release the private listener", async () => {
   await escalated.cleanup()
 
   const failing = await launchMcp({ APPLE2TS_FAKE_CHROMIUM_MODE: "exit" })
+  t.after(failing.cleanup)
   const failingBridgeLine = await failing.waitForStderr((line) => line.includes("private bridge listening"))
   const failingUrl = parseBridgeUrl(failingBridgeLine)
   const failingReceipt = await failing.readReceipt()
