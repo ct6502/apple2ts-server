@@ -44,6 +44,21 @@ const speedInputSchema = fromJsonSchema({
   additionalProperties: false,
 })
 
+const keyboardKeyInputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    key: {
+      type: ["string", "null"],
+      minLength: 1,
+      maxLength: 1,
+      pattern: "^[\\u0001-\\u00FF]$",
+    },
+    repeat: { type: "boolean", default: false },
+  },
+  required: ["key"],
+  additionalProperties: false,
+})
+
 const emulatorIdentitySchema = {
   type: "object",
   properties: {
@@ -100,6 +115,23 @@ const memoryReadOutputSchema = fromJsonSchema({
         },
       },
       required: ["address", "length", "bytes"],
+      additionalProperties: false,
+    },
+  },
+  required: ["emulator", "value"],
+  additionalProperties: false,
+})
+
+const keyboardKeyOutputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    emulator: emulatorIdentitySchema,
+    value: {
+      type: "object",
+      properties: {
+        heldKey: { type: ["string", "null"] },
+      },
+      required: ["heldKey"],
       additionalProperties: false,
     },
   },
@@ -246,6 +278,7 @@ const fetchEnvelope = async (baseUrl, pathname, controllerToken, signal, options
     headers["Content-Type"] = options.contentType || "application/json"
   }
   const method = options.method || "GET"
+  const timeoutSignal = AbortSignal.timeout(method === "GET" ? READ_TIMEOUT_MS : MUTATION_TIMEOUT_MS)
   const response = await fetch(new URL(pathname, baseUrl), {
     method,
     headers,
@@ -254,10 +287,7 @@ const fetchEnvelope = async (baseUrl, pathname, controllerToken, signal, options
       : options.contentType
         ? options.body
         : JSON.stringify(options.body),
-    signal: AbortSignal.any([
-      signal,
-      AbortSignal.timeout(method === "GET" ? READ_TIMEOUT_MS : MUTATION_TIMEOUT_MS),
-    ]),
+    signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
   })
   const payload = await response.json().catch(() => null)
   if (!response.ok || payload?.ok !== true) {
@@ -361,10 +391,11 @@ export class Apple2tsCore {
     this.binaryRoot = binaryRoot
     this.mutations = Promise.resolve()
     this.mutationFailure = null
+    this.heldKey = null
   }
 
-  async request(pathname, options) {
-    const state = await fetchEnvelope(this.baseUrl, pathname, this.controllerToken, this.signal, options)
+  async request(pathname, options, signal = this.signal) {
+    const state = await fetchEnvelope(this.baseUrl, pathname, this.controllerToken, signal, options)
     return { emulator: this.identity, state }
   }
 
@@ -397,8 +428,10 @@ export class Apple2tsCore {
       if (this.mutationFailure) throw this.mutationFailure
       if (signal?.aborted) throw signal.reason
       let mutationStarted = !prepare
+      let uncertain = false
       const markUncertain = () => {
         if (!mutationStarted) return
+        uncertain = true
         this.mutationFailure ||= new Error(
           "The previous mutation did not complete cleanly; restart this MCP session",
         )
@@ -409,9 +442,12 @@ export class Apple2tsCore {
       }
       signal?.addEventListener("abort", markUncertain, { once: true })
       try {
-        return await operation(startMutation)
+        const result = await operation(startMutation)
+        if (uncertain) await this.releaseHeldKeyboard().catch(() => {})
+        return result
       } catch (error) {
         markUncertain()
+        await this.releaseHeldKeyboard().catch(() => {})
         throw error
       } finally {
         signal?.removeEventListener("abort", markUncertain)
@@ -452,6 +488,43 @@ export class Apple2tsCore {
 
   setSpeed(speed, signal) {
     return this.changeMachine("/api/machine", { method: "PATCH", body: { speedMode: speed } }, signal)
+  }
+
+  setKeyboardKey(key, repeat = false, signal) {
+    return this.serializeMutation(async () => {
+      if (key === this.heldKey) {
+        if (key !== null && repeat) await this.sendKeyboardState(key, true, true)
+        return { emulator: this.identity, value: { heldKey: this.heldKey } }
+      }
+      if (this.heldKey !== null) {
+        await this.sendKeyboardState(this.heldKey, false)
+        this.heldKey = null
+      }
+      if (key !== null) {
+        this.heldKey = key
+        await this.sendKeyboardState(key, true, repeat)
+      }
+      return { emulator: this.identity, value: { heldKey: this.heldKey } }
+    }, signal)
+  }
+
+  sendKeyboardState(key, isDown, repeat = false, signal = this.signal) {
+    return this.request("/api/input/keys", {
+      method: "POST",
+      body: { type: "keyState", key, isDown, repeat },
+    }, signal)
+  }
+
+  async releaseHeldKeyboard() {
+    if (this.heldKey === null) return
+    const key = this.heldKey
+    await this.sendKeyboardState(key, false, false, null)
+    if (this.heldKey === key) this.heldKey = null
+  }
+
+  async neutralizeKeyboard() {
+    await this.mutations
+    await this.releaseHeldKeyboard()
   }
 
   setBreakpoint(address, signal) {
@@ -579,6 +652,16 @@ export class Apple2tsCore {
 }
 
 const mutationTools = [
+  {
+    name: "set_keyboard_key",
+    title: "Set held keyboard key",
+    description: "Hold one keyboard key, or pass null to release the held key.",
+    inputSchema: keyboardKeyInputSchema,
+    outputSchema: keyboardKeyOutputSchema,
+    destructiveHint: false,
+    idempotentHint: false,
+    execute: (core, input, signal) => core.setKeyboardKey(input.key, input.repeat, signal),
+  },
   {
     name: "boot",
     title: "Boot Apple II",
@@ -954,6 +1037,7 @@ export const runStdio = async (options = {}) => {
   let listenerPromise = Promise.resolve()
   let rendererPromise = Promise.resolve(null)
   let ownedRenderer = null
+  let core = null
   let stopping = null
 
   const shutdown = (reason) => {
@@ -961,6 +1045,7 @@ export const runStdio = async (options = {}) => {
     stopping = (async () => {
       const failures = []
       shutdownController.abort(new Error(reason))
+      await core?.neutralizeKeyboard().catch((error) => failures.push(error))
       await listenerPromise.catch(() => {})
       ownedRenderer ||= await rendererPromise.catch(() => null)
       await stdioHandle?.close().catch((error) => failures.push(error))
@@ -1007,7 +1092,7 @@ export const runStdio = async (options = {}) => {
       logger: { log: (message) => process.stderr.write(`${message}\n`) },
     })
     const listener = await listenerPromise
-    const core = new Apple2tsCore(
+    core = new Apple2tsCore(
       listener.url,
       controllerToken,
       {

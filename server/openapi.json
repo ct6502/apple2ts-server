@@ -1553,6 +1553,29 @@
             "type": "object",
             "properties": {
               "type": {
+                "const": "keyState"
+              },
+              "key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1,
+                "pattern": "^[\\u0001-\\u00FF]$"
+              },
+              "isDown": {
+                "type": "boolean"
+              },
+              "repeat": {
+                "type": "boolean",
+                "default": false
+              }
+            },
+            "required": ["type", "key", "isDown"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
                 "const": "text"
               },
               "text": {

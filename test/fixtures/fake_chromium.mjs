@@ -71,6 +71,7 @@ status.drives = [{
   motorRunning: false,
   byteLength: 143360,
 }]
+const keyboardStates = []
 const canHaltAtAddress = (breakpoint) => breakpoint.watchpoint === false
   && breakpoint.instruction === false
   && breakpoint.disabled === false
@@ -111,6 +112,13 @@ while (!stopping) {
       status.machine.runMode = command.payload.runMode === -4 || command.payload.runMode === -3
         ? -1
         : command.payload.runMode
+      if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "stall-run-mode") {
+        if (receiptPath) {
+          const receipt = JSON.parse(readFileSync(receiptPath, "utf8"))
+          writeFileSync(receiptPath, JSON.stringify({ ...receipt, stalledRunMode: true }))
+        }
+        continue
+      }
       result = status
     } else if (command.action === "setSpeedMode") {
       status.machine.speedMode = command.payload.speedMode
@@ -131,6 +139,13 @@ while (!stopping) {
       }
     } else if (command.action === "setCpuState") {
       status.machine.machineState = command.payload.state
+      result = status
+    } else if (command.action === "setKeyboardState") {
+      keyboardStates.push(command.payload)
+      if (receiptPath) {
+        const receipt = JSON.parse(readFileSync(receiptPath, "utf8"))
+        writeFileSync(receiptPath, JSON.stringify({ ...receipt, keyboardStates }))
+      }
       result = status
     }
     const reply = await postJson("/api/client/reply", {
