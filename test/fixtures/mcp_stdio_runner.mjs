@@ -9,6 +9,7 @@ void runStdio({
   startupTimeoutMs: process.env.APPLE2TS_STARTUP_TIMEOUT_MS,
   chromiumExecutable: process.env.APPLE2TS_CHROMIUM_EXECUTABLE,
   chromiumMode: process.env.APPLE2TS_CHROMIUM_MODE,
+  binaryRoot: process.env.APPLE2TS_BINARY_ROOT,
   requireBrowserBuild: missingBrowserBuild,
   hasBrowserBuild: missingBrowserBuild ? async () => false : undefined,
 })
