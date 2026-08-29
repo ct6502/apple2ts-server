@@ -129,6 +129,24 @@ while (!stopping) {
       result = { memoryDump }
     } else if (command.action === "loadBinary") {
       result = status
+    } else if (command.action === "mountDisk") {
+      const driveIndex = Number(command.payload.driveIndex)
+      const drive = status.drives.find((candidate) => candidate.index === driveIndex)
+      if (drive) {
+        drive.filename = command.payload.filename
+        drive.status = "mounted"
+        drive.byteLength = 143360
+      }
+      result = { mountedDrive: driveIndex, status }
+    } else if (command.action === "ejectDisk") {
+      const driveIndex = Number(command.payload.driveIndex)
+      const drive = status.drives.find((candidate) => candidate.index === driveIndex)
+      if (drive) {
+        drive.filename = ""
+        drive.status = ""
+        drive.byteLength = 0
+      }
+      result = status
     } else if (command.action === "getBreakpoints") {
       result = { breakpoints }
     } else if (command.action === "setBreakpoints") {

@@ -795,6 +795,288 @@ test("configured binary loading validates and serializes one local file", async 
   assert.equal(requestPaths.length, 2)
 })
 
+test("configured disk mounting reads a file added after root selection and serializes eject", async (t) => {
+  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-root-"))
+  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
+  const bytes = Buffer.from("WOZ2\u00ff\n\r\n")
+
+  const requests = []
+  const identity = { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" }
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    identity,
+    new AbortController().signal,
+    await realpath(binaryRoot),
+  )
+  core.request = async (pathname, options) => {
+    requests.push({ pathname, options })
+    const mounted = options.method !== "DELETE"
+    return {
+      emulator: identity,
+      state: {
+        driveId: "fd1",
+        index: 0,
+        kind: "floppy",
+        mounted,
+        filename: mounted ? "fixture.woz" : null,
+        status: mounted ? "mounted" : "",
+        writeProtected: false,
+        dirty: false,
+        motorRunning: false,
+        byteLength: mounted ? bytes.length : 0,
+      },
+    }
+  }
+
+  await assert.rejects(core.mountDisk({ driveId: "fd1", path: "fixture.woz" }))
+  await writeFile(path.join(binaryRoot, "fixture.woz"), bytes)
+  const mounted = await core.mountDisk({ driveId: "fd1", path: "fixture.woz" })
+  const ejected = await core.ejectDisk("fd1")
+
+  assert.deepEqual(mounted.state, { driveId: "fd1", mounted: true })
+  assert.deepEqual(ejected.state, { driveId: "fd1", mounted: false })
+  assert.deepEqual(requests, [
+    {
+      pathname: "/api/drives/fd1/mount",
+      options: {
+        method: "POST",
+        body: {
+          sourceType: "base64",
+          filename: "fixture.woz",
+          dataBase64: bytes.toString("base64"),
+        },
+      },
+    },
+    { pathname: "/api/drives/fd1", options: { method: "DELETE" } },
+  ])
+})
+
+test("disk mutations reject drive state that does not confirm the requested result", async (t) => {
+  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-confirmation-"))
+  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
+  await writeFile(path.join(binaryRoot, "fixture.woz"), Buffer.from("WOZ2\u00ff\n\r\n"))
+  const resolvedRoot = await realpath(binaryRoot)
+  const identity = { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" }
+  const driveState = {
+    driveId: "fd1",
+    index: 0,
+    kind: "floppy",
+    mounted: true,
+    filename: "fixture.woz",
+    status: "mounted",
+    writeProtected: false,
+    dirty: false,
+    motorRunning: false,
+    byteLength: 9,
+  }
+  const createCore = (state) => {
+    const core = new Apple2tsCore(
+      "http://unused.test",
+      controllerToken,
+      identity,
+      new AbortController().signal,
+      resolvedRoot,
+    )
+    core.request = async () => ({ emulator: identity, state })
+    return core
+  }
+
+  const invalidMountStates = [
+    { ...driveState, driveId: "fd2" },
+    { ...driveState, mounted: false },
+  ]
+  for (const state of invalidMountStates) {
+    await assert.rejects(
+      createCore(state).mountDisk({ driveId: "fd1", path: "fixture.woz" }),
+      /did not confirm disk mount for fd1/,
+    )
+  }
+  await assert.rejects(
+    createCore(driveState).ejectDisk("fd1"),
+    /did not confirm disk eject for fd1/,
+  )
+})
+
+test("confirmed invalid disk rejection leaves later eject usable", async (t) => {
+  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-rejection-"))
+  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
+  await writeFile(path.join(binaryRoot, "invalid.woz"), Buffer.from("not a disk"))
+  const identity = { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" }
+  const emptyDrive = {
+    driveId: "fd2",
+    index: 1,
+    kind: "floppy",
+    mounted: false,
+    filename: null,
+    status: "",
+    writeProtected: false,
+    dirty: false,
+    motorRunning: false,
+    byteLength: 0,
+  }
+  const requestPaths = []
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    identity,
+    new AbortController().signal,
+    await realpath(binaryRoot),
+  )
+  core.request = async (pathname, options = {}) => {
+    requestPaths.push(pathname)
+    if (options.method === "POST") {
+      const error = new Error("Apple2TS rejected invalid disk media")
+      error.bridgeStatus = 400
+      throw error
+    }
+    return { emulator: identity, state: emptyDrive }
+  }
+
+  await assert.rejects(
+    core.mountDisk({ driveId: "fd2", path: "invalid.woz" }),
+    /rejected invalid disk media/,
+  )
+  const ejected = await core.ejectDisk("fd2")
+
+  assert.equal(ejected.state.mounted, false)
+  assert.deepEqual(requestPaths, [
+    "/api/drives/fd2/mount",
+    "/api/drives/fd2",
+    "/api/drives/fd2",
+  ])
+})
+
+test("disk preflight failure preserves a held key", async (t) => {
+  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-preflight-"))
+  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
+  const identity = { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" }
+  const requests = []
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    identity,
+    new AbortController().signal,
+    await realpath(binaryRoot),
+  )
+  core.request = async (pathname, options = {}) => {
+    requests.push({ pathname, body: options.body })
+    return { emulator: identity, state: {} }
+  }
+
+  await core.setKeyboardKey("j")
+  await assert.rejects(
+    core.mountDisk({ driveId: "fd1", path: "missing.woz" }),
+    /unavailable or unreadable/,
+  )
+
+  assert.equal(core.heldKey, "j")
+  assert.deepEqual(requests, [{
+    pathname: "/api/input/keys",
+    body: { type: "keyState", key: "j", isDown: true, repeat: false },
+  }])
+})
+
+test("aborted confirmed disk rejection releases a held key", async (t) => {
+  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-abort-"))
+  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
+  await writeFile(path.join(binaryRoot, "invalid.woz"), Buffer.from("not a disk"))
+  const identity = { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" }
+  const emptyDrive = { driveId: "fd1", mounted: false }
+  let finishMount
+  let mountStarted
+  const finish = new Promise((resolve) => (finishMount = resolve))
+  const started = new Promise((resolve) => (mountStarted = resolve))
+  const requests = []
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    identity,
+    new AbortController().signal,
+    await realpath(binaryRoot),
+  )
+  core.request = async (pathname, options = {}) => {
+    requests.push({ pathname, body: options.body })
+    if (pathname.endsWith("/mount")) {
+      mountStarted()
+      await finish
+      const error = new Error("Apple2TS rejected invalid disk media")
+      error.bridgeStatus = 400
+      throw error
+    }
+    if (pathname === "/api/drives/fd1") return { emulator: identity, state: emptyDrive }
+    return { emulator: identity, state: {} }
+  }
+
+  await core.setKeyboardKey("j")
+  const cancellation = new AbortController()
+  const mount = core.mountDisk({ driveId: "fd1", path: "invalid.woz" }, cancellation.signal)
+  await started
+  cancellation.abort()
+  finishMount()
+  await assert.rejects(mount, /rejected invalid disk media/)
+
+  assert.equal(core.heldKey, null)
+  assert.equal(requests.at(-1).pathname, "/api/input/keys")
+  assert.equal(requests.at(-1).body.isDown, false)
+  await assert.rejects(core.ejectDisk("fd1"), /restart this MCP session/)
+})
+
+test("unconfirmed mount rejection still poisons later mutations", async (t) => {
+  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-uncertain-"))
+  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
+  await writeFile(path.join(binaryRoot, "invalid.woz"), Buffer.from("not a disk"))
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+    new AbortController().signal,
+    await realpath(binaryRoot),
+  )
+  let requests = 0
+  core.request = async () => {
+    requests += 1
+    if (requests === 1) {
+      const error = new Error("Apple2TS rejected invalid disk media")
+      error.bridgeStatus = 400
+      throw error
+    }
+    throw new Error("drive readback unavailable")
+  }
+
+  await assert.rejects(
+    core.mountDisk({ driveId: "fd2", path: "invalid.woz" }),
+    /drive readback unavailable/,
+  )
+  await assert.rejects(core.ejectDisk("fd2"), /restart this MCP session/)
+  assert.equal(requests, 2)
+})
+
+test("mount transport failure remains an uncertain mutation", async (t) => {
+  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-transport-"))
+  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
+  await writeFile(path.join(binaryRoot, "fixture.woz"), Buffer.from("WOZ2\u00ff\n\r\n"))
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+    new AbortController().signal,
+    await realpath(binaryRoot),
+  )
+  let requests = 0
+  core.request = async () => {
+    requests += 1
+    throw new Error("transport timed out")
+  }
+
+  await assert.rejects(
+    core.mountDisk({ driveId: "fd1", path: "fixture.woz" }),
+    /transport timed out/,
+  )
+  await assert.rejects(core.ejectDisk("fd1"), /restart this MCP session/)
+  assert.equal(requests, 1)
+})
+
 test("cancelling an active mutation prevents later mutations in the same session", async (t) => {
   let release
   let started
@@ -881,6 +1163,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     [
       "read_memory",
       "set_keyboard_key",
+      "eject_disk",
       "boot",
       "reset",
       "pause",
@@ -1199,6 +1482,7 @@ test("stdio test cleanup escalates when its child ignores EOF", async (t) => {
 test("configured stdio advertises and loads a local binary", async (t) => {
   const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-mcp-binaries-"))
   await writeFile(path.join(binaryRoot, "fixture.bin"), Buffer.from([0xA9, 0x42, 0x60]))
+  await writeFile(path.join(binaryRoot, "fixture.woz"), Buffer.from("WOZ2\u00ff\n\r\n"))
   const processState = await launchMcp({ APPLE2TS_BINARY_ROOT: binaryRoot })
   t.after(processState.cleanup)
   try {
@@ -1218,6 +1502,27 @@ test("configured stdio advertises and loads a local binary", async (t) => {
     processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" })}\n`)
     const tools = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 2))
     assert.ok(tools.result.tools.some((tool) => tool.name === "load_binary"))
+    const mountTool = tools.result.tools.find((tool) => tool.name === "mount_disk")
+    assert.deepEqual(mountTool.inputSchema, {
+      type: "object",
+      properties: {
+        driveId: { type: "string", enum: ["fd1", "fd2"] },
+        path: { type: "string", minLength: 1 },
+      },
+      required: ["driveId", "path"],
+      additionalProperties: false,
+    })
+    assert.equal(mountTool.annotations.destructiveHint, true)
+    assert.equal(mountTool.annotations.idempotentHint, false)
+    assert.deepEqual(mountTool.outputSchema.properties.state, {
+      type: "object",
+      properties: {
+        driveId: { type: "string", enum: ["fd1", "fd2"] },
+        mounted: { type: "boolean" },
+      },
+      required: ["driveId", "mounted"],
+      additionalProperties: false,
+    })
 
     processState.child.stdin.write(`${JSON.stringify({
       jsonrpc: "2.0",
@@ -1231,6 +1536,32 @@ test("configured stdio advertises and loads a local binary", async (t) => {
     assert.equal(loaded.result.structuredContent.address, 0x6000)
     assert.equal(loaded.result.structuredContent.bytesWritten, 3)
     assert.equal(loaded.result.structuredContent.sha256.length, 64)
+
+    processState.child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: { name: "mount_disk", arguments: { driveId: "fd1", path: "fixture.woz" } },
+    })}\n`)
+    const mounted = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 4))
+    assert.equal(mounted.result.isError, undefined)
+    assert.deepEqual(mounted.result.structuredContent.state, {
+      driveId: "fd1",
+      mounted: true,
+    })
+
+    processState.child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 5,
+      method: "tools/call",
+      params: { name: "eject_disk", arguments: { driveId: "fd1" } },
+    })}\n`)
+    const ejected = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 5))
+    assert.equal(ejected.result.isError, undefined)
+    assert.deepEqual(ejected.result.structuredContent.state, {
+      driveId: "fd1",
+      mounted: false,
+    })
 
     processState.child.stdin.end()
     const outcome = await processState.waitForExit()
