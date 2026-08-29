@@ -60,6 +60,17 @@ let buffer = ""
 let stopping = false
 let statusReplies = 0
 const status = structuredClone(statusFixture)
+status.drives = [{
+  index: 0,
+  drive: 1,
+  hardDrive: false,
+  filename: "fixture.woz",
+  status: "mounted",
+  isWriteProtected: true,
+  diskHasChanges: false,
+  motorRunning: false,
+  byteLength: 143360,
+}]
 const canHaltAtAddress = (breakpoint) => breakpoint.watchpoint === false
   && breakpoint.instruction === false
   && breakpoint.disabled === false

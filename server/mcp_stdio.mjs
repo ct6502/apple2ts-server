@@ -380,6 +380,10 @@ export class Apple2tsCore {
     return this.request("/api/debug/breakpoints")
   }
 
+  readDrives() {
+    return this.request("/api/drives")
+  }
+
   serializeMutation(operation, signal, { prepare = false } = {}) {
     const mutation = this.mutations.then(async () => {
       if (this.mutationFailure) throw this.mutationFailure
@@ -688,6 +692,13 @@ export const createMcpServer = (core) => {
       title: "Apple2TS breakpoints",
       description: "Current breakpoints for the emulator bound to this process.",
       read: () => core.readBreakpoints(),
+    },
+    {
+      name: "drives",
+      uri: "apple2ts://disks/current",
+      title: "Apple2TS drives",
+      description: "Current drives and mounted media for the emulator bound to this process.",
+      read: () => core.readDrives(),
     },
   ]
 
