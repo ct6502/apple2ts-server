@@ -28,6 +28,14 @@ const MUTATION_RESPONSE_MARGIN_MS = 1000
 const MUTATION_TIMEOUT_MS = Number(process.env.COMMAND_TIMEOUT_MS || 10000)
   + MUTATION_RESPONSE_MARGIN_MS
 const MAX_BINARY_BYTES = 0xC000
+const MAX_FLOPPY_IMAGE_BYTES = 2 * 1024 * 1024
+
+class ConfirmedMutationRejection extends Error {
+  constructor(error) {
+    super(error instanceof Error ? error.message : String(error), { cause: error })
+    this.name = "ConfirmedMutationRejection"
+  }
+}
 
 const noInputSchema = fromJsonSchema({
   type: "object",
@@ -59,6 +67,25 @@ const keyboardKeyInputSchema = fromJsonSchema({
   additionalProperties: false,
 })
 
+const floppyDriveInputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    driveId: { type: "string", enum: ["fd1", "fd2"] },
+  },
+  required: ["driveId"],
+  additionalProperties: false,
+})
+
+const diskMountInputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    driveId: { type: "string", enum: ["fd1", "fd2"] },
+    path: { type: "string", minLength: 1 },
+  },
+  required: ["driveId", "path"],
+  additionalProperties: false,
+})
+
 const emulatorIdentitySchema = {
   type: "object",
   properties: {
@@ -69,6 +96,26 @@ const emulatorIdentitySchema = {
   required: ["serverInstanceId", "rendererId", "targetId"],
   additionalProperties: false,
 }
+
+const driveReceiptSchema = {
+  type: "object",
+  properties: {
+    driveId: { type: "string", enum: ["fd1", "fd2"] },
+    mounted: { type: "boolean" },
+  },
+  required: ["driveId", "mounted"],
+  additionalProperties: false,
+}
+
+const driveResultSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    emulator: emulatorIdentitySchema,
+    state: driveReceiptSchema,
+  },
+  required: ["emulator", "state"],
+  additionalProperties: false,
+})
 
 const machineResultSchema = fromJsonSchema({
   type: "object",
@@ -292,7 +339,9 @@ const fetchEnvelope = async (baseUrl, pathname, controllerToken, signal, options
   const payload = await response.json().catch(() => null)
   if (!response.ok || payload?.ok !== true) {
     const detail = payload?.error?.message || payload?.error?.code || payload?.error || `HTTP ${response.status}`
-    throw new Error(`Apple2TS bridge request ${pathname} failed: ${detail}`)
+    const error = new Error(`Apple2TS bridge request ${pathname} failed: ${detail}`)
+    error.bridgeStatus = response.status
+    throw error
   }
   return payload.data
 }
@@ -320,12 +369,9 @@ const readAtMost = async (handle, limit) => {
   return buffer.subarray(0, length)
 }
 
-const readBinaryFile = async (root, filePath, address) => {
+const readTrustedFile = async (root, filePath, noun, maxBytes) => {
   if (typeof filePath !== "string" || filePath.length === 0 || path.isAbsolute(filePath)) {
-    throw new Error("path must be a non-empty path relative to APPLE2TS_BINARY_ROOT")
-  }
-  if (!Number.isInteger(address) || address < 0 || address >= MAX_BINARY_BYTES) {
-    throw new Error("address must be an integer between 0 and 49151")
+    throw new Error(`path must be a non-empty path relative to APPLE2TS_BINARY_ROOT`)
   }
 
   const candidate = path.resolve(root, filePath)
@@ -338,7 +384,7 @@ const readBinaryFile = async (root, filePath, address) => {
   try {
     pathInfo = await lstat(candidate)
   } catch {
-    throw new Error("binary file is unavailable or unreadable")
+    throw new Error(`${noun} file is unavailable or unreadable`)
   }
   if (pathInfo.isSymbolicLink()) throw new Error("symbolic links are not allowed")
   if (!pathInfo.isFile()) throw new Error("path must name a regular file")
@@ -347,7 +393,7 @@ const readBinaryFile = async (root, filePath, address) => {
   try {
     resolvedFile = await realpath(candidate)
   } catch {
-    throw new Error("binary file is unavailable or unreadable")
+    throw new Error(`${noun} file is unavailable or unreadable`)
   }
   if (resolvedFile !== candidate) throw new Error("symbolic links are not allowed")
 
@@ -359,26 +405,44 @@ const readBinaryFile = async (root, filePath, address) => {
         fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
       )
     } catch {
-      throw new Error("binary file is unavailable or unreadable")
+      throw new Error(`${noun} file is unavailable or unreadable`)
     }
     const fileInfo = await handle.stat()
     if (!fileInfo.isFile()) throw new Error("path must name a regular file")
-    if (fileInfo.size === 0) throw new Error("binary file must not be empty")
-    if (fileInfo.size > MAX_BINARY_BYTES) {
-      throw new Error(`binary file cannot exceed ${MAX_BINARY_BYTES} bytes`)
-    }
-    if (address + fileInfo.size > MAX_BINARY_BYTES) {
-      throw new Error("binary block must fit within main RAM at $0000-$BFFF")
-    }
+    if (fileInfo.size === 0) throw new Error(`${noun} file must not be empty`)
+    if (fileInfo.size > maxBytes) throw new Error(`${noun} file cannot exceed ${maxBytes} bytes`)
 
-    const bytes = await readAtMost(handle, MAX_BINARY_BYTES - address + 1)
-    if (bytes.length === 0) throw new Error("binary file must not be empty")
-    if (bytes.length > MAX_BINARY_BYTES || address + bytes.length > MAX_BINARY_BYTES) {
-      throw new Error("binary block must fit within main RAM at $0000-$BFFF")
-    }
+    const bytes = await readAtMost(handle, maxBytes + 1)
+    if (bytes.length === 0) throw new Error(`${noun} file must not be empty`)
+    if (bytes.length > maxBytes) throw new Error(`${noun} file cannot exceed ${maxBytes} bytes`)
     return bytes
   } finally {
     await handle?.close()
+  }
+}
+
+const readBinaryFile = async (root, filePath, address) => {
+  if (!Number.isInteger(address) || address < 0 || address >= MAX_BINARY_BYTES) {
+    throw new Error("address must be an integer between 0 and 49151")
+  }
+  const bytes = await readTrustedFile(root, filePath, "binary", MAX_BINARY_BYTES)
+  if (address + bytes.length > MAX_BINARY_BYTES) {
+    throw new Error("binary block must fit within main RAM at $0000-$BFFF")
+  }
+  return bytes
+}
+
+const isConfirmedDriveState = (result, driveId, mounted) =>
+  result?.state?.driveId === driveId
+  && result.state.mounted === mounted
+
+const confirmDriveState = (result, driveId, mounted, operation) => {
+  if (!isConfirmedDriveState(result, driveId, mounted)) {
+    throw new Error(`Apple2TS did not confirm ${operation} for ${driveId}`)
+  }
+  return {
+    emulator: result.emulator,
+    state: { driveId: result.state.driveId, mounted: result.state.mounted },
   }
 }
 
@@ -446,8 +510,8 @@ export class Apple2tsCore {
         if (uncertain) await this.releaseHeldKeyboard().catch(() => {})
         return result
       } catch (error) {
-        markUncertain()
-        await this.releaseHeldKeyboard().catch(() => {})
+        if (!(error instanceof ConfirmedMutationRejection)) markUncertain()
+        if (uncertain) await this.releaseHeldKeyboard().catch(() => {})
         throw error
       } finally {
         signal?.removeEventListener("abort", markUncertain)
@@ -525,6 +589,42 @@ export class Apple2tsCore {
   async neutralizeKeyboard() {
     await this.mutations
     await this.releaseHeldKeyboard()
+  }
+
+  mountDisk({ driveId, path: filePath }, signal) {
+    return this.serializeMutation(async (startMutation) => {
+      const bytes = await readTrustedFile(
+        this.binaryRoot,
+        filePath,
+        "disk image",
+        MAX_FLOPPY_IMAGE_BYTES,
+      )
+      startMutation()
+      let result
+      try {
+        result = await this.request(`/api/drives/${driveId}/mount`, {
+          method: "POST",
+          body: {
+            sourceType: "base64",
+            filename: path.basename(filePath),
+            dataBase64: bytes.toString("base64"),
+          },
+        })
+      } catch (error) {
+        if (error?.bridgeStatus !== 400) throw error
+        const current = await this.request(`/api/drives/${driveId}`)
+        if (!isConfirmedDriveState(current, driveId, false)) throw error
+        throw new ConfirmedMutationRejection(error)
+      }
+      return confirmDriveState(result, driveId, true, "disk mount")
+    }, signal, { prepare: true })
+  }
+
+  ejectDisk(driveId, signal) {
+    return this.serializeMutation(async () => {
+      const result = await this.request(`/api/drives/${driveId}`, { method: "DELETE" })
+      return confirmDriveState(result, driveId, false, "disk eject")
+    }, signal)
   }
 
   setBreakpoint(address, signal) {
@@ -661,6 +761,27 @@ const mutationTools = [
     destructiveHint: false,
     idempotentHint: false,
     execute: (core, input, signal) => core.setKeyboardKey(input.key, input.repeat, signal),
+  },
+  {
+    name: "mount_disk",
+    title: "Mount a local floppy image",
+    description: "Mount one trusted local floppy image in fd1 or fd2 and return its confirmed mounted-state receipt.",
+    inputSchema: diskMountInputSchema,
+    outputSchema: driveResultSchema,
+    destructiveHint: true,
+    idempotentHint: false,
+    enabled: (core) => Boolean(core.binaryRoot),
+    execute: (core, input, signal) => core.mountDisk(input, signal),
+  },
+  {
+    name: "eject_disk",
+    title: "Eject a floppy disk",
+    description: "Eject the disk in fd1 or fd2 and return its confirmed mounted-state receipt.",
+    inputSchema: floppyDriveInputSchema,
+    outputSchema: driveResultSchema,
+    destructiveHint: true,
+    idempotentHint: true,
+    execute: (core, input, signal) => core.ejectDisk(input.driveId, signal),
   },
   {
     name: "boot",
@@ -874,6 +995,7 @@ export const createMcpServer = (core) => {
   }
 
   for (const tool of mutationTools) {
+    if (tool.enabled && !tool.enabled(core)) continue
     server.registerTool(
       tool.name,
       {

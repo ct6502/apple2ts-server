@@ -89,11 +89,14 @@ Replace the paths for your installation. To open the browser window, add
 `"APPLE2TS_CHROMIUM_MODE": "visible"` to `env`. When the host closes the stdio
 connection, the server stops the browser and removes its private profile.
 
-To enable `load_binary`, create or choose a directory containing Apple II
-binary files and set `APPLE2TS_BINARY_ROOT` to its path before startup. The
-tool accepts paths relative to that directory and is hidden when the setting
-is absent. Do not change the directory while the server runs. A file can be
-up to 49,152 bytes and must fit in main RAM at `$0000-$BFFF`.
+To enable `load_binary` and `mount_disk`, create or choose a directory
+containing trusted Apple II input files, then set `APPLE2TS_BINARY_ROOT` to its
+path before startup. Both tools accept paths relative to that directory and
+are hidden when the setting is absent. The configured root remains fixed for
+the server session, but fully written files may be added between tool calls.
+The server reads files in place and does not remove them. A binary can be up to
+49,152 bytes and must fit in main RAM at `$0000-$BFFF`; a floppy image can be
+up to 2 MiB.
 
 ### Server Docs URLs
 
