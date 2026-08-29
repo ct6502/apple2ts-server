@@ -384,6 +384,14 @@ export class Apple2tsCore {
     return this.request("/api/drives")
   }
 
+  async readTextScreen() {
+    const result = await this.readMachine()
+    return {
+      emulator: result.emulator,
+      state: { textPage: result.state.textPage },
+    }
+  }
+
   serializeMutation(operation, signal, { prepare = false } = {}) {
     const mutation = this.mutations.then(async () => {
       if (this.mutationFailure) throw this.mutationFailure
@@ -699,6 +707,13 @@ export const createMcpServer = (core) => {
       title: "Apple2TS drives",
       description: "Current drives and mounted media for the emulator bound to this process.",
       read: () => core.readDrives(),
+    },
+    {
+      name: "text-screen",
+      uri: "apple2ts://video/text",
+      title: "Apple2TS text screen",
+      description: "Current Apple II text screen for the emulator bound to this process.",
+      read: () => core.readTextScreen(),
     },
   ]
 
