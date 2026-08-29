@@ -730,6 +730,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     "apple2ts://machine",
     "apple2ts://cpu",
     "apple2ts://debugger/breakpoints",
+    "apple2ts://disks/current",
   ])
 
   processState.child.stdin.write(`${JSON.stringify({
@@ -899,6 +900,30 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.deepEqual(breakpointsPayload.state.map(({ breakpointId, address }) => ({ breakpointId, address })), [
     { breakpointId: "bp:24579", address: 0x6003 },
   ])
+
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: 151,
+    method: "resources/read",
+    params: { uri: "apple2ts://disks/current" },
+  })}\n`)
+  const drivesRead = JSON.parse(
+    await processState.waitForStdout((line) => JSON.parse(line).id === 151),
+  )
+  const drivesPayload = JSON.parse(drivesRead.result.contents[0].text)
+  assert.equal(drivesPayload.emulator.rendererId, rendererId)
+  assert.deepEqual(drivesPayload.state, [{
+    driveId: "fd1",
+    index: 0,
+    kind: "floppy",
+    mounted: true,
+    filename: "fixture.woz",
+    status: "mounted",
+    writeProtected: true,
+    dirty: false,
+    motorRunning: false,
+    byteLength: 143360,
+  }])
   await callTool(16, "set_breakpoint", { address: 0x6006 })
   const cleared = await callTool(17, "clear_breakpoint", { address: 0x6003 })
   assert.deepEqual(cleared.value, {
