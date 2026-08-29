@@ -731,6 +731,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     "apple2ts://cpu",
     "apple2ts://debugger/breakpoints",
     "apple2ts://disks/current",
+    "apple2ts://video/text",
   ])
 
   processState.child.stdin.write(`${JSON.stringify({
@@ -924,6 +925,21 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     motorRunning: false,
     byteLength: 143360,
   }])
+
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: 152,
+    method: "resources/read",
+    params: { uri: "apple2ts://video/text" },
+  })}\n`)
+  const textRead = JSON.parse(
+    await processState.waitForStdout((line) => JSON.parse(line).id === 152),
+  )
+  const textPayload = JSON.parse(textRead.result.contents[0].text)
+  assert.deepEqual(textPayload, {
+    emulator: payload.emulator,
+    state: { textPage: "READY" },
+  })
   await callTool(16, "set_breakpoint", { address: 0x6006 })
   const cleared = await callTool(17, "clear_breakpoint", { address: 0x6003 })
   assert.deepEqual(cleared.value, {
