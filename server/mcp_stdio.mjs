@@ -415,6 +415,11 @@ export class Apple2tsCore {
     return this.request("/api/drives")
   }
 
+  async readSoftSwitches() {
+    const result = await this.request("/api/debug/soft-switches")
+    return { emulator: result.emulator, softswitches: result.state.switches }
+  }
+
   async readTextScreen() {
     const result = await this.readMachine()
     return {
@@ -790,6 +795,13 @@ export const createMcpServer = (core) => {
       title: "Apple2TS drives",
       description: "Current drives and mounted media for the emulator bound to this process.",
       read: () => core.readDrives(),
+    },
+    {
+      name: "soft-switches",
+      uri: "apple2ts://system/softswitches",
+      title: "Apple2TS soft switches",
+      description: "Current soft-switch state for the emulator bound to this process.",
+      read: () => core.readSoftSwitches(),
     },
     {
       name: "text-screen",

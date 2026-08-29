@@ -7,6 +7,12 @@ export const statusFixture = {
     isDebugging: true,
     showDebugTab: false,
     textPage: "READY",
+    softSwitches: {
+      TEXT: false,
+      MIXED: false,
+      PAGE2: false,
+      HIRES: true,
+    },
     machineState: {
       PC: 768,
       Accum: 65,

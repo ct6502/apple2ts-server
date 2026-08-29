@@ -860,6 +860,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     "apple2ts://cpu",
     "apple2ts://debugger/breakpoints",
     "apple2ts://disks/current",
+    "apple2ts://system/softswitches",
     "apple2ts://video/text",
   ])
 
@@ -1067,10 +1068,30 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     jsonrpc: "2.0",
     id: 152,
     method: "resources/read",
+    params: { uri: "apple2ts://system/softswitches" },
+  })}\n`)
+  const softSwitchesRead = JSON.parse(
+    await processState.waitForStdout((line) => JSON.parse(line).id === 152),
+  )
+  const softSwitchesPayload = JSON.parse(softSwitchesRead.result.contents[0].text)
+  assert.deepEqual(softSwitchesPayload, {
+    emulator: payload.emulator,
+    softswitches: {
+      TEXT: false,
+      MIXED: false,
+      PAGE2: false,
+      HIRES: true,
+    },
+  })
+
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: 153,
+    method: "resources/read",
     params: { uri: "apple2ts://video/text" },
   })}\n`)
   const textRead = JSON.parse(
-    await processState.waitForStdout((line) => JSON.parse(line).id === 152),
+    await processState.waitForStdout((line) => JSON.parse(line).id === 153),
   )
   const textPayload = JSON.parse(textRead.result.contents[0].text)
   assert.deepEqual(textPayload, {
