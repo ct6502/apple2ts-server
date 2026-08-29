@@ -376,6 +376,10 @@ export class Apple2tsCore {
     return this.request("/api/debug/cpu")
   }
 
+  readBreakpoints() {
+    return this.request("/api/debug/breakpoints")
+  }
+
   serializeMutation(operation, signal, { prepare = false } = {}) {
     const mutation = this.mutations.then(async () => {
       if (this.mutationFailure) throw this.mutationFailure
@@ -663,31 +667,48 @@ const toolResult = (result) => ({
 export const createMcpServer = (core) => {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION })
 
-  server.registerResource(
-    "machine",
-    "apple2ts://machine",
+  const resources = [
     {
+      name: "machine",
+      uri: "apple2ts://machine",
       title: "Apple2TS machine state",
       description: "Current state of the emulator bound to this process.",
-      mimeType: "application/json",
+      read: () => core.readMachine(),
     },
-    async (uri) => ({
-      contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(await core.readMachine()) }],
-    }),
-  )
-
-  server.registerResource(
-    "cpu",
-    "apple2ts://cpu",
     {
+      name: "cpu",
+      uri: "apple2ts://cpu",
       title: "Apple2TS CPU state",
       description: "Current CPU state of the emulator bound to this process.",
-      mimeType: "application/json",
+      read: () => core.readCpu(),
     },
-    async (uri) => ({
-      contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(await core.readCpu()) }],
-    }),
-  )
+    {
+      name: "breakpoints",
+      uri: "apple2ts://debugger/breakpoints",
+      title: "Apple2TS breakpoints",
+      description: "Current breakpoints for the emulator bound to this process.",
+      read: () => core.readBreakpoints(),
+    },
+  ]
+
+  for (const resource of resources) {
+    server.registerResource(
+      resource.name,
+      resource.uri,
+      {
+        title: resource.title,
+        description: resource.description,
+        mimeType: "application/json",
+      },
+      async (uri) => ({
+        contents: [{
+          uri: uri.href,
+          mimeType: "application/json",
+          text: JSON.stringify(await resource.read()),
+        }],
+      }),
+    )
+  }
 
   server.registerTool(
     "read_memory",
