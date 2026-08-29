@@ -726,7 +726,11 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`)
   processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/list" })}\n`)
   const listed = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 2))
-  assert.deepEqual(listed.result.resources.map((resource) => resource.uri), ["apple2ts://machine", "apple2ts://cpu"])
+  assert.deepEqual(listed.result.resources.map((resource) => resource.uri), [
+    "apple2ts://machine",
+    "apple2ts://cpu",
+    "apple2ts://debugger/breakpoints",
+  ])
 
   processState.child.stdin.write(`${JSON.stringify({
     jsonrpc: "2.0",
@@ -880,6 +884,21 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   })
   const occupied = await callTool(15, "set_breakpoint", { address: 0x6003 })
   assert.deepEqual(occupied, breakpoint)
+
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: 150,
+    method: "resources/read",
+    params: { uri: "apple2ts://debugger/breakpoints" },
+  })}\n`)
+  const breakpointsRead = JSON.parse(
+    await processState.waitForStdout((line) => JSON.parse(line).id === 150),
+  )
+  const breakpointsPayload = JSON.parse(breakpointsRead.result.contents[0].text)
+  assert.equal(breakpointsPayload.emulator.rendererId, rendererId)
+  assert.deepEqual(breakpointsPayload.state.map(({ breakpointId, address }) => ({ breakpointId, address })), [
+    { breakpointId: "bp:24579", address: 0x6003 },
+  ])
   await callTool(16, "set_breakpoint", { address: 0x6006 })
   const cleared = await callTool(17, "clear_breakpoint", { address: 0x6003 })
   assert.deepEqual(cleared.value, {
