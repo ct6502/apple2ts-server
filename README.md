@@ -35,14 +35,16 @@ npm run cli -- machine boot
 npm run cli -- machine reset
 ```
 
-If `dist/index.html` is missing, `npm run start` prints setup steps and exits.
+The server uses `dist/` by default. Set `APPLE2TS_DIST_DIR` to an existing
+Apple2TS build directory when the build lives elsewhere. If its `index.html`
+is missing, `npm run start` prints setup steps and exits.
 Use `npm run start:force` only when you intentionally want the API server without the built client UI.
 Both commands also refuse to start when the target port is already occupied by a different service.
 
 ## Server Overview
 
 - localhost-only by design (`127.0.0.1`)
-- serves the browser app from `dist/`
+- serves the browser app from the configured Apple2TS build directory
 - provides a resource-oriented HTTP API
 - bridges commands to the browser client via SSE
 
@@ -53,7 +55,7 @@ Use `?remoteControl=1` so the browser client auto-registers with the integrated 
 ## MCP over stdio
 
 The stdio server needs an Apple2TS browser build. Build it in an Apple2TS
-checkout, then copy it into this repository:
+checkout, then give the server its `dist/` path:
 
 ```bash
 cd /path/to/apple2ts
@@ -62,8 +64,9 @@ npm run build
 
 cd /path/to/apple2ts-server
 npm ci
-rm -rf ./dist
-cp -R /path/to/apple2ts/dist ./dist
+APPLE2TS_CHROMIUM_EXECUTABLE=/path/to/chrome \
+  APPLE2TS_DIST_DIR=/path/to/apple2ts/dist \
+  npm run mcp:stdio
 ```
 
 `npm run mcp:stdio` starts one private Apple2TS browser session owned by the
@@ -78,6 +81,7 @@ it with an entry like this:
       "args": ["--prefix", "/path/to/apple2ts-server", "run", "mcp:stdio"],
       "env": {
         "APPLE2TS_CHROMIUM_EXECUTABLE": "/path/to/chrome",
+        "APPLE2TS_DIST_DIR": "/path/to/apple2ts/dist",
         "APPLE2TS_BINARY_ROOT": "/path/to/apple2-binaries"
       }
     }

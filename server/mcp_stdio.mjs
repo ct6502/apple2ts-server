@@ -13,7 +13,8 @@ import { serveStdio } from "@modelcontextprotocol/server/stdio"
 
 import {
   hasBrowserBuild,
-  MISSING_BROWSER_BUILD_MESSAGE,
+  getMissingBrowserBuildMessage,
+  resolveBrowserBuildDir,
   startApple2tsServer,
   stopApple2tsServer,
 } from "./server.mjs"
@@ -1211,17 +1212,19 @@ export const runStdio = async (options = {}) => {
   try {
     if (!options.chromiumExecutable) throw new Error("APPLE2TS_CHROMIUM_EXECUTABLE is required")
     const binaryRoot = await resolveBinaryRoot(options.binaryRoot)
+    const distDir = resolveBrowserBuildDir(options.distDir)
     const chromiumMode = options.chromiumMode ?? "headless"
     if (chromiumMode !== "headless" && chromiumMode !== "visible") {
       throw new Error("APPLE2TS_CHROMIUM_MODE must be 'headless' or 'visible'")
     }
     const browserBuildAvailable = options.hasBrowserBuild || hasBrowserBuild
-    if (options.requireBrowserBuild !== false && !(await browserBuildAvailable())) {
-      throw new Error(MISSING_BROWSER_BUILD_MESSAGE)
+    if (options.requireBrowserBuild !== false && !(await browserBuildAvailable(distDir))) {
+      throw new Error(getMissingBrowserBuildMessage(distDir))
     }
     listenerPromise = startApple2tsServer({
       host: "127.0.0.1",
       port: Number(options.port ?? 0),
+      distDir,
       privateRenderer: { remoteControlToken, rendererId, controllerToken },
       logger: { log: (message) => process.stderr.write(`${message}\n`) },
     })
@@ -1286,5 +1289,6 @@ if (isMain) {
     chromiumExecutable: process.env.APPLE2TS_CHROMIUM_EXECUTABLE,
     chromiumMode: process.env.APPLE2TS_CHROMIUM_MODE,
     binaryRoot: process.env.APPLE2TS_BINARY_ROOT,
+    distDir: process.env.APPLE2TS_DIST_DIR,
   })
 }
