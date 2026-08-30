@@ -661,7 +661,7 @@ test("mutations wait for prior callers and the mutation deadline", async (t) => 
     res.end(JSON.stringify({
       ok: true,
       data: req.url === "/api/debug/cpu"
-        ? { PC: body.PC, PStatus: body.PStatus }
+        ? { PC: body.PC, S: body.S ?? 0xff, PStatus: body.PStatus }
         : { runMode: "paused", speedMode: body.speedMode },
     }))
     activeRequests -= 1
@@ -682,7 +682,7 @@ test("mutations wait for prior callers and the mutation deadline", async (t) => 
   ])
   assert.equal(maxActiveRequests, 1)
   assert.equal(accelerated.state.speedMode, 4)
-  assert.deepEqual(cpu.value, { PC: 0x6000, PStatus: 0x20 })
+  assert.deepEqual(cpu.value, { PC: 0x6000, S: 0xff, PStatus: 0x20 })
   assert.equal(normalized.state.speedMode, 0)
 })
 
@@ -1552,9 +1552,10 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     type: "object",
     properties: {
       PC: { type: "integer", minimum: 0, maximum: 65535 },
+      S: { type: "integer", minimum: 0, maximum: 255 },
       PStatus: { type: "integer", minimum: 0, maximum: 255 },
     },
-    anyOf: [{ required: ["PC"] }, { required: ["PStatus"] }],
+    anyOf: [{ required: ["PC"] }, { required: ["S"] }, { required: ["PStatus"] }],
     additionalProperties: false,
   })
 
@@ -1723,27 +1724,33 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   const pcOnly = await callTool(11, "set_cpu", { PC: 0x6000 })
   assert.deepEqual(pcOnly, {
     emulator: payload.emulator,
-    value: { PC: 0x6000, PStatus: 0x20 },
+    value: { PC: 0x6000, S: 0xff, PStatus: 0x20 },
   })
 
-  const statusOnly = await callTool(12, "set_cpu", { PStatus: 0x24 })
+  const stackOnly = await callTool(12, "set_cpu", { S: 0xf0 })
+  assert.deepEqual(stackOnly, {
+    emulator: payload.emulator,
+    value: { PC: 0x6000, S: 0xf0, PStatus: 0x20 },
+  })
+
+  const statusOnly = await callTool(13, "set_cpu", { PStatus: 0x24 })
   assert.deepEqual(statusOnly, {
     emulator: payload.emulator,
-    value: { PC: 0x6000, PStatus: 0x24 },
+    value: { PC: 0x6000, S: 0xf0, PStatus: 0x24 },
   })
 
-  const cpu = await callTool(13, "set_cpu", { PC: 0x6001, PStatus: 0x20 })
+  const cpu = await callTool(14, "set_cpu", { PC: 0x6001, S: 0xef, PStatus: 0x20 })
   assert.deepEqual(cpu, {
     emulator: payload.emulator,
-    value: { PC: 0x6001, PStatus: 0x20 },
+    value: { PC: 0x6001, S: 0xef, PStatus: 0x20 },
   })
 
-  const breakpoint = await callTool(14, "set_breakpoint", { address: 0x6003 })
+  const breakpoint = await callTool(15, "set_breakpoint", { address: 0x6003 })
   assert.deepEqual(breakpoint, {
     emulator: payload.emulator,
     value: { address: 0x6003, breakpointId: "bp:24579" },
   })
-  const occupied = await callTool(15, "set_breakpoint", { address: 0x6003 })
+  const occupied = await callTool(16, "set_breakpoint", { address: 0x6003 })
   assert.deepEqual(occupied, breakpoint)
 
   processState.child.stdin.write(`${JSON.stringify({

@@ -356,9 +356,10 @@ const cpuPatchInputSchema = fromJsonSchema({
   type: "object",
   properties: {
     PC: { type: "integer", minimum: 0, maximum: 65535 },
+    S: { type: "integer", minimum: 0, maximum: 255 },
     PStatus: { type: "integer", minimum: 0, maximum: 255 },
   },
-  anyOf: [{ required: ["PC"] }, { required: ["PStatus"] }],
+  anyOf: [{ required: ["PC"] }, { required: ["S"] }, { required: ["PStatus"] }],
   additionalProperties: false,
 })
 
@@ -370,9 +371,10 @@ const cpuResultSchema = fromJsonSchema({
       type: "object",
       properties: {
         PC: { type: "integer", minimum: 0, maximum: 65535 },
+        S: { type: "integer", minimum: 0, maximum: 255 },
         PStatus: { type: "integer", minimum: 0, maximum: 255 },
       },
-      required: ["PC", "PStatus"],
+      required: ["PC", "S", "PStatus"],
       additionalProperties: false,
     },
   },
@@ -923,11 +925,17 @@ export class Apple2tsCore {
 
   setCpu(patch, signal) {
     const fields = Object.keys(patch)
-    if (fields.length < 1 || fields.some((field) => field !== "PC" && field !== "PStatus")) {
-      throw new Error("set_cpu accepts PC and PStatus")
+    if (fields.length < 1 || fields.some((field) => !["PC", "S", "PStatus"].includes(field))) {
+      throw new Error("set_cpu accepts PC, S, and PStatus")
     }
     if ("PC" in patch && (!Number.isInteger(patch.PC) || patch.PC < 0 || patch.PC > 65535)) {
       throw new Error("PC must be an integer between 0 and 65535")
+    }
+    if (
+      "S" in patch
+      && (!Number.isInteger(patch.S) || patch.S < 0 || patch.S > 255)
+    ) {
+      throw new Error("S must be an integer between 0 and 255")
     }
     if (
       "PStatus" in patch
@@ -942,6 +950,7 @@ export class Apple2tsCore {
         emulator: result.emulator,
         value: {
           PC: result.state.PC,
+          S: result.state.S,
           PStatus: result.state.PStatus,
         },
       }
@@ -1142,7 +1151,7 @@ const mutationTools = [
   {
     name: "set_cpu",
     title: "Set Apple II CPU state",
-    description: "Set the program counter or processor status and return both confirmed values.",
+    description: "Set the program counter, stack pointer, or processor status and return confirmed CPU state.",
     inputSchema: cpuPatchInputSchema,
     outputSchema: cpuResultSchema,
     destructiveHint: true,
