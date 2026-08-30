@@ -402,6 +402,7 @@
       "put": {
         "tags": ["Debug"],
         "summary": "Write a memory block",
+        "description": "Writes sequentially through the CPU-visible address space using the current main, auxiliary, language-card, or expansion-memory mapping. The caller must select the intended bank first. Addresses in $C000-$CFFF may trigger device or soft-switch behavior; prefer dedicated control routes when available. Completion does not verify stored bytes. The write is not atomic: a failure may occur after earlier bytes have taken effect.",
         "requestBody": {
           "required": true,
           "content": {
@@ -414,13 +415,16 @@
         },
         "responses": {
           "200": {
-            "$ref": "#/components/responses/MemoryRangeResponse"
+            "$ref": "#/components/responses/MemoryWriteReceiptResponse"
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/OperationFailed"
           }
         }
       }
@@ -869,6 +873,16 @@
           }
         }
       },
+      "MemoryWriteReceiptResponse": {
+        "description": "Completed CPU-visible memory write",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/MemoryWriteReceiptEnvelope"
+            }
+          }
+        }
+      },
       "BinaryLoadReceiptResponse": {
         "description": "Completed binary load",
         "content": {
@@ -991,6 +1005,16 @@
       },
       "ServiceUnavailable": {
         "description": "No browser emulator is connected",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            }
+          }
+        }
+      },
+      "OperationFailed": {
+        "description": "The operation failed after effects may have begun",
         "content": {
           "application/json": {
             "schema": {
@@ -1304,16 +1328,39 @@
         "type": "object",
         "properties": {
           "start": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
           },
           "data": {
             "type": "array",
             "items": {
-              "type": "integer"
-            }
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 255
+            },
+            "minItems": 1,
+            "maxItems": 65536
           }
         },
         "required": ["start", "data"],
+        "additionalProperties": false
+      },
+      "MemoryWriteReceipt": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "bytesProcessed": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65536
+          }
+        },
+        "required": ["address", "bytesProcessed"],
         "additionalProperties": false
       },
       "BinaryLoadReceipt": {
@@ -1679,6 +1726,18 @@
           },
           "data": {
             "$ref": "#/components/schemas/MemoryRange"
+          }
+        },
+        "required": ["ok", "data"]
+      },
+      "MemoryWriteReceiptEnvelope": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "data": {
+            "$ref": "#/components/schemas/MemoryWriteReceipt"
           }
         },
         "required": ["ok", "data"]

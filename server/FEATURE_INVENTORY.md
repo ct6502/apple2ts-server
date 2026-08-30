@@ -28,6 +28,7 @@ The current browser bridge already exposes these actions through the integrated 
 - `appleKey`
 - `mouseEvent`
 - `setMemory`
+- `writeMemory`
 - `setSoftSwitches`
 - `setDriveWriteProtected`
 - `mountDisk`
