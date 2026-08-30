@@ -127,6 +127,15 @@ while (!stopping) {
       result = status
     } else if (command.action === "getMemory") {
       result = { memoryDump }
+    } else if (command.action === "captureScreen") {
+      result = {
+        mimeType: "image/png",
+        dataBase64: process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "invalid-screen"
+          ? "not base64"
+          : "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+        width: 1,
+        height: 1,
+      }
     } else if (command.action === "loadBinary") {
       result = status
     } else if (command.action === "mountDisk") {

@@ -574,6 +574,45 @@ const getMemoryDumpFromReply = async (client) => {
   }
 }
 
+const MAX_SCREEN_CAPTURE_BASE64_LENGTH = 64 * 1024 * 1024
+const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
+
+const getRenderedScreenFromReply = async (client) => {
+  const reply = await dispatchCommand(client, "captureScreen", {}, true)
+  const result = reply.result
+  if (
+    result?.mimeType !== "image/png"
+    || typeof result.dataBase64 !== "string"
+    || result.dataBase64.length === 0
+    || result.dataBase64.length > MAX_SCREEN_CAPTURE_BASE64_LENGTH
+    || result.dataBase64.length % 4 !== 0
+    || !/^[A-Za-z0-9+/]*={0,2}$/.test(result.dataBase64)
+    || !Number.isInteger(result.width)
+    || result.width < 1
+    || !Number.isInteger(result.height)
+    || result.height < 1
+  ) {
+    throw new Error("Rendered screen was not available from the browser client.")
+  }
+  const image = Buffer.from(result.dataBase64, "base64")
+  if (
+    image.length < 24
+    || !image.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)
+    || image.toString("ascii", 12, 16) !== "IHDR"
+    || image.readUInt32BE(16) !== result.width
+    || image.readUInt32BE(20) !== result.height
+  ) {
+    throw new Error("Rendered screen was not available from the browser client.")
+  }
+  client.lastSeenAt = Date.now()
+  return {
+    mimeType: result.mimeType,
+    dataBase64: result.dataBase64,
+    width: result.width,
+    height: result.height,
+  }
+}
+
 const formatBytesAsHex = (bytes) =>
   bytes.map((byte) => Number(byte).toString(16).padStart(2, "0").toUpperCase()).join(" ")
 
@@ -1164,6 +1203,29 @@ const server = createServer(async (req, res) => {
 
       try {
         writeEnvelope(res, 200, await getMemoryDumpFromReply(client))
+      } catch (error) {
+        writeErrorEnvelope(
+          res,
+          400,
+          "BAD_REQUEST",
+          error instanceof Error ? error.message : String(error),
+        )
+      }
+      return
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/private/screen") {
+      if (!privateRenderer) {
+        writeErrorEnvelope(res, 404, "NOT_FOUND", "Screen capture requires a private emulator session.")
+        return
+      }
+      const client = getConnectedClient()
+      if (!client) {
+        writeNoConnectedClientError(res)
+        return
+      }
+      try {
+        writeEnvelope(res, 200, await getRenderedScreenFromReply(client))
       } catch (error) {
         writeErrorEnvelope(
           res,
