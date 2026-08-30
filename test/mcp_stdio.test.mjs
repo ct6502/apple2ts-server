@@ -535,6 +535,42 @@ test("private bridge rejects invalid and unavailable memory ranges", async (t) =
   assert.equal(unavailable.body.error.code, "BAD_REQUEST")
 })
 
+test("memory writes send one confirmed block and report execution failure separately from invalid input", async (t) => {
+  const listener = await startApple2tsServer({
+    port: 0,
+    privateRenderer: { remoteControlToken: token, rendererId, controllerToken },
+    logger: { log() {} },
+  })
+  t.after(stopApple2tsServer)
+
+  const renderer = await connectFakeRenderer(listener.url, { autoServe: false })
+  t.after(() => renderer.stop())
+  const writeRequest = fetch(new URL("/api/debug/memory", listener.url), {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${controllerToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ start: 0xC000, data: [1, 2] }),
+  })
+
+  const first = await renderer.nextCommand()
+  assert.deepEqual({ action: first.action, payload: first.payload }, {
+    action: "writeMemory",
+    payload: { address: 0xC000, data: [1, 2] },
+  })
+  assert.equal((await renderer.reply(first, {
+    ok: false,
+    error: "Memory write processed 1 of 2 bytes; the next byte and earlier writes may have taken effect. rejected",
+  })).status, 200)
+
+  const response = await writeRequest
+  assert.equal(response.status, 500)
+  const body = await response.json()
+  assert.equal(body.error.code, "MEMORY_WRITE_FAILED")
+  assert.match(body.error.message, /processed 1 of 2 bytes; the next byte and earlier writes may have taken effect/)
+})
+
 test("private bridge loads a binary into main RAM and returns a completion receipt", async (t) => {
   const listener = await startApple2tsServer({
     port: 0,
@@ -1643,6 +1679,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
       "read_memory",
       "wait_for_execution_stop",
       "capture_screen",
+      "write_memory",
       "set_keyboard_key",
       "eject_disk",
       "boot",
@@ -1706,6 +1743,14 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     idempotentHint: true,
     openWorldHint: false,
   })
+  const writeMemoryTool = tools.result.tools.find((tool) => tool.name === "write_memory")
+  assert.equal(writeMemoryTool.inputSchema.properties.bytes.maxItems, 256)
+  assert.equal(writeMemoryTool.outputSchema.properties.value.properties.bytesProcessed.maximum, 256)
+  assert.match(writeMemoryTool.description, /up to 256 bytes/)
+  assert.match(writeMemoryTool.description, /caller must select the intended bank first/)
+  assert.match(writeMemoryTool.description, /never pauses implicitly/)
+  assert.match(writeMemoryTool.description, /Completion does not verify stored bytes/)
+  assert.equal(writeMemoryTool.annotations.idempotentHint, false)
   const keyboardTool = tools.result.tools.find((tool) => tool.name === "set_keyboard_key")
   assert.deepEqual(keyboardTool.inputSchema.properties.key.type, ["string", "null"])
   assert.equal(keyboardTool.inputSchema.properties.key.minLength, 1)
@@ -1847,6 +1892,20 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
 
   processState.child.stdin.write(`${JSON.stringify({
     jsonrpc: "2.0",
+    id: "write-memory",
+    method: "tools/call",
+    params: { name: "write_memory", arguments: { address: 65534, bytes: [18, 52] } },
+  })}\n`)
+  const written = JSON.parse(
+    await processState.waitForStdout((line) => JSON.parse(line).id === "write-memory"),
+  )
+  assert.deepEqual(written.result.structuredContent, {
+    emulator: payload.emulator,
+    value: { address: 65534, bytesProcessed: 2 },
+  })
+
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0",
     id: 6,
     method: "tools/call",
     params: { name: "read_memory", arguments: { address: 65535, length: 2 } },
@@ -1872,6 +1931,23 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     return response.result.structuredContent
   }
 
+  const overflowingWrite = await requestTool("write-memory-overflow", "write_memory", {
+    address: 65535,
+    bytes: [18, 52],
+  })
+  assert.equal(overflowingWrite.result.isError, true)
+  assert.match(overflowingWrite.result.content[0].text, /exceeds 64 KB address space/)
+
+  const writeAfterOverflow = await requestTool("write-memory-after-overflow", "write_memory", {
+    address: 65535,
+    bytes: [86],
+  })
+  assert.equal(writeAfterOverflow.result.isError, undefined, JSON.stringify(writeAfterOverflow))
+  assert.deepEqual(writeAfterOverflow.result.structuredContent, {
+    emulator: payload.emulator,
+    value: { address: 65535, bytesProcessed: 1 },
+  })
+
   const screen = await requestTool(50, "capture_screen")
   assert.equal(screen.result.isError, undefined)
   assert.deepEqual(screen.result.content[0], {
@@ -1884,6 +1960,13 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     image: { mimeType: "image/png", width: 1, height: 1 },
   })
   assert.deepEqual(JSON.parse(screen.result.content[1].text), screen.result.structuredContent)
+
+  const oversizedWrite = await requestTool("write-memory-too-large", "write_memory", {
+    address: 0,
+    bytes: Array(257).fill(0),
+  })
+  assert.equal(oversizedWrite.result.isError, true)
+  assert.match(oversizedWrite.result.content[0].text, /Input validation error/)
 
   const booted = await callTool(7, "boot")
   assert.equal(booted.state.runMode, "running")

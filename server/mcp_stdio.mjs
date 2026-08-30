@@ -338,6 +338,39 @@ const memoryReadInputSchema = fromJsonSchema({
   additionalProperties: false,
 })
 
+const memoryWriteInputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    address: { type: "integer", minimum: 0, maximum: 65535 },
+    bytes: {
+      type: "array",
+      items: { type: "integer", minimum: 0, maximum: 255 },
+      minItems: 1,
+      maxItems: 256,
+    },
+  },
+  required: ["address", "bytes"],
+  additionalProperties: false,
+})
+
+const memoryWriteOutputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    emulator: emulatorIdentitySchema,
+    value: {
+      type: "object",
+      properties: {
+        address: { type: "integer", minimum: 0, maximum: 65535 },
+        bytesProcessed: { type: "integer", minimum: 1, maximum: 256 },
+      },
+      required: ["address", "bytesProcessed"],
+      additionalProperties: false,
+    },
+  },
+  required: ["emulator", "value"],
+  additionalProperties: false,
+})
+
 const memoryReadOutputSchema = fromJsonSchema({
   type: "object",
   properties: {
@@ -1297,6 +1330,25 @@ export class Apple2tsCore {
     }
   }
 
+  writeMemory({ address, bytes }, signal) {
+    if (address + bytes.length > 65536) {
+      throw new Error("Requested memory range exceeds 64 KB address space")
+    }
+    return this.serializeMutation(async () => {
+      const result = await this.request(
+        "/api/debug/memory",
+        { method: "PUT", body: { start: address, data: bytes } },
+      )
+      return {
+        emulator: result.emulator,
+        value: {
+          address: result.state.address,
+          bytesProcessed: result.state.bytesProcessed,
+        },
+      }
+    }, signal)
+  }
+
   loadBinary({ path: filePath, address }, signal) {
     return this.serializeMutation(async (startMutation) => {
       const bytes = await this.readInputFile(filePath, "binary", MAX_BINARY_BYTES)
@@ -1708,6 +1760,32 @@ export const createMcpServer = (session) => {
     async () => {
       try {
         return screenCaptureResult(await core().captureScreen())
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+        }
+      }
+    },
+  )
+
+  server.registerTool(
+    "write_memory",
+    {
+      title: "Write Apple II memory",
+      description: "Write up to 256 bytes of CPU-visible memory sequentially using the current main, auxiliary, language-card, or expansion-memory mapping. The caller must select the intended bank first. Pause before writing when stable setup matters; this tool never pauses implicitly. Writes to $C000-$CFFF may trigger I/O or soft switches; prefer dedicated control tools when available. Completion does not verify stored bytes, and failure may follow partial effects.",
+      inputSchema: memoryWriteInputSchema,
+      outputSchema: memoryWriteOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async (input, context) => {
+      try {
+        return toolResult(await core().writeMemory(input, context.mcpReq.signal))
       } catch (error) {
         return {
           isError: true,

@@ -259,6 +259,9 @@ while (!stopping) {
         width: 1,
         height: 1,
       }
+    } else if (command.action === "writeMemory") {
+      memoryDump.splice(command.payload.address, command.payload.data.length, ...command.payload.data)
+      result = snapshotStatus()
     } else if (command.action === "loadBinary") {
       result = snapshotStatus()
     } else if (command.action === "mountDisk") {
