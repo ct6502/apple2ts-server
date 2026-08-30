@@ -10,7 +10,11 @@ import { promisify } from "node:util"
 import test from "node:test"
 
 import { Apple2tsCore } from "../server/mcp_stdio.mjs"
-import { startApple2tsServer, stopApple2tsServer } from "../server/server.mjs"
+import {
+  resolveBrowserBuildDir,
+  startApple2tsServer,
+  stopApple2tsServer,
+} from "../server/server.mjs"
 import { statusFixture } from "./fixtures/status_fixture.mjs"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -535,6 +539,32 @@ test("non-private server routes preserve legacy access", async (t) => {
     body: Buffer.from([0x60]),
   })
   assert.equal(binary.status, 404)
+})
+
+test("server serves a selected Apple2TS build directory", async (t) => {
+  const browserBuildDir = await mkdtemp(path.join(os.tmpdir(), "apple2ts-dist-test-"))
+  const outsideDir = await mkdtemp(path.join(os.tmpdir(), "apple2ts-dist-outside-test-"))
+  t.after(() => rm(browserBuildDir, { recursive: true, force: true }))
+  t.after(() => rm(outsideDir, { recursive: true, force: true }))
+  await writeFile(path.join(browserBuildDir, "index.html"), "selected build")
+  await writeFile(path.join(browserBuildDir, "asset.txt"), "selected asset")
+  await writeFile(path.join(outsideDir, "private.txt"), "outside build")
+  await symlink(path.join(outsideDir, "private.txt"), path.join(browserBuildDir, "escape.txt"))
+
+  const listener = await startApple2tsServer({
+    port: 0,
+    distDir: browserBuildDir,
+    logger: { log() {} },
+  })
+  t.after(stopApple2tsServer)
+
+  assert.equal(await (await fetch(listener.url)).text(), "selected build")
+  assert.equal(await (await fetch(new URL("/asset.txt", listener.url))).text(), "selected asset")
+  assert.equal((await fetch(new URL("/escape.txt", listener.url))).status, 403)
+  assert.throws(
+    () => resolveBrowserBuildDir("relative/dist"),
+    /APPLE2TS_DIST_DIR must be an absolute path/,
+  )
 })
 
 test("mutations wait for prior callers and the mutation deadline", async (t) => {
@@ -1638,12 +1668,31 @@ test("missing browser build fails before private resources start", async (t) => 
 
   assert.equal(outcome.error, null)
   assert.equal(outcome.code, 1)
-  assert.match(missing.getStderr(), /missing dist\/index\.html/)
+  assert.match(missing.getStderr(), /missing .*dist\/index\.html/)
   assert.match(missing.getStderr(), /Build Apple2TS in its source repository/)
   assert.doesNotMatch(missing.getStderr(), /private bridge listening/)
   assert.equal(missing.getStdout(), "")
   await assert.rejects(access(missing.receiptPath))
   await missing.cleanup()
+})
+
+test("stdio launches from a selected Apple2TS build directory", async (t) => {
+  const browserBuildDir = await mkdtemp(path.join(os.tmpdir(), "apple2ts-stdio-dist-test-"))
+  t.after(() => rm(browserBuildDir, { recursive: true, force: true }))
+  await writeFile(path.join(browserBuildDir, "index.html"), "selected build")
+
+  const processState = await launchMcp({
+    APPLE2TS_DIST_DIR: browserBuildDir,
+    APPLE2TS_TEST_REQUIRE_BROWSER_BUILD: "1",
+  })
+  t.after(processState.cleanup)
+  await processState.waitForStderr((line) => line.includes("MCP ready"))
+  const receipt = await processState.readReceipt()
+  assert.doesNotThrow(() => process.kill(receipt.pid, 0))
+
+  processState.child.stdin.end()
+  assert.equal((await processState.waitForExit()).code, 0, processState.getStderr())
+  await assert.rejects(access(receipt.profilePath))
 })
 
 test("invalid binary root fails before private resources start", async (t) => {

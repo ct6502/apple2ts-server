@@ -7,7 +7,8 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const repoRoot = path.resolve(__dirname, "..")
-const distDir = path.join(repoRoot, "dist")
+const defaultDistDir = path.join(repoRoot, "dist")
+let distDir = defaultDistDir
 const serverDir = __dirname
 let host = "127.0.0.1"
 let port = Number(process.env.PORT || 6502)
@@ -744,8 +745,13 @@ const serveStaticFile = async (res, pathname) => {
   }
 
   try {
-    const data = await fs.readFile(filePath)
-    const ext = path.extname(filePath)
+    const canonicalPath = await fs.realpath(filePath)
+    if (canonicalPath !== distDir && !canonicalPath.startsWith(safeRoot)) {
+      writeJson(res, 403, { error: "Forbidden" })
+      return
+    }
+    const data = await fs.readFile(canonicalPath)
+    const ext = path.extname(canonicalPath)
     res.statusCode = 200
     res.setHeader("Content-Type", MIME_TYPES[ext] || "application/octet-stream")
     res.end(data)
@@ -1775,14 +1781,22 @@ const server = createServer(async (req, res) => {
   }
 })
 
-export const MISSING_BROWSER_BUILD_MESSAGE =
-  "Cannot start the Apple2TS browser: missing dist/index.html. "
-  + "Build Apple2TS in its source repository and copy its dist/ directory into this server root."
+export const resolveBrowserBuildDir = (candidate = process.env.APPLE2TS_DIST_DIR) => {
+  if (!candidate) return defaultDistDir
+  if (!path.isAbsolute(candidate)) {
+    throw new Error("APPLE2TS_DIST_DIR must be an absolute path")
+  }
+  return path.normalize(candidate)
+}
 
-export const hasBrowserBuild = async () => {
+export const getMissingBrowserBuildMessage = (browserBuildDir = resolveBrowserBuildDir()) =>
+  `Cannot start the Apple2TS browser: missing ${path.join(browserBuildDir, "index.html")}. `
+  + "Build Apple2TS in its source repository and set APPLE2TS_DIST_DIR to that dist directory."
+
+export const hasBrowserBuild = async (browserBuildDir = resolveBrowserBuildDir()) => {
   let hasDist = true
   try {
-    await fs.access(path.join(distDir, "index.html"))
+    await fs.access(path.join(browserBuildDir, "index.html"))
   } catch {
     hasDist = false
   }
@@ -1797,6 +1811,13 @@ export const startApple2tsServer = async (options = {}) => {
 
   host = options.host || "127.0.0.1"
   port = Number(options.port ?? process.env.PORT ?? 6502)
+  const selectedDistDir = resolveBrowserBuildDir(options.distDir)
+  try {
+    distDir = await fs.realpath(selectedDistDir)
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error
+    distDir = selectedDistDir
+  }
   commandTimeoutMs = Number(options.commandTimeoutMs ?? process.env.COMMAND_TIMEOUT_MS ?? 10000)
   serverInstanceId = options.serverInstanceId || randomUUID()
   logger = options.logger || console
@@ -1839,8 +1860,8 @@ export const startApple2tsServer = async (options = {}) => {
 
   const url = `http://${address.address}:${address.port}`
   logger.log?.(`Apple2TS server listening on ${url} (localhost only)`)
-  if (!(await hasBrowserBuild())) {
-    logger.log?.(MISSING_BROWSER_BUILD_MESSAGE)
+  if (!(await hasBrowserBuild(distDir))) {
+    logger.log?.(getMissingBrowserBuildMessage(distDir))
   }
 
   return { url, host: address.address, port: address.port, serverInstanceId }

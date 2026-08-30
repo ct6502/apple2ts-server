@@ -1,23 +1,26 @@
-import { access } from "node:fs/promises"
 import path from "node:path"
 import { spawn } from "node:child_process"
 import { fileURLToPath } from "node:url"
 
+import {
+  hasBrowserBuild,
+  resolveBrowserBuildDir,
+} from "../server/server.mjs"
+
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const repoRoot = path.resolve(__dirname, "..")
-const distIndex = path.join(repoRoot, "dist", "index.html")
 const host = "127.0.0.1"
 const port = Number(process.env.PORT || 6502)
 const allowMissingDist = process.argv.includes("--allow-missing-dist")
 
-const printMissingDistHelp = () => {
-  process.stderr.write("Cannot start emulator UI: missing dist/index.html\n")
+const printMissingDistHelp = (browserBuildDir) => {
+  process.stderr.write(`Cannot start emulator UI: missing ${path.join(browserBuildDir, "index.html")}\n`)
   process.stderr.write("This repo does not define a build script for the browser client.\n")
   process.stderr.write("\n")
   process.stderr.write("To run the full app:\n")
   process.stderr.write("1. Build the Apple2TS web client in its source repo.\n")
-  process.stderr.write("2. Copy its build output into this repo at dist/.\n")
+  process.stderr.write("2. Set APPLE2TS_DIST_DIR to that checkout's dist directory.\n")
   process.stderr.write("3. Re-run: npm run start\n")
 }
 
@@ -68,6 +71,7 @@ const probePort = async () => {
 }
 
 const run = async () => {
+  const browserBuildDir = resolveBrowserBuildDir()
   const portState = await probePort()
   if (portState === "integrated-running") {
     printAlreadyRunningHelp()
@@ -79,10 +83,8 @@ const run = async () => {
   }
 
   if (!allowMissingDist) {
-    try {
-      await access(distIndex)
-    } catch {
-      printMissingDistHelp()
+    if (!(await hasBrowserBuild(browserBuildDir))) {
+      printMissingDistHelp(browserBuildDir)
       process.exit(1)
     }
   }

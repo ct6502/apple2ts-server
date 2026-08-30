@@ -1,6 +1,8 @@
 import { runStdio } from "../../server/mcp_stdio.mjs"
 
 const missingBrowserBuild = process.env.APPLE2TS_TEST_MISSING_BROWSER_BUILD === "1"
+const requireBrowserBuild = missingBrowserBuild
+  || process.env.APPLE2TS_TEST_REQUIRE_BROWSER_BUILD === "1"
 
 void runStdio({
   port: process.env.APPLE2TS_PRIVATE_PORT,
@@ -10,6 +12,7 @@ void runStdio({
   chromiumExecutable: process.env.APPLE2TS_CHROMIUM_EXECUTABLE,
   chromiumMode: process.env.APPLE2TS_CHROMIUM_MODE,
   binaryRoot: process.env.APPLE2TS_BINARY_ROOT,
-  requireBrowserBuild: missingBrowserBuild,
+  distDir: process.env.APPLE2TS_DIST_DIR,
+  requireBrowserBuild,
   hasBrowserBuild: missingBrowserBuild ? async () => false : undefined,
 })
