@@ -169,6 +169,25 @@ const memoryReadOutputSchema = fromJsonSchema({
   additionalProperties: false,
 })
 
+const screenCaptureOutputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    emulator: emulatorIdentitySchema,
+    image: {
+      type: "object",
+      properties: {
+        mimeType: { type: "string", enum: ["image/png"] },
+        width: { type: "integer", minimum: 1 },
+        height: { type: "integer", minimum: 1 },
+      },
+      required: ["mimeType", "width", "height"],
+      additionalProperties: false,
+    },
+  },
+  required: ["emulator", "image"],
+  additionalProperties: false,
+})
+
 const keyboardKeyOutputSchema = fromJsonSchema({
   type: "object",
   properties: {
@@ -489,6 +508,19 @@ export class Apple2tsCore {
     return {
       emulator: result.emulator,
       state: { textPage: result.state.textPage },
+    }
+  }
+
+  async captureScreen() {
+    const result = await this.request("/api/private/screen")
+    return {
+      emulator: result.emulator,
+      image: {
+        mimeType: result.state.mimeType,
+        width: result.state.width,
+        height: result.state.height,
+      },
+      dataBase64: result.state.dataBase64,
     }
   }
 
@@ -885,6 +917,14 @@ const toolResult = (result) => ({
   structuredContent: result,
 })
 
+const screenCaptureResult = ({ dataBase64, ...result }) => ({
+  content: [
+    { type: "image", data: dataBase64, mimeType: result.image.mimeType },
+    { type: "text", text: JSON.stringify(result) },
+  ],
+  structuredContent: result,
+})
+
 export const createMcpServer = (core) => {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION })
 
@@ -969,6 +1009,32 @@ export const createMcpServer = (core) => {
     async (input) => {
       try {
         return toolResult(await core.readMemory(input))
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+        }
+      }
+    },
+  )
+
+  server.registerTool(
+    "capture_screen",
+    {
+      title: "Capture Apple II screen",
+      description: "Capture the current rendered Apple II display from the emulator bound to this process.",
+      inputSchema: noInputSchema,
+      outputSchema: screenCaptureOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async () => {
+      try {
+        return screenCaptureResult(await core.captureScreen())
       } catch (error) {
         return {
           isError: true,

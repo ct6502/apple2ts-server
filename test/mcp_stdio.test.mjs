@@ -368,6 +368,41 @@ test("private bridge reads bounded memory in byte and hex formats", async (t) =>
   })
 })
 
+test("private bridge captures the current renderer screen", async (t) => {
+  const listener = await startApple2tsServer({
+    port: 0,
+    privateRenderer: { remoteControlToken: token, rendererId, controllerToken },
+    logger: { log() {} },
+  })
+  t.after(stopApple2tsServer)
+
+  const renderer = await connectFakeRenderer(listener.url, { autoServe: false })
+  t.after(() => renderer.stop())
+  const captureRequest = readPrivateJson(listener.url, "/api/private/screen")
+  const command = await renderer.nextCommand()
+  assert.deepEqual(
+    { action: command.action, payload: command.payload },
+    { action: "captureScreen", payload: {} },
+  )
+  assert.equal((await renderer.reply(command, {
+    result: {
+      mimeType: "image/png",
+      dataBase64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      width: 1,
+      height: 1,
+    },
+  })).status, 200)
+
+  const capture = await captureRequest
+  assert.equal(capture.response.status, 200)
+  assert.deepEqual(capture.body.data, {
+    mimeType: "image/png",
+    dataBase64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    width: 1,
+    height: 1,
+  })
+})
+
 test("private bridge rejects invalid and unavailable memory ranges", async (t) => {
   const listener = await startApple2tsServer({
     port: 0,
@@ -1163,6 +1198,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     tools.result.tools.map((tool) => tool.name),
     [
       "read_memory",
+      "capture_screen",
       "set_keyboard_key",
       "eject_disk",
       "boot",
@@ -1266,6 +1302,19 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     assert.equal(response.result.isError, undefined)
     return response.result.structuredContent
   }
+
+  const screen = await requestTool(50, "capture_screen")
+  assert.equal(screen.result.isError, undefined)
+  assert.deepEqual(screen.result.content[0], {
+    type: "image",
+    data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    mimeType: "image/png",
+  })
+  assert.deepEqual(screen.result.structuredContent, {
+    emulator: payload.emulator,
+    image: { mimeType: "image/png", width: 1, height: 1 },
+  })
+  assert.deepEqual(JSON.parse(screen.result.content[1].text), screen.result.structuredContent)
 
   const booted = await callTool(7, "boot")
   assert.equal(booted.state.runMode, "running")
@@ -1430,6 +1479,39 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   ])
   await assert.rejects(access(receipt.profilePath))
   await assertClosed(bridgeUrl)
+})
+
+test("stdio rejects an invalid rendered screen", async (t) => {
+  const processState = await launchMcp({ APPLE2TS_FAKE_CHROMIUM_MODE: "invalid-screen" })
+  t.after(processState.cleanup)
+  await processState.waitForStderr((line) => line.includes("MCP ready"))
+
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-11-25",
+      capabilities: {},
+      clientInfo: { name: "test", version: "1" },
+    },
+  })}\n`)
+  await processState.waitForStdout((line) => JSON.parse(line).id === 1)
+  processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`)
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: { name: "capture_screen", arguments: {} },
+  })}\n`)
+  const response = JSON.parse(
+    await processState.waitForStdout((line) => JSON.parse(line).id === 2),
+  )
+  assert.equal(response.result.isError, true)
+  assert.match(response.result.content[0].text, /Rendered screen was not available/)
+
+  processState.child.stdin.end()
+  assert.equal((await processState.waitForExit()).code, 0)
 })
 
 test("EOF cancels a stalled mutation before releasing its held key", async (t) => {
