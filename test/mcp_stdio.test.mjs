@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { execFile, spawn } from "node:child_process"
 import { createHash } from "node:crypto"
-import { access, mkdir, mkdtemp, readFile, realpath, rm, symlink, truncate, writeFile } from "node:fs/promises"
+import { access, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, truncate, writeFile } from "node:fs/promises"
 import { createServer } from "node:http"
 import os from "node:os"
 import path from "node:path"
@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url"
 import { promisify } from "node:util"
 import test from "node:test"
 
-import { Apple2tsCore } from "../server/mcp_stdio.mjs"
+import { Apple2tsCore, FileStager } from "../server/mcp_stdio.mjs"
 import {
   resolveBrowserBuildDir,
   startApple2tsServer,
@@ -1650,14 +1650,120 @@ test("stdio test cleanup escalates when its child ignores EOF", async (t) => {
   await wedged.cleanup()
 })
 
+test("file staging copies only safe source files into a session-private trusted path", async (t) => {
+  const sourceRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-source-"))
+  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-root-"))
+  t.after(() => Promise.all([
+    rm(sourceRoot, { recursive: true, force: true }),
+    rm(binaryRoot, { recursive: true, force: true }),
+  ]))
+  const disk = Buffer.from("ProDOS test disk")
+  await writeFile(path.join(sourceRoot, "eamon.po"), disk)
+  await writeFile(path.join(sourceRoot, "companion.hdv"), Buffer.from("companion disk"))
+  await writeFile(path.join(sourceRoot, "fixture.bin"), disk)
+  await writeFile(path.join(sourceRoot, "large.hdv"), "")
+  await truncate(path.join(sourceRoot, "large.hdv"), 32 * 1024 * 1024 + 1)
+  await symlink(path.join(sourceRoot, "eamon.po"), path.join(sourceRoot, "link.po"))
+
+  const stager = new FileStager(await realpath(sourceRoot), await realpath(binaryRoot))
+  t.after(() => stager.cleanup())
+  const staged = await stager.stage("eamon.po")
+
+  assert.match(staged.path, /^\.apple2ts-mcp-stage-[^/]+\/[0-9a-f]{64}\.po$/)
+  assert.equal(path.isAbsolute(staged.path), false)
+  assert.equal(staged.byteCount, disk.length)
+  assert.equal(staged.sha256, createHash("sha256").update(disk).digest("hex"))
+  assert.deepEqual(await readFile(path.join(binaryRoot, staged.path)), disk)
+  await assert.rejects(stager.stage("../eamon.po"), /stay within APPLE2TS_FILE_SOURCE_ROOT/)
+  await assert.rejects(stager.stage(path.join(sourceRoot, "eamon.po")), /relative to APPLE2TS_FILE_SOURCE_ROOT/)
+  assert.equal((await stager.stage("fixture.bin")).byteCount, disk.length)
+  await assert.rejects(stager.stage("link.po"), /symbolic links are not allowed/)
+  await assert.rejects(stager.stage("large.hdv"), /cannot exceed 33554432 bytes/)
+
+  await stager.cleanup()
+  await assert.rejects(access(path.join(binaryRoot, staged.path)))
+})
+
+test("file staging removes a failed temporary copy and mounts a staged hard drive", async (t) => {
+  const sourceRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-stage-source-"))
+  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-stage-root-"))
+  t.after(() => Promise.all([
+    rm(sourceRoot, { recursive: true, force: true }),
+    rm(binaryRoot, { recursive: true, force: true }),
+  ]))
+  const disk = Buffer.from("ProDOS test disk")
+  await writeFile(path.join(sourceRoot, "eamon.po"), disk)
+  const stager = new FileStager(await realpath(sourceRoot), await realpath(binaryRoot))
+  t.after(() => stager.cleanup())
+  const stagedName = `${createHash("sha256").update(disk).digest("hex")}.po`
+  const stageDirectory = await stager.getStageDirectory()
+  await mkdir(path.join(stageDirectory, stagedName))
+
+  await assert.rejects(stager.stage("eamon.po"))
+  assert.deepEqual(await readdir(stageDirectory), [stagedName])
+
+  await rm(path.join(stageDirectory, stagedName), { recursive: true })
+  const identity = { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" }
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    identity,
+    new AbortController().signal,
+    await realpath(binaryRoot),
+    stager,
+  )
+  const mountedPaths = []
+  core.request = async (pathname, options = {}) => {
+    mountedPaths.push({ pathname, options })
+    return { emulator: identity, state: { driveId: "hd1", mounted: true } }
+  }
+  await assert.rejects(
+    core.mountDisk({ driveId: "hd1", path: "eamon.po" }),
+    /file staged by this MCP session/,
+  )
+  const staged = await core.stageFile({ path: "eamon.po" })
+  const mounted = await core.mountDisk({ driveId: "hd1", path: staged.path })
+
+  assert.deepEqual(mounted.state, { driveId: "hd1", mounted: true })
+  assert.equal(mountedPaths[0].pathname, "/api/drives/hd1/mount")
+  assert.equal(mountedPaths[0].options.body.filename, path.basename(staged.path))
+})
+
+test("file staging serializes concurrent copies and waits for them before cleanup", async (t) => {
+  const sourceRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-concurrent-source-"))
+  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-concurrent-root-"))
+  t.after(() => Promise.all([
+    rm(sourceRoot, { recursive: true, force: true }),
+    rm(binaryRoot, { recursive: true, force: true }),
+  ]))
+  await writeFile(path.join(sourceRoot, "first.po"), Buffer.from("first disk"))
+  await writeFile(path.join(sourceRoot, "second.hdv"), Buffer.from("second disk"))
+  const stager = new FileStager(await realpath(sourceRoot), await realpath(binaryRoot))
+
+  const first = stager.stage("first.po")
+  const second = stager.stage("second.hdv")
+  const cleanup = stager.cleanup()
+  const [firstResult, secondResult] = await Promise.all([first, second])
+  await cleanup
+
+  assert.equal(path.dirname(firstResult.path), path.dirname(secondResult.path))
+  await assert.rejects(access(path.join(binaryRoot, firstResult.path)))
+  await assert.rejects(access(path.join(binaryRoot, secondResult.path)))
+  await assert.rejects(stager.stage("first.po"), /File staging is closing/)
+})
+
 test("configured stdio advertises and loads a local binary", async (t) => {
   const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-mcp-binaries-"))
+  const sourceRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-mcp-disk-source-"))
   await writeFile(path.join(binaryRoot, "fixture.bin"), Buffer.from([0xA9, 0x42, 0x60]))
   await writeFile(path.join(binaryRoot, "fixture.woz"), Buffer.from("WOZ2\u00ff\n\r\n"))
   await writeFile(path.join(binaryRoot, "fixture.po"), "")
   await truncate(path.join(binaryRoot, "fixture.po"), 32 * 1024 * 1024)
+  await writeFile(path.join(sourceRoot, "fixture.bin"), Buffer.from([0xA9, 0x42, 0x60]))
+  await writeFile(path.join(sourceRoot, "eamon.po"), Buffer.from("ProDOS test disk"))
   const processState = await launchMcp({
-    APPLE2TS_BINARY_ROOT: binaryRoot,
+    APPLE2TS_FILE_STAGING_ROOT: binaryRoot,
+    APPLE2TS_FILE_SOURCE_ROOT: sourceRoot,
     APPLE2TS_FAKE_CHROMIUM_HARD_DRIVE: "1",
   })
   t.after(processState.cleanup)
@@ -1701,6 +1807,14 @@ test("configured stdio advertises and loads a local binary", async (t) => {
       required: ["driveId", "mounted"],
       additionalProperties: false,
     })
+    const stageTool = tools.result.tools.find((tool) => tool.name === "stage_file")
+    assert.deepEqual(stageTool.inputSchema, {
+      type: "object",
+      properties: { path: { type: "string", minLength: 1 } },
+      required: ["path"],
+      additionalProperties: false,
+    })
+    assert.equal(stageTool.annotations.idempotentHint, true)
     const ejectTool = tools.result.tools.find((tool) => tool.name === "eject_disk")
     assert.deepEqual(ejectTool.inputSchema, {
       type: "object",
@@ -1716,9 +1830,21 @@ test("configured stdio advertises and loads a local binary", async (t) => {
       jsonrpc: "2.0",
       id: 3,
       method: "tools/call",
-      params: { name: "load_binary", arguments: { path: "fixture.bin", address: 0x6000 } },
+      params: { name: "stage_file", arguments: { path: "fixture.bin" } },
     })}\n`)
-    const loaded = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 3))
+    const stagedBinary = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 3))
+    assert.equal(stagedBinary.result.isError, undefined)
+
+    processState.child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: {
+        name: "load_binary",
+        arguments: { path: stagedBinary.result.structuredContent.path, address: 0x6000 },
+      },
+    })}\n`)
+    const loaded = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 4))
     assert.equal(loaded.result.isError, undefined)
     assert.equal(loaded.result.structuredContent.emulator.rendererId, rendererId)
     assert.equal(loaded.result.structuredContent.address, 0x6000)
@@ -1727,11 +1853,24 @@ test("configured stdio advertises and loads a local binary", async (t) => {
 
     processState.child.stdin.write(`${JSON.stringify({
       jsonrpc: "2.0",
-      id: 4,
+      id: 5,
       method: "tools/call",
-      params: { name: "mount_disk", arguments: { driveId: "hd1", path: "fixture.po" } },
+      params: { name: "stage_file", arguments: { path: "eamon.po" } },
     })}\n`)
-    const mounted = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 4))
+    const staged = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 5))
+    assert.equal(staged.result.isError, undefined)
+    assert.match(staged.result.structuredContent.path, /^\.apple2ts-mcp-stage-[^/]+\/[0-9a-f]{64}\.po$/)
+
+    processState.child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 6,
+      method: "tools/call",
+      params: {
+        name: "mount_disk",
+        arguments: { driveId: "hd1", path: staged.result.structuredContent.path },
+      },
+    })}\n`)
+    const mounted = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 6))
     assert.equal(mounted.result.isError, undefined)
     assert.deepEqual(mounted.result.structuredContent.state, {
       driveId: "hd1",
@@ -1740,11 +1879,11 @@ test("configured stdio advertises and loads a local binary", async (t) => {
 
     processState.child.stdin.write(`${JSON.stringify({
       jsonrpc: "2.0",
-      id: 5,
+      id: 7,
       method: "tools/call",
       params: { name: "eject_disk", arguments: { driveId: "hd1" } },
     })}\n`)
-    const ejected = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 5))
+    const ejected = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 7))
     assert.equal(ejected.result.isError, undefined)
     assert.deepEqual(ejected.result.structuredContent.state, {
       driveId: "hd1",
@@ -1754,12 +1893,14 @@ test("configured stdio advertises and loads a local binary", async (t) => {
     processState.child.stdin.end()
     const outcome = await processState.waitForExit()
     assert.equal(outcome.code, 0, processState.getStderr())
+    await assert.rejects(access(path.join(binaryRoot, staged.result.structuredContent.path)))
   } finally {
     if (processState.child.exitCode === null) processState.child.kill("SIGTERM")
     await processState.waitForExit()
     await Promise.all([
       processState.cleanup(),
       rm(binaryRoot, { recursive: true, force: true }),
+      rm(sourceRoot, { recursive: true, force: true }),
     ])
   }
 })
@@ -1834,13 +1975,13 @@ test("stdio launches from a selected Apple2TS build directory", async (t) => {
 
 test("invalid binary root fails before private resources start", async (t) => {
   const missingRoot = path.join(os.tmpdir(), `apple2ts-missing-binary-root-${process.pid}`)
-  const invalid = await launchMcp({ APPLE2TS_BINARY_ROOT: missingRoot })
+  const invalid = await launchMcp({ APPLE2TS_FILE_STAGING_ROOT: missingRoot })
   t.after(invalid.cleanup)
   const outcome = await invalid.waitForExit()
 
   assert.equal(outcome.error, null)
   assert.equal(outcome.code, 1)
-  assert.match(invalid.getStderr(), /APPLE2TS_BINARY_ROOT must name a readable directory/)
+  assert.match(invalid.getStderr(), /APPLE2TS_FILE_STAGING_ROOT must name a readable directory/)
   assert.doesNotMatch(invalid.getStderr(), /private bridge listening/)
   assert.equal(invalid.getStdout(), "")
   await invalid.cleanup()
