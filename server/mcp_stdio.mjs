@@ -30,6 +30,8 @@ const MUTATION_TIMEOUT_MS = Number(process.env.COMMAND_TIMEOUT_MS || 10000)
   + MUTATION_RESPONSE_MARGIN_MS
 const MAX_BINARY_BYTES = 0xC000
 const MAX_FLOPPY_IMAGE_BYTES = 2 * 1024 * 1024
+const MAX_HARD_DRIVE_IMAGE_BYTES = 32 * 1024 * 1024
+const DRIVE_IDS = ["hd1", "hd2", "fd1", "fd2"]
 
 class ConfirmedMutationRejection extends Error {
   constructor(error) {
@@ -68,10 +70,10 @@ const keyboardKeyInputSchema = fromJsonSchema({
   additionalProperties: false,
 })
 
-const floppyDriveInputSchema = fromJsonSchema({
+const driveInputSchema = fromJsonSchema({
   type: "object",
   properties: {
-    driveId: { type: "string", enum: ["fd1", "fd2"] },
+    driveId: { type: "string", enum: DRIVE_IDS },
   },
   required: ["driveId"],
   additionalProperties: false,
@@ -80,7 +82,7 @@ const floppyDriveInputSchema = fromJsonSchema({
 const diskMountInputSchema = fromJsonSchema({
   type: "object",
   properties: {
-    driveId: { type: "string", enum: ["fd1", "fd2"] },
+    driveId: { type: "string", enum: DRIVE_IDS },
     path: { type: "string", minLength: 1 },
   },
   required: ["driveId", "path"],
@@ -101,7 +103,7 @@ const emulatorIdentitySchema = {
 const driveReceiptSchema = {
   type: "object",
   properties: {
-    driveId: { type: "string", enum: ["fd1", "fd2"] },
+    driveId: { type: "string", enum: DRIVE_IDS },
     mounted: { type: "boolean" },
   },
   required: ["driveId", "mounted"],
@@ -599,11 +601,12 @@ export class Apple2tsCore {
 
   mountDisk({ driveId, path: filePath }, signal) {
     return this.serializeMutation(async (startMutation) => {
+      const hardDrive = driveId === "hd1" || driveId === "hd2"
       const bytes = await readTrustedFile(
         this.binaryRoot,
         filePath,
-        "disk image",
-        MAX_FLOPPY_IMAGE_BYTES,
+        hardDrive ? "hard-drive image" : "floppy image",
+        hardDrive ? MAX_HARD_DRIVE_IMAGE_BYTES : MAX_FLOPPY_IMAGE_BYTES,
       )
       startMutation()
       let result
@@ -770,8 +773,8 @@ const mutationTools = [
   },
   {
     name: "mount_disk",
-    title: "Mount a local floppy image",
-    description: "Mount one trusted local floppy image in fd1 or fd2 and return its confirmed mounted-state receipt.",
+    title: "Mount a local disk image",
+    description: "Mount one trusted local disk image in hd1, hd2, fd1, or fd2 and return its confirmed mounted-state receipt. Floppy images may be up to 2 MiB; hard-drive images may be up to 32 MiB.",
     inputSchema: diskMountInputSchema,
     outputSchema: driveResultSchema,
     destructiveHint: true,
@@ -781,9 +784,9 @@ const mutationTools = [
   },
   {
     name: "eject_disk",
-    title: "Eject a floppy disk",
-    description: "Eject the disk in fd1 or fd2 and return its confirmed mounted-state receipt.",
-    inputSchema: floppyDriveInputSchema,
+    title: "Eject a disk",
+    description: "Eject the disk in hd1, hd2, fd1, or fd2 and return its confirmed mounted-state receipt.",
+    inputSchema: driveInputSchema,
     outputSchema: driveResultSchema,
     destructiveHint: true,
     idempotentHint: true,

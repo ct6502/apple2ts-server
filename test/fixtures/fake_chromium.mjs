@@ -71,6 +71,19 @@ status.drives = [{
   motorRunning: false,
   byteLength: 143360,
 }]
+if (process.env.APPLE2TS_FAKE_CHROMIUM_HARD_DRIVE === "1") {
+  status.drives.push({
+    index: 2,
+    drive: 1,
+    hardDrive: true,
+    filename: "",
+    status: "",
+    isWriteProtected: false,
+    diskHasChanges: false,
+    motorRunning: false,
+    byteLength: 0,
+  })
+}
 const keyboardStates = []
 const canHaltAtAddress = (breakpoint) => breakpoint.watchpoint === false
   && breakpoint.instruction === false
