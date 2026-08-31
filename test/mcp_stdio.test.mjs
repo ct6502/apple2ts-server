@@ -985,6 +985,58 @@ test("disk mounting applies separate floppy and hard-drive size limits", async (
   assert.equal(requests.length, 1)
 })
 
+test("disk mounting preflights known media compatibility without poisoning the session", async (t) => {
+  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-media-"))
+  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
+  const standardPo = Buffer.alloc(143360)
+  const boundaryOverPo = Buffer.alloc(143361)
+  const hardDrivePo = Buffer.alloc(800 * 1024)
+  await Promise.all([
+    writeFile(path.join(binaryRoot, "standard.po"), standardPo),
+    writeFile(path.join(binaryRoot, "boundary-over.po"), boundaryOverPo),
+    writeFile(path.join(binaryRoot, "hard-drive.po"), hardDrivePo),
+    writeFile(path.join(binaryRoot, "disk.woz"), Buffer.from("WOZ2")),
+    writeFile(path.join(binaryRoot, "disk.dsk"), Buffer.from("DSK")),
+    writeFile(path.join(binaryRoot, "disk.do"), Buffer.from("DO")),
+    writeFile(path.join(binaryRoot, "unknown.img"), Buffer.from("IMG")),
+  ])
+
+  const identity = { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" }
+  const requests = []
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    identity,
+    new AbortController().signal,
+    await realpath(binaryRoot),
+  )
+  core.request = async (pathname, options) => {
+    requests.push({ pathname, options })
+    return { emulator: identity, state: { driveId: pathname.split("/")[3], mounted: true } }
+  }
+
+  await assert.rejects(core.mountDisk({ driveId: "fd1", path: "hard-drive.po" }), /fd1 cannot mount a hard-drive image/)
+  assert.equal(requests.length, 0)
+  await assert.rejects(core.mountDisk({ driveId: "hd1", path: "standard.po" }), /hd1 cannot mount a floppy image/)
+  await assert.rejects(core.mountDisk({ driveId: "fd1", path: "boundary-over.po" }), /fd1 cannot mount a hard-drive image/)
+  await assert.rejects(core.mountDisk({ driveId: "hd1", path: "disk.woz" }), /hd1 cannot mount a floppy image/)
+  await assert.rejects(core.mountDisk({ driveId: "hd1", path: "disk.dsk" }), /hd1 cannot mount a floppy image/)
+  await assert.rejects(core.mountDisk({ driveId: "hd1", path: "disk.do" }), /hd1 cannot mount a floppy image/)
+  assert.equal(requests.length, 0)
+
+  const floppyPo = await core.mountDisk({ driveId: "fd1", path: "standard.po" })
+  const hardDrive = await core.mountDisk({ driveId: "hd1", path: "hard-drive.po" })
+  const unclassified = await core.mountDisk({ driveId: "fd2", path: "unknown.img" })
+  assert.deepEqual(floppyPo.state, { driveId: "fd1", mounted: true })
+  assert.deepEqual(hardDrive.state, { driveId: "hd1", mounted: true })
+  assert.deepEqual(unclassified.state, { driveId: "fd2", mounted: true })
+  assert.deepEqual(requests.map(({ pathname }) => pathname), [
+    "/api/drives/fd1/mount",
+    "/api/drives/hd1/mount",
+    "/api/drives/fd2/mount",
+  ])
+})
+
 test("disk mutations reject drive state that does not confirm the requested result", async (t) => {
   const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-confirmation-"))
   t.after(() => rm(binaryRoot, { recursive: true, force: true }))
