@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
-import { randomBytes, randomUUID } from "node:crypto"
+import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { spawn } from "node:child_process"
 import { constants as fsConstants } from "node:fs"
-import { access, lstat, mkdtemp, open, realpath, rm, stat } from "node:fs/promises"
+import { access, lstat, mkdtemp, open, realpath, rename, rm, stat, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
@@ -89,6 +89,15 @@ const diskMountInputSchema = fromJsonSchema({
   additionalProperties: false,
 })
 
+const fileStageInputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    path: { type: "string", minLength: 1 },
+  },
+  required: ["path"],
+  additionalProperties: false,
+})
+
 const emulatorIdentitySchema = {
   type: "object",
   properties: {
@@ -117,6 +126,17 @@ const driveResultSchema = fromJsonSchema({
     state: driveReceiptSchema,
   },
   required: ["emulator", "state"],
+  additionalProperties: false,
+})
+
+const fileStageResultSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    path: { type: "string", minLength: 1 },
+    byteCount: { type: "integer", minimum: 1, maximum: MAX_HARD_DRIVE_IMAGE_BYTES },
+    sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
+  },
+  required: ["path", "byteCount", "sha256"],
   additionalProperties: false,
 })
 
@@ -368,7 +388,7 @@ const fetchEnvelope = async (baseUrl, pathname, controllerToken, signal, options
   return payload.data
 }
 
-const resolveBinaryRoot = async (configuredRoot) => {
+const resolveBinaryRoot = async (configuredRoot, settingName = "APPLE2TS_BINARY_ROOT") => {
   if (!configuredRoot) return null
   try {
     const root = await realpath(path.resolve(configuredRoot))
@@ -376,7 +396,7 @@ const resolveBinaryRoot = async (configuredRoot) => {
     await access(root, fsConstants.R_OK | fsConstants.X_OK)
     return root
   } catch {
-    throw new Error("APPLE2TS_BINARY_ROOT must name a readable directory")
+    throw new Error(`${settingName} must name a readable directory`)
   }
 }
 
@@ -391,15 +411,15 @@ const readAtMost = async (handle, limit) => {
   return buffer.subarray(0, length)
 }
 
-const readTrustedFile = async (root, filePath, noun, maxBytes) => {
+const readTrustedFile = async (root, filePath, noun, maxBytes, rootName = "APPLE2TS_BINARY_ROOT") => {
   if (typeof filePath !== "string" || filePath.length === 0 || path.isAbsolute(filePath)) {
-    throw new Error(`path must be a non-empty path relative to APPLE2TS_BINARY_ROOT`)
+    throw new Error(`path must be a non-empty path relative to ${rootName}`)
   }
 
   const candidate = path.resolve(root, filePath)
   const relative = path.relative(root, candidate)
   if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-    throw new Error("path must stay within APPLE2TS_BINARY_ROOT")
+    throw new Error(`path must stay within ${rootName}`)
   }
 
   let pathInfo
@@ -443,15 +463,73 @@ const readTrustedFile = async (root, filePath, noun, maxBytes) => {
   }
 }
 
-const readBinaryFile = async (root, filePath, address) => {
-  if (!Number.isInteger(address) || address < 0 || address >= MAX_BINARY_BYTES) {
-    throw new Error("address must be an integer between 0 and 49151")
+export class FileStager {
+  constructor(sourceRoot, binaryRoot) {
+    this.sourceRoot = sourceRoot
+    this.binaryRoot = binaryRoot
+    this.stageDirectory = null
+    this.stages = Promise.resolve()
+    this.closing = false
   }
-  const bytes = await readTrustedFile(root, filePath, "binary", MAX_BINARY_BYTES)
-  if (address + bytes.length > MAX_BINARY_BYTES) {
-    throw new Error("binary block must fit within main RAM at $0000-$BFFF")
+
+  stage(filePath) {
+    if (this.closing) return Promise.reject(new Error("File staging is closing"))
+    const stage = this.stages.then(() => this.stageOne(filePath))
+    this.stages = stage.catch(() => {})
+    return stage
   }
-  return bytes
+
+  async stageOne(filePath) {
+    const bytes = await readTrustedFile(
+      this.sourceRoot,
+      filePath,
+      "file",
+      MAX_HARD_DRIVE_IMAGE_BYTES,
+      "APPLE2TS_FILE_SOURCE_ROOT",
+    )
+    const sha256 = createHash("sha256").update(bytes).digest("hex")
+    const stageDirectory = await this.getStageDirectory()
+    const stagedPath = path.join(stageDirectory, `${sha256}${path.extname(filePath).toLowerCase()}`)
+    const temporaryPath = path.join(stageDirectory, `.${randomUUID()}.tmp`)
+    try {
+      await writeFile(temporaryPath, bytes, { flag: "wx" })
+      await rename(temporaryPath, stagedPath)
+    } catch (error) {
+      await rm(temporaryPath, { force: true })
+      throw error
+    }
+    return {
+      path: path.relative(this.binaryRoot, stagedPath),
+      byteCount: bytes.length,
+      sha256,
+    }
+  }
+
+  async getStageDirectory() {
+    if (!this.stageDirectory) {
+      this.stageDirectory = await mkdtemp(path.join(this.binaryRoot, ".apple2ts-mcp-stage-"))
+    }
+    return this.stageDirectory
+  }
+
+  async cleanup() {
+    this.closing = true
+    await this.stages
+    if (!this.stageDirectory) return
+    const stageDirectory = this.stageDirectory
+    await rm(stageDirectory, { recursive: true, force: true })
+    this.stageDirectory = null
+  }
+
+  read(filePath, noun, maxBytes) {
+    if (!this.stageDirectory) throw new Error("path must name a file staged by this MCP session")
+    const candidate = path.resolve(this.binaryRoot, filePath)
+    const relative = path.relative(this.stageDirectory, candidate)
+    if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error("path must name a file staged by this MCP session")
+    }
+    return readTrustedFile(this.binaryRoot, filePath, noun, maxBytes, "APPLE2TS_FILE_STAGING_ROOT")
+  }
 }
 
 const isConfirmedDriveState = (result, driveId, mounted) =>
@@ -469,12 +547,20 @@ const confirmDriveState = (result, driveId, mounted, operation) => {
 }
 
 export class Apple2tsCore {
-  constructor(baseUrl, controllerToken, identity, signal = new AbortController().signal, binaryRoot = null) {
+  constructor(
+    baseUrl,
+    controllerToken,
+    identity,
+    signal = new AbortController().signal,
+    binaryRoot = null,
+    fileStager = null,
+  ) {
     this.baseUrl = baseUrl
     this.controllerToken = controllerToken
     this.identity = identity
     this.signal = signal
     this.binaryRoot = binaryRoot
+    this.fileStager = fileStager
     this.mutations = Promise.resolve()
     this.mutationFailure = null
     this.heldKey = null
@@ -631,11 +717,25 @@ export class Apple2tsCore {
     await this.releaseHeldKeyboard()
   }
 
+  stageFile({ path: filePath }) {
+    if (!this.fileStager) throw new Error("File staging is not configured")
+    return this.fileStager.stage(filePath)
+  }
+
+  cleanupStagedFiles() {
+    return this.fileStager?.cleanup()
+  }
+
+  readInputFile(filePath, noun, maxBytes) {
+    return this.fileStager
+      ? this.fileStager.read(filePath, noun, maxBytes)
+      : readTrustedFile(this.binaryRoot, filePath, noun, maxBytes)
+  }
+
   mountDisk({ driveId, path: filePath }, signal) {
     return this.serializeMutation(async (startMutation) => {
       const hardDrive = driveId === "hd1" || driveId === "hd2"
-      const bytes = await readTrustedFile(
-        this.binaryRoot,
+      const bytes = await this.readInputFile(
         filePath,
         hardDrive ? "hard-drive image" : "floppy image",
         hardDrive ? MAX_HARD_DRIVE_IMAGE_BYTES : MAX_FLOPPY_IMAGE_BYTES,
@@ -780,7 +880,13 @@ export class Apple2tsCore {
 
   loadBinary({ path: filePath, address }, signal) {
     return this.serializeMutation(async (startMutation) => {
-      const bytes = await readBinaryFile(this.binaryRoot, filePath, address)
+      const bytes = await this.readInputFile(filePath, "binary", MAX_BINARY_BYTES)
+      if (!Number.isInteger(address) || address < 0 || address >= MAX_BINARY_BYTES) {
+        throw new Error("address must be an integer between 0 and 49151")
+      }
+      if (address + bytes.length > MAX_BINARY_BYTES) {
+        throw new Error("binary block must fit within main RAM at $0000-$BFFF")
+      }
       startMutation()
       const query = new URLSearchParams({ address: String(address) })
       const receipt = await this.request(
@@ -794,6 +900,17 @@ export class Apple2tsCore {
 
 const mutationTools = [
   {
+    name: "stage_file",
+    title: "Stage a local file",
+    description: "Copy one file from the configured source directory into this MCP session's trusted input area.",
+    inputSchema: fileStageInputSchema,
+    outputSchema: fileStageResultSchema,
+    destructiveHint: false,
+    idempotentHint: true,
+    enabled: (core) => Boolean(core.fileStager),
+    execute: (core, input) => core.stageFile(input),
+  },
+  {
     name: "set_keyboard_key",
     title: "Set held keyboard key",
     description: "Hold one keyboard key, or pass null to release the held key.",
@@ -806,12 +923,12 @@ const mutationTools = [
   {
     name: "mount_disk",
     title: "Mount a local disk image",
-    description: "Mount one trusted local disk image in hd1, hd2, fd1, or fd2 and return its confirmed mounted-state receipt. Floppy images may be up to 2 MiB; hard-drive images may be up to 32 MiB.",
+    description: "Mount one file staged by this MCP session in hd1, hd2, fd1, or fd2. Use stage_file first. Floppy images may be up to 2 MiB; hard-drive images may be up to 32 MiB.",
     inputSchema: diskMountInputSchema,
     outputSchema: driveResultSchema,
     destructiveHint: true,
     idempotentHint: false,
-    enabled: (core) => Boolean(core.binaryRoot),
+    enabled: (core) => Boolean(core.fileStager),
     execute: (core, input, signal) => core.mountDisk(input, signal),
   },
   {
@@ -1048,12 +1165,12 @@ export const createMcpServer = (core) => {
     },
   )
 
-  if (core.binaryRoot) {
+  if (core.fileStager) {
     server.registerTool(
       "load_binary",
       {
         title: "Load an Apple II binary",
-        description: "Load one file from the configured trusted binary root into main RAM.",
+        description: "Load one file staged by this MCP session into main RAM. Use stage_file first.",
         inputSchema: binaryLoadInputSchema,
         outputSchema: binaryLoadOutputSchema,
         annotations: {
@@ -1250,6 +1367,7 @@ export const runStdio = async (options = {}) => {
       const failures = []
       shutdownController.abort(new Error(reason))
       await core?.neutralizeKeyboard().catch((error) => failures.push(error))
+      await core?.cleanupStagedFiles().catch((error) => failures.push(error))
       await listenerPromise.catch(() => {})
       ownedRenderer ||= await rendererPromise.catch(() => null)
       await stdioHandle?.close().catch((error) => failures.push(error))
@@ -1280,7 +1398,15 @@ export const runStdio = async (options = {}) => {
 
   try {
     if (!options.chromiumExecutable) throw new Error("APPLE2TS_CHROMIUM_EXECUTABLE is required")
-    const binaryRoot = await resolveBinaryRoot(options.binaryRoot)
+    const binaryRoot = await resolveBinaryRoot(options.fileStagingRoot, "APPLE2TS_FILE_STAGING_ROOT")
+    const fileSourceRoot = await resolveBinaryRoot(options.fileSourceRoot, "APPLE2TS_FILE_SOURCE_ROOT")
+    if (binaryRoot && fileSourceRoot) {
+      try {
+        await access(binaryRoot, fsConstants.W_OK | fsConstants.X_OK)
+      } catch {
+        throw new Error("APPLE2TS_FILE_STAGING_ROOT must be writable when file staging is configured")
+      }
+    }
     const distDir = resolveBrowserBuildDir(options.distDir)
     const chromiumMode = options.chromiumMode ?? "headless"
     if (chromiumMode !== "headless" && chromiumMode !== "visible") {
@@ -1308,6 +1434,7 @@ export const runStdio = async (options = {}) => {
       },
       shutdownController.signal,
       binaryRoot,
+      binaryRoot && fileSourceRoot ? new FileStager(fileSourceRoot, binaryRoot) : null,
     )
     rendererPromise = launchChromium({
       executable: options.chromiumExecutable,
@@ -1357,7 +1484,8 @@ if (isMain) {
     startupTimeoutMs: process.env.APPLE2TS_STARTUP_TIMEOUT_MS,
     chromiumExecutable: process.env.APPLE2TS_CHROMIUM_EXECUTABLE,
     chromiumMode: process.env.APPLE2TS_CHROMIUM_MODE,
-    binaryRoot: process.env.APPLE2TS_BINARY_ROOT,
+    fileSourceRoot: process.env.APPLE2TS_FILE_SOURCE_ROOT,
+    fileStagingRoot: process.env.APPLE2TS_FILE_STAGING_ROOT,
     distDir: process.env.APPLE2TS_DIST_DIR,
   })
 }

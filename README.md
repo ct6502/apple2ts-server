@@ -82,7 +82,8 @@ it with an entry like this:
       "env": {
         "APPLE2TS_CHROMIUM_EXECUTABLE": "/path/to/chrome",
         "APPLE2TS_DIST_DIR": "/path/to/apple2ts/dist",
-        "APPLE2TS_BINARY_ROOT": "/path/to/apple2-binaries"
+        "APPLE2TS_FILE_SOURCE_ROOT": "/path/to/project-test-artifacts",
+        "APPLE2TS_FILE_STAGING_ROOT": "/path/to/private-mcp-staging"
       }
     }
   }
@@ -93,14 +94,15 @@ Replace the paths for your installation. To open the browser window, add
 `"APPLE2TS_CHROMIUM_MODE": "visible"` to `env`. When the host closes the stdio
 connection, the server stops the browser and removes its private profile.
 
-To enable `load_binary` and `mount_disk`, create or choose a directory
-containing trusted Apple II input files, then set `APPLE2TS_BINARY_ROOT` to its
-path before startup. Both tools accept paths relative to that directory and
-are hidden when the setting is absent. The configured root remains fixed for
-the server session, but fully written files may be added between tool calls.
-The server reads files in place and does not remove them. A binary can be up to
-49,152 bytes and must fit in main RAM at `$0000-$BFFF`. A floppy image can be
-up to 2 MiB; a hard-drive image can be up to 32 MiB.
+To enable `stage_file`, `load_binary`, and `mount_disk`, set both
+`APPLE2TS_FILE_SOURCE_ROOT` and `APPLE2TS_FILE_STAGING_ROOT` before startup.
+The source root is one allowed project or test-artifact directory. The staging
+root is writable private storage for this MCP process. First call `stage_file`
+with a path relative to the source root, then use its returned path with
+`mount_disk` or `load_binary`. The server removes staged files when the MCP
+session ends. A binary can be up to 49,152 bytes and must fit in main RAM at
+`$0000-$BFFF`. A floppy image can be up to 2 MiB; a hard-drive image can be up
+to 32 MiB.
 
 ### Server Docs URLs
 
