@@ -31,6 +31,7 @@ const MUTATION_TIMEOUT_MS = Number(process.env.COMMAND_TIMEOUT_MS || 10000)
 const MAX_BINARY_BYTES = 0xC000
 const MAX_FLOPPY_IMAGE_BYTES = 2 * 1024 * 1024
 const MAX_HARD_DRIVE_IMAGE_BYTES = 32 * 1024 * 1024
+const STANDARD_FLOPPY_IMAGE_BYTES = 143360
 const DRIVE_IDS = ["hd1", "hd2", "fd1", "fd2"]
 
 class ConfirmedMutationRejection extends Error {
@@ -454,6 +455,23 @@ const readBinaryFile = async (root, filePath, address) => {
   return bytes
 }
 
+const classifyDiskImage = (filePath, byteLength) => {
+  switch (path.extname(path.basename(filePath)).toLowerCase()) {
+    case ".hdv":
+    case ".2mg":
+    case ".2meg":
+      return "hard-drive"
+    case ".po":
+      return byteLength > STANDARD_FLOPPY_IMAGE_BYTES ? "hard-drive" : "floppy"
+    case ".dsk":
+    case ".do":
+    case ".woz":
+      return "floppy"
+    default:
+      return null
+  }
+}
+
 const isConfirmedDriveState = (result, driveId, mounted) =>
   result?.state?.driveId === driveId
   && result.state.mounted === mounted
@@ -640,6 +658,10 @@ export class Apple2tsCore {
         hardDrive ? "hard-drive image" : "floppy image",
         hardDrive ? MAX_HARD_DRIVE_IMAGE_BYTES : MAX_FLOPPY_IMAGE_BYTES,
       )
+      const mediaKind = classifyDiskImage(filePath, bytes.length)
+      if (mediaKind && mediaKind !== (hardDrive ? "hard-drive" : "floppy")) {
+        throw new Error(`${driveId} cannot mount a ${mediaKind} image`)
+      }
       startMutation()
       let result
       try {
