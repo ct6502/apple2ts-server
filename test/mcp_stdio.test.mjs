@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { execFile, spawn } from "node:child_process"
 import { createHash } from "node:crypto"
-import { access, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises"
+import { access, mkdir, mkdtemp, readFile, realpath, rm, symlink, truncate, writeFile } from "node:fs/promises"
 import { createServer } from "node:http"
 import os from "node:os"
 import path from "node:path"
@@ -917,6 +917,44 @@ test("configured disk mounting reads a file added after root selection and seria
   ])
 })
 
+test("disk mounting applies separate floppy and hard-drive size limits", async (t) => {
+  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-limits-"))
+  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
+  const mediumImage = Buffer.alloc(2 * 1024 * 1024 + 1)
+  await writeFile(path.join(binaryRoot, "medium.po"), mediumImage)
+  await writeFile(path.join(binaryRoot, "oversized.po"), "")
+  await truncate(path.join(binaryRoot, "oversized.po"), 32 * 1024 * 1024 + 1)
+
+  const identity = { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" }
+  const requests = []
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    identity,
+    new AbortController().signal,
+    await realpath(binaryRoot),
+  )
+  core.request = async (pathname, options) => {
+    requests.push({ pathname, options })
+    return { emulator: identity, state: { driveId: "hd1", mounted: true } }
+  }
+
+  await assert.rejects(
+    core.mountDisk({ driveId: "fd1", path: "medium.po" }),
+    /floppy image file cannot exceed 2097152 bytes/,
+  )
+  const mounted = await core.mountDisk({ driveId: "hd1", path: "medium.po" })
+  assert.deepEqual(mounted.state, { driveId: "hd1", mounted: true })
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0].pathname, "/api/drives/hd1/mount")
+  assert.equal(Buffer.from(requests[0].options.body.dataBase64, "base64").length, mediumImage.length)
+  await assert.rejects(
+    core.mountDisk({ driveId: "hd1", path: "oversized.po" }),
+    /hard-drive image file cannot exceed 33554432 bytes/,
+  )
+  assert.equal(requests.length, 1)
+})
+
 test("disk mutations reject drive state that does not confirm the requested result", async (t) => {
   const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-confirmation-"))
   t.after(() => rm(binaryRoot, { recursive: true, force: true }))
@@ -1616,7 +1654,12 @@ test("configured stdio advertises and loads a local binary", async (t) => {
   const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-mcp-binaries-"))
   await writeFile(path.join(binaryRoot, "fixture.bin"), Buffer.from([0xA9, 0x42, 0x60]))
   await writeFile(path.join(binaryRoot, "fixture.woz"), Buffer.from("WOZ2\u00ff\n\r\n"))
-  const processState = await launchMcp({ APPLE2TS_BINARY_ROOT: binaryRoot })
+  await writeFile(path.join(binaryRoot, "fixture.po"), "")
+  await truncate(path.join(binaryRoot, "fixture.po"), 32 * 1024 * 1024)
+  const processState = await launchMcp({
+    APPLE2TS_BINARY_ROOT: binaryRoot,
+    APPLE2TS_FAKE_CHROMIUM_HARD_DRIVE: "1",
+  })
   t.after(processState.cleanup)
   try {
     await processState.waitForStderr((line) => line.includes("MCP ready"))
@@ -1639,7 +1682,7 @@ test("configured stdio advertises and loads a local binary", async (t) => {
     assert.deepEqual(mountTool.inputSchema, {
       type: "object",
       properties: {
-        driveId: { type: "string", enum: ["fd1", "fd2"] },
+        driveId: { type: "string", enum: ["hd1", "hd2", "fd1", "fd2"] },
         path: { type: "string", minLength: 1 },
       },
       required: ["driveId", "path"],
@@ -1647,15 +1690,27 @@ test("configured stdio advertises and loads a local binary", async (t) => {
     })
     assert.equal(mountTool.annotations.destructiveHint, true)
     assert.equal(mountTool.annotations.idempotentHint, false)
+    assert.match(mountTool.description, /Floppy images may be up to 2 MiB/)
+    assert.match(mountTool.description, /hard-drive images may be up to 32 MiB/)
     assert.deepEqual(mountTool.outputSchema.properties.state, {
       type: "object",
       properties: {
-        driveId: { type: "string", enum: ["fd1", "fd2"] },
+        driveId: { type: "string", enum: ["hd1", "hd2", "fd1", "fd2"] },
         mounted: { type: "boolean" },
       },
       required: ["driveId", "mounted"],
       additionalProperties: false,
     })
+    const ejectTool = tools.result.tools.find((tool) => tool.name === "eject_disk")
+    assert.deepEqual(ejectTool.inputSchema, {
+      type: "object",
+      properties: {
+        driveId: { type: "string", enum: ["hd1", "hd2", "fd1", "fd2"] },
+      },
+      required: ["driveId"],
+      additionalProperties: false,
+    })
+    assert.deepEqual(ejectTool.outputSchema.properties.state, mountTool.outputSchema.properties.state)
 
     processState.child.stdin.write(`${JSON.stringify({
       jsonrpc: "2.0",
@@ -1674,12 +1729,12 @@ test("configured stdio advertises and loads a local binary", async (t) => {
       jsonrpc: "2.0",
       id: 4,
       method: "tools/call",
-      params: { name: "mount_disk", arguments: { driveId: "fd1", path: "fixture.woz" } },
+      params: { name: "mount_disk", arguments: { driveId: "hd1", path: "fixture.po" } },
     })}\n`)
     const mounted = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 4))
     assert.equal(mounted.result.isError, undefined)
     assert.deepEqual(mounted.result.structuredContent.state, {
-      driveId: "fd1",
+      driveId: "hd1",
       mounted: true,
     })
 
@@ -1687,12 +1742,12 @@ test("configured stdio advertises and loads a local binary", async (t) => {
       jsonrpc: "2.0",
       id: 5,
       method: "tools/call",
-      params: { name: "eject_disk", arguments: { driveId: "fd1" } },
+      params: { name: "eject_disk", arguments: { driveId: "hd1" } },
     })}\n`)
     const ejected = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 5))
     assert.equal(ejected.result.isError, undefined)
     assert.deepEqual(ejected.result.structuredContent.state, {
-      driveId: "fd1",
+      driveId: "hd1",
       mounted: false,
     })
 

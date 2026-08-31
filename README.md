@@ -99,8 +99,8 @@ path before startup. Both tools accept paths relative to that directory and
 are hidden when the setting is absent. The configured root remains fixed for
 the server session, but fully written files may be added between tool calls.
 The server reads files in place and does not remove them. A binary can be up to
-49,152 bytes and must fit in main RAM at `$0000-$BFFF`; a floppy image can be
-up to 2 MiB.
+49,152 bytes and must fit in main RAM at `$0000-$BFFF`. A floppy image can be
+up to 2 MiB; a hard-drive image can be up to 32 MiB.
 
 ### Server Docs URLs
 
