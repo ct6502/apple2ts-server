@@ -1094,6 +1094,16 @@ export const createMcpServer = (core) => {
     },
   ]
 
+  if (core.fileStager) {
+    resources.push({
+      name: "task-input-root",
+      uri: "apple2ts://session/input-root",
+      title: "Apple2TS task input folder",
+      description: "Folder where this MCP session accepts files for stage_file.",
+      read: () => ({ path: core.fileStager.sourceRoot }),
+    })
+  }
+
   for (const resource of resources) {
     server.registerResource(
       resource.name,

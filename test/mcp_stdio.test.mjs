@@ -1815,6 +1815,19 @@ test("configured stdio advertises and loads a local binary", async (t) => {
       additionalProperties: false,
     })
     assert.equal(stageTool.annotations.idempotentHint, true)
+
+    processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 50, method: "resources/list" })}\n`)
+    const resources = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 50))
+    assert.ok(resources.result.resources.some((resource) => resource.uri === "apple2ts://session/input-root"))
+    processState.child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 51,
+      method: "resources/read",
+      params: { uri: "apple2ts://session/input-root" },
+    })}\n`)
+    const inputRoot = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 51))
+    assert.deepEqual(JSON.parse(inputRoot.result.contents[0].text), { path: await realpath(sourceRoot) })
+
     const ejectTool = tools.result.tools.find((tool) => tool.name === "eject_disk")
     assert.deepEqual(ejectTool.inputSchema, {
       type: "object",
