@@ -26,8 +26,12 @@ const BROWSER_EXIT_TIMEOUT_MS = 2000
 const CHILD_STDERR_LIMIT = 8192
 const READ_TIMEOUT_MS = 2000
 const MUTATION_RESPONSE_MARGIN_MS = 1000
-const MUTATION_TIMEOUT_MS = Number(process.env.COMMAND_TIMEOUT_MS || 10000)
-  + MUTATION_RESPONSE_MARGIN_MS
+const COMMAND_TIMEOUT_MS = Number(process.env.COMMAND_TIMEOUT_MS || 10000)
+const MUTATION_TIMEOUT_MS = COMMAND_TIMEOUT_MS + MUTATION_RESPONSE_MARGIN_MS
+// Mounting asks the renderer for fresh status before it performs the mount.
+// A rejected image then needs one more fresh-status request to confirm that no
+// media was mounted, so retain one shared budget for all three requests.
+const MOUNT_TIMEOUT_MS = COMMAND_TIMEOUT_MS * 3 + MUTATION_RESPONSE_MARGIN_MS
 const MAX_BINARY_BYTES = 0xC000
 const MAX_FLOPPY_IMAGE_BYTES = 2 * 1024 * 1024
 const MAX_HARD_DRIVE_IMAGE_BYTES = 32 * 1024 * 1024
@@ -342,13 +346,15 @@ const sleep = (milliseconds, signal) =>
     signal.addEventListener("abort", onAbort, { once: true })
   })
 
-const fetchEnvelope = async (baseUrl, pathname, controllerToken, signal, options = {}) => {
+const fetchEnvelope = async (baseUrl, pathname, controllerToken, signal, options = {}, timeoutMs) => {
   const headers = { Authorization: `Bearer ${controllerToken}` }
   if (options.body !== undefined) {
     headers["Content-Type"] = options.contentType || "application/json"
   }
   const method = options.method || "GET"
-  const timeoutSignal = AbortSignal.timeout(method === "GET" ? READ_TIMEOUT_MS : MUTATION_TIMEOUT_MS)
+  const timeoutSignal = AbortSignal.timeout(
+    timeoutMs ?? (method === "GET" ? READ_TIMEOUT_MS : MUTATION_TIMEOUT_MS),
+  )
   const response = await fetch(new URL(pathname, baseUrl), {
     method,
     headers,
@@ -498,8 +504,15 @@ export class Apple2tsCore {
     this.heldKey = null
   }
 
-  async request(pathname, options, signal = this.signal) {
-    const state = await fetchEnvelope(this.baseUrl, pathname, this.controllerToken, signal, options)
+  async request(pathname, options, signal = this.signal, timeoutMs) {
+    const state = await fetchEnvelope(
+      this.baseUrl,
+      pathname,
+      this.controllerToken,
+      signal,
+      options,
+      timeoutMs,
+    )
     return { emulator: this.identity, state }
   }
 
@@ -663,9 +676,16 @@ export class Apple2tsCore {
         throw new Error(`${driveId} cannot mount a ${mediaKind} image`)
       }
       startMutation()
+      const mountDeadline = Date.now() + MOUNT_TIMEOUT_MS
+      const mountRequest = (pathname, options) => this.request(
+        pathname,
+        options,
+        this.signal,
+        Math.max(1, mountDeadline - Date.now()),
+      )
       let result
       try {
-        result = await this.request(`/api/drives/${driveId}/mount`, {
+        result = await mountRequest(`/api/drives/${driveId}/mount`, {
           method: "POST",
           body: {
             sourceType: "base64",
@@ -675,7 +695,7 @@ export class Apple2tsCore {
         })
       } catch (error) {
         if (error?.bridgeStatus !== 400) throw error
-        const current = await this.request(`/api/drives/${driveId}`)
+        const current = await mountRequest(`/api/drives/${driveId}`)
         if (!isConfirmedDriveState(current, driveId, false)) throw error
         throw new ConfirmedMutationRejection(error)
       }

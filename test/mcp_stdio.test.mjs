@@ -28,6 +28,21 @@ const rendererId = "test-renderer"
 const cleanupGraceTimeoutMs = 5000
 const cleanupKillTimeoutMs = 1000
 const execFileAsync = promisify(execFile)
+let timeoutModuleSequence = 0
+
+const importCoreWithCommandTimeout = async (commandTimeoutMs) => {
+  const previousCommandTimeout = process.env.COMMAND_TIMEOUT_MS
+  process.env.COMMAND_TIMEOUT_MS = String(commandTimeoutMs)
+  try {
+    const module = await import(
+      `../server/mcp_stdio.mjs?command-timeout=${commandTimeoutMs}-${timeoutModuleSequence++}`
+    )
+    return module.Apple2tsCore
+  } finally {
+    if (previousCommandTimeout === undefined) delete process.env.COMMAND_TIMEOUT_MS
+    else process.env.COMMAND_TIMEOUT_MS = previousCommandTimeout
+  }
+}
 
 const postJson = (url, body) =>
   fetch(url, {
@@ -1071,6 +1086,7 @@ test("confirmed invalid disk rejection leaves later eject usable", async (t) => 
     byteLength: 0,
   }
   const requestPaths = []
+  const requestTimeouts = []
   const core = new Apple2tsCore(
     "http://unused.test",
     controllerToken,
@@ -1078,9 +1094,11 @@ test("confirmed invalid disk rejection leaves later eject usable", async (t) => 
     new AbortController().signal,
     await realpath(binaryRoot),
   )
-  core.request = async (pathname, options = {}) => {
+  core.request = async (pathname, options = {}, _signal, timeoutMs) => {
     requestPaths.push(pathname)
+    requestTimeouts.push(timeoutMs)
     if (options.method === "POST") {
+      await new Promise((resolve) => setTimeout(resolve, 20))
       const error = new Error("Apple2TS rejected invalid disk media")
       error.bridgeStatus = 400
       throw error
@@ -1100,6 +1118,10 @@ test("confirmed invalid disk rejection leaves later eject usable", async (t) => 
     "/api/drives/fd2",
     "/api/drives/fd2",
   ])
+  assert.equal(typeof requestTimeouts[0], "number")
+  assert.equal(typeof requestTimeouts[1], "number")
+  assert.ok(requestTimeouts[1] < requestTimeouts[0])
+  assert.equal(requestTimeouts[2], undefined)
 })
 
 test("disk preflight failure preserves a held key", async (t) => {
@@ -1227,6 +1249,106 @@ test("mount transport failure remains an uncertain mutation", async (t) => {
   await assert.rejects(
     core.mountDisk({ driveId: "fd1", path: "fixture.woz" }),
     /transport timed out/,
+  )
+  await assert.rejects(core.ejectDisk("fd1"), /restart this MCP session/)
+  assert.equal(requests, 1)
+})
+
+test("mount timeout covers delayed drive lookup and mount confirmation", async (t) => {
+  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-delayed-mount-"))
+  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
+  await writeFile(path.join(binaryRoot, "fixture.woz"), Buffer.from("WOZ2\u00ff\n\r\n"))
+
+  const commandTimeoutMs = 2000
+  const DelayedMountCore = await importCoreWithCommandTimeout(commandTimeoutMs)
+
+  const listener = await startApple2tsServer({
+    port: 0,
+    commandTimeoutMs,
+    privateRenderer: { remoteControlToken: token, rendererId, controllerToken },
+    logger: { log() {} },
+  })
+  t.after(stopApple2tsServer)
+  const renderer = await connectFakeRenderer(listener.url, { autoServe: false })
+  t.after(() => renderer.stop())
+
+  const emptyDrive = {
+    index: 0,
+    drive: 1,
+    hardDrive: false,
+    filename: "",
+    status: "",
+    isWriteProtected: false,
+    diskHasChanges: false,
+    motorRunning: false,
+    byteLength: 0,
+  }
+  const mountedDrive = {
+    ...emptyDrive,
+    filename: "fixture.woz",
+    status: "mounted",
+    byteLength: 9,
+  }
+  const core = new DelayedMountCore(
+    listener.url,
+    controllerToken,
+    { serverInstanceId: listener.serverInstanceId, rendererId, targetId: `${listener.serverInstanceId}:${rendererId}` },
+    new AbortController().signal,
+    await realpath(binaryRoot),
+  )
+
+  const mountOutcome = core.mountDisk({ driveId: "fd1", path: "fixture.woz" })
+    .then((value) => ({ value }), (error) => ({ error }))
+  const statusCommand = await renderer.nextCommand()
+  assert.equal(statusCommand.action, "getStatus")
+  await new Promise((resolve) => setTimeout(resolve, 1000))
+  assert.equal((await renderer.reply(statusCommand, {
+    result: { ...statusFixture, drives: [emptyDrive] },
+  })).status, 200)
+
+  const mountCommand = await renderer.nextCommand()
+  assert.equal(mountCommand.action, "mountDisk")
+  await new Promise((resolve) => setTimeout(resolve, 1000))
+  assert.equal((await renderer.reply(mountCommand, {
+    result: {
+      mountedDrive: 0,
+      status: { ...statusFixture, drives: [mountedDrive] },
+    },
+  })).status, 200)
+
+  const outcome = await mountOutcome
+  assert.ifError(outcome.error)
+  assert.deepEqual(outcome.value.state, { driveId: "fd1", mounted: true })
+})
+
+test("mount timeout still poisons later mutations when its full budget is exceeded", async (t) => {
+  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-stalled-mount-"))
+  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
+  await writeFile(path.join(binaryRoot, "fixture.woz"), Buffer.from("WOZ2\u00ff\n\r\n"))
+
+  const StalledMountCore = await importCoreWithCommandTimeout(100)
+
+  let requests = 0
+  const bridge = createServer(async (_req, res) => {
+    requests += 1
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+    res.setHeader("Content-Type", "application/json")
+    res.end(JSON.stringify({ ok: true, data: { driveId: "fd1", mounted: true } }))
+  })
+  await new Promise((resolve) => bridge.listen(0, "127.0.0.1", resolve))
+  t.after(() => new Promise((resolve) => bridge.close(resolve)))
+  const address = bridge.address()
+  const core = new StalledMountCore(
+    `http://127.0.0.1:${address.port}`,
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+    new AbortController().signal,
+    await realpath(binaryRoot),
+  )
+
+  await assert.rejects(
+    core.mountDisk({ driveId: "fd1", path: "fixture.woz" }),
+    /aborted due to timeout/,
   )
   await assert.rejects(core.ejectDisk("fd1"), /restart this MCP session/)
   assert.equal(requests, 1)
