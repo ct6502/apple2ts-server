@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { execFile, spawn } from "node:child_process"
 import { createHash } from "node:crypto"
-import { access, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, truncate, writeFile } from "node:fs/promises"
+import { access, chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, truncate, writeFile } from "node:fs/promises"
 import { createServer } from "node:http"
 import os from "node:os"
 import path from "node:path"
@@ -295,12 +295,13 @@ const sendMcpRequest = async (processState, id, method, params = {}) => {
 }
 
 const initializeMcp = async (processState, id = "initialize") => {
-  await sendMcpRequest(processState, id, "initialize", {
+  const initialized = await sendMcpRequest(processState, id, "initialize", {
     protocolVersion: "2025-11-25",
     capabilities: {},
     clientInfo: { name: "test", version: "1" },
   })
   processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`)
+  return initialized
 }
 
 const startMcpSession = async (processState, id = "start-session") =>
@@ -365,6 +366,40 @@ test("private bridge binds one renderer and rejects forged replies", async (t) =
     assert.equal(response.status, 400)
     assert.match((await response.json()).error.message, /code from 1 through 255/)
   }
+})
+
+test("private renderer reconnect cancels definitive disconnect", async (t) => {
+  let disconnectCount = 0
+  let resolveDisconnected
+  const disconnected = new Promise((resolve) => {
+    resolveDisconnected = resolve
+  })
+  const listener = await startApple2tsServer({
+    port: 0,
+    privateRenderer: {
+      remoteControlToken: token,
+      rendererId,
+      controllerToken,
+      disconnectGraceMs: 100,
+      onDisconnect: () => {
+        disconnectCount += 1
+        resolveDisconnected()
+      },
+    },
+    logger: { log() {} },
+  })
+  t.after(() => stopApple2tsServer())
+
+  const first = await connectFakeRenderer(listener.url)
+  await first.stop()
+  const reconnected = await connectFakeRenderer(listener.url)
+  t.after(() => reconnected.stop())
+  await new Promise((resolve) => setTimeout(resolve, 150))
+  assert.equal(disconnectCount, 0)
+
+  await reconnected.stop()
+  await disconnected
+  assert.equal(disconnectCount, 1)
 })
 
 test("private bridge reads bounded memory in byte and hex formats", async (t) => {
@@ -1454,6 +1489,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/list" })}\n`)
   const listed = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 2))
   assert.deepEqual(listed.result.resources.map((resource) => resource.uri), [
+    "apple2ts://session/lifecycle",
     "apple2ts://machine",
     "apple2ts://cpu",
     "apple2ts://debugger/breakpoints",
@@ -2299,6 +2335,167 @@ test("visible Chromium uses the same owned session and cleanup", async (t) => {
   await assert.rejects(access(receipt.profilePath))
   await assertClosed(bridgeUrl)
   await visible.cleanup()
+})
+
+test("closing an owned visible renderer cleans its session and permits another start", async (t) => {
+  const stagingRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-visible-close-stage-"))
+  const sourceRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-visible-close-source-"))
+  await writeFile(path.join(sourceRoot, "fixture.bin"), Buffer.from([0xA9, 0x42, 0x60]))
+  const visible = await launchMcp({
+    APPLE2TS_CHROMIUM_MODE: "visible",
+    APPLE2TS_FAKE_CHROMIUM_MODE: "disconnect-after-load",
+    APPLE2TS_TEST_RENDERER_DISCONNECT_GRACE_MS: "50",
+    APPLE2TS_FILE_STAGING_ROOT: stagingRoot,
+    APPLE2TS_FILE_SOURCE_ROOT: sourceRoot,
+  })
+  t.after(visible.cleanup)
+  t.after(() => rm(stagingRoot, { recursive: true, force: true }))
+  t.after(() => rm(sourceRoot, { recursive: true, force: true }))
+
+  await visible.waitForStderr((line) => line.includes("MCP ready"))
+  const initialized = await initializeMcp(visible, "visible-close-initialize")
+  assert.equal(initialized.result.capabilities.resources.subscribe, true)
+  const started = await startMcpSession(visible, "visible-close-start")
+  assert.equal(started.result.isError, undefined, JSON.stringify(started))
+  const subscribed = await sendMcpRequest(visible, "visible-close-subscribe", "resources/subscribe", {
+    uri: "apple2ts://session/lifecycle",
+  })
+  assert.deepEqual(subscribed.result, {})
+  const bridgeLine = await visible.waitForStderr((line) => line.includes("private bridge listening"))
+  const bridgeUrl = parseBridgeUrl(bridgeLine)
+  const receipt = await visible.readReceipt()
+  assert.equal(receipt.headless, false)
+
+  const staged = await sendMcpRequest(visible, "visible-close-stage", "tools/call", {
+    name: "stage_file",
+    arguments: { path: "fixture.bin" },
+  })
+  assert.equal(staged.result.isError, undefined, JSON.stringify(staged))
+  const stagedPath = path.join(stagingRoot, staged.result.structuredContent.path)
+  await access(stagedPath)
+  const loaded = await sendMcpRequest(visible, "visible-close-load", "tools/call", {
+    name: "load_binary",
+    arguments: { path: staged.result.structuredContent.path, address: 0x6000 },
+  })
+  assert.equal(loaded.result.isError, undefined, JSON.stringify(loaded))
+
+  await visible.waitForStderr((line) => line.includes("renderer disconnected; stopping owned session"))
+    .catch((error) => {
+      throw new Error(`${error.message}\n${visible.getStderr()}`)
+    })
+  const lifecycleNotification = JSON.parse(await visible.waitForStdout((line) => {
+    const message = JSON.parse(line)
+    return message.method === "notifications/resources/updated"
+      && message.params?.uri === "apple2ts://session/lifecycle"
+  }).catch((error) => {
+    throw new Error(`${error.message}\n${visible.getStderr()}\n${visible.getStdout()}`)
+  }))
+  assert.deepEqual(lifecycleNotification.params, { uri: "apple2ts://session/lifecycle" })
+  await waitForAbsent(receipt.profilePath)
+  await waitForAbsent(stagedPath)
+  await assertClosed(bridgeUrl)
+  assert.throws(() => process.kill(receipt.pid, 0), { code: "ESRCH" })
+
+  const lifecycle = await sendMcpRequest(visible, "visible-close-lifecycle", "resources/read", {
+    uri: "apple2ts://session/lifecycle",
+  })
+  assert.deepEqual(JSON.parse(lifecycle.result.contents[0].text), {
+    sequence: 1,
+    state: "closed",
+    reason: "renderer_closed",
+    cleanup: "complete",
+    emulator: started.result.structuredContent.emulator,
+  })
+
+  const alreadyStopped = await sendMcpRequest(visible, "visible-close-stop", "tools/call", {
+    name: "stop_session",
+    arguments: {},
+  })
+  assert.deepEqual(alreadyStopped.result.structuredContent, { stopped: false })
+
+  const restarted = await startMcpSession(visible, "visible-close-restart")
+  assert.equal(restarted.result.isError, undefined, JSON.stringify(restarted))
+  assert.notEqual(
+    restarted.result.structuredContent.emulator.serverInstanceId,
+    started.result.structuredContent.emulator.serverInstanceId,
+  )
+  const restartedReceipt = await visible.readReceipt()
+  assert.notEqual(restartedReceipt.pid, receipt.pid)
+  assert.equal(restartedReceipt.headless, false)
+  const stopped = await sendMcpRequest(visible, "visible-close-final-stop", "tools/call", {
+    name: "stop_session",
+    arguments: {},
+  })
+  assert.deepEqual(stopped.result.structuredContent, { stopped: true })
+  await waitForAbsent(restartedReceipt.profilePath)
+  assert.throws(() => process.kill(restartedReceipt.pid, 0), { code: "ESRCH" })
+
+  visible.child.stdin.end()
+  const outcome = await visible.waitForExit()
+  assert.equal(outcome.code, 0, visible.getStderr())
+})
+
+test("closing a visible renderer during startup releases its private resources", async (t) => {
+  const interrupted = await launchMcp({
+    APPLE2TS_CHROMIUM_MODE: "visible",
+    APPLE2TS_FAKE_CHROMIUM_MODE: "disconnect-before-ready",
+    APPLE2TS_TEST_RENDERER_DISCONNECT_GRACE_MS: "50",
+  })
+  t.after(interrupted.cleanup)
+  await interrupted.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(interrupted, "visible-startup-close-initialize")
+  const bridgeLinePromise = interrupted.waitForStderr((line) => line.includes("private bridge listening"))
+  const startPromise = startMcpSession(interrupted, "visible-startup-close-start")
+  const bridgeUrl = parseBridgeUrl(await bridgeLinePromise)
+  const receipt = await interrupted.readReceipt()
+  const started = await startPromise
+  assert.equal(started.result.isError, true)
+  assert.match(started.result.content[0].text, /Owned renderer disconnected during startup/)
+  await waitForAbsent(receipt.profilePath)
+  await assertClosed(bridgeUrl)
+  assert.throws(() => process.kill(receipt.pid, 0), { code: "ESRCH" })
+
+  const stopped = await sendMcpRequest(interrupted, "visible-startup-close-stop", "tools/call", {
+    name: "stop_session",
+    arguments: {},
+  })
+  assert.deepEqual(stopped.result.structuredContent, { stopped: false })
+  interrupted.child.stdin.end()
+  const outcome = await interrupted.waitForExit()
+  assert.equal(outcome.code, 0, interrupted.getStderr())
+})
+
+test("renderer disconnect reports a startup cleanup failure", async (t) => {
+  const interrupted = await launchMcp({
+    APPLE2TS_CHROMIUM_MODE: "visible",
+    APPLE2TS_FAKE_CHROMIUM_MODE: "disconnect-before-ready-cleanup-failure",
+    APPLE2TS_TEST_RENDERER_DISCONNECT_GRACE_MS: "50",
+  })
+  t.after(interrupted.cleanup)
+  await interrupted.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(interrupted, "visible-cleanup-failure-initialize")
+  const bridgeLinePromise = interrupted.waitForStderr((line) => line.includes("private bridge listening"))
+  const startPromise = startMcpSession(interrupted, "visible-cleanup-failure-start")
+  const bridgeUrl = parseBridgeUrl(await bridgeLinePromise)
+  const receipt = await interrupted.readReceipt()
+  const removeRetainedProfile = async () => {
+    await chmod(receipt.profilePath, 0o700).catch((error) => {
+      if (error?.code !== "ENOENT") throw error
+    })
+    await rm(receipt.profilePath, { recursive: true, force: true })
+  }
+  t.after(removeRetainedProfile)
+  const started = await startPromise
+  assert.equal(started.result.isError, true)
+  assert.match(started.result.content[0].text, /session cleanup failed/)
+  await assertClosed(bridgeUrl)
+  assert.throws(() => process.kill(receipt.pid, 0), { code: "ESRCH" })
+  await access(receipt.profilePath)
+  await removeRetainedProfile()
+
+  interrupted.child.stdin.end()
+  const outcome = await interrupted.waitForExit()
+  assert.equal(outcome.code, 0, interrupted.getStderr())
 })
 
 test("invalid Chromium mode fails session start before launch", async (t) => {

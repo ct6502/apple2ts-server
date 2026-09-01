@@ -94,6 +94,13 @@ private emulator is no longer needed. A host whose configuration uses an
 Replace the paths for your installation. To open the browser window, add
 `"APPLE2TS_CHROMIUM_MODE": "visible"` to `env`. When the host closes the stdio
 connection, the server stops any active browser and removes its private profile.
+Closing the owned visible window also ends that emulator session; the MCP
+process remains available for another `start_session`.
+Consumers can subscribe to `apple2ts://session/lifecycle`, then await its
+`notifications/resources/updated` notification instead of polling emulator
+state. The server sends this notification only after the renderer has failed
+to reconnect and session cleanup has finished. Reading the resource reports
+whether cleanup completed.
 
 To enable `stage_file`, `load_binary`, and `mount_disk`, set both
 `APPLE2TS_FILE_SOURCE_ROOT` and `APPLE2TS_FILE_STAGING_ROOT` before startup.
