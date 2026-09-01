@@ -69,9 +69,10 @@ APPLE2TS_CHROMIUM_EXECUTABLE=/path/to/chrome \
   npm run mcp:stdio
 ```
 
-`npm run mcp:stdio` starts one private Apple2TS browser session owned by the
-MCP process. A host whose configuration uses an `mcpServers` object can start
-it with an entry like this:
+`npm run mcp:stdio` starts a lightweight MCP process. It does not start a
+browser until the client calls `start_session`. Call `stop_session` when that
+private emulator is no longer needed. A host whose configuration uses an
+`mcpServers` object can start it with an entry like this:
 
 ```json
 {
@@ -92,7 +93,7 @@ it with an entry like this:
 
 Replace the paths for your installation. To open the browser window, add
 `"APPLE2TS_CHROMIUM_MODE": "visible"` to `env`. When the host closes the stdio
-connection, the server stops the browser and removes its private profile.
+connection, the server stops any active browser and removes its private profile.
 
 To enable `stage_file`, `load_binary`, and `mount_disk`, set both
 `APPLE2TS_FILE_SOURCE_ROOT` and `APPLE2TS_FILE_STAGING_ROOT` before startup.
