@@ -1457,6 +1457,15 @@ export const runStdio = async (options = {}) => {
         const fileSourceRoot = await resolveBinaryRoot(options.fileSourceRoot, "APPLE2TS_FILE_SOURCE_ROOT")
         throwIfShuttingDown()
         if (binaryRoot && fileSourceRoot) {
+          const stagingRelativeToSource = path.relative(fileSourceRoot, binaryRoot)
+          if (
+            stagingRelativeToSource === ""
+            || (!stagingRelativeToSource.startsWith(`..${path.sep}`)
+              && stagingRelativeToSource !== ".."
+              && !path.isAbsolute(stagingRelativeToSource))
+          ) {
+            throw new Error("APPLE2TS_FILE_STAGING_ROOT must not be inside APPLE2TS_FILE_SOURCE_ROOT")
+          }
           try {
             await access(binaryRoot, fsConstants.W_OK | fsConstants.X_OK)
           } catch {
