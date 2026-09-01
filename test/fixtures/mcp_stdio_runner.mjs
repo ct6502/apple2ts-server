@@ -9,6 +9,7 @@ void runStdio({
   remoteControlToken: process.env.APPLE2TS_REMOTE_CONTROL_TOKEN,
   rendererId: process.env.APPLE2TS_RENDERER_ID,
   startupTimeoutMs: process.env.APPLE2TS_STARTUP_TIMEOUT_MS,
+  rendererDisconnectGraceMs: process.env.APPLE2TS_TEST_RENDERER_DISCONNECT_GRACE_MS,
   chromiumExecutable: process.env.APPLE2TS_CHROMIUM_EXECUTABLE,
   chromiumMode: process.env.APPLE2TS_CHROMIUM_MODE,
   fileSourceRoot: process.env.APPLE2TS_FILE_SOURCE_ROOT,

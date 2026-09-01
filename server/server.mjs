@@ -118,6 +118,24 @@ const getConnectedClient = () => {
   return client
 }
 
+const cancelPrivateRendererDisconnect = () => {
+  if (!privateRenderer?.disconnectTimer) return
+  clearTimeout(privateRenderer.disconnectTimer)
+  privateRenderer.disconnectTimer = null
+}
+
+const schedulePrivateRendererDisconnect = () => {
+  const renderer = privateRenderer
+  if (!renderer?.onDisconnect || renderer.disconnectTimer) return
+  renderer.disconnectTimer = setTimeout(() => {
+    renderer.disconnectTimer = null
+    if (privateRenderer !== renderer) return
+    const client = clients.get(renderer.clientId)
+    if (client?.eventStream) return
+    renderer.onDisconnect()
+  }, renderer.disconnectGraceMs)
+}
+
 const rendererCredentialsMatch = (value) =>
   !privateRenderer ||
   (value?.remoteControlToken === privateRenderer.remoteControlToken &&
@@ -912,6 +930,7 @@ const server = createServer(async (req, res) => {
 
       client.lastSeenAt = Date.now()
       client.eventStream = res
+      cancelPrivateRendererDisconnect()
       client.heartbeat = setInterval(() => {
         res.write(": keep-alive\n\n")
       }, 15000)
@@ -922,6 +941,7 @@ const server = createServer(async (req, res) => {
         client.heartbeat = null
         if (client.eventStream === res) {
           client.eventStream = null
+          schedulePrivateRendererDisconnect()
         }
         client.lastSeenAt = Date.now()
         failPendingCommandsForClient(clientId, "Browser client disconnected")
@@ -1961,6 +1981,9 @@ export const startApple2tsServer = async (options = {}) => {
         rendererId: String(options.privateRenderer.rendererId),
         controllerToken: String(options.privateRenderer.controllerToken),
         clientId: null,
+        disconnectGraceMs: Number(options.privateRenderer.disconnectGraceMs ?? 0),
+        disconnectTimer: null,
+        onDisconnect: options.privateRenderer.onDisconnect,
       }
     : null
 
@@ -1994,6 +2017,7 @@ export const startApple2tsServer = async (options = {}) => {
 }
 
 export const stopApple2tsServer = async () => {
+  cancelPrivateRendererDisconnect()
   for (const client of clients.values()) {
     if (client.heartbeat) clearInterval(client.heartbeat)
     client.heartbeat = null

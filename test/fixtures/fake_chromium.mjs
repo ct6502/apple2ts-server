@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { readFileSync, writeFileSync } from "node:fs"
-import { writeFile } from "node:fs/promises"
+import { chmod, writeFile } from "node:fs/promises"
 
 import { statusFixture } from "./status_fixture.mjs"
 
@@ -47,7 +47,8 @@ const eventsUrl = new URL("/api/client/events", launchUrl.origin)
 eventsUrl.searchParams.set("clientId", clientId)
 eventsUrl.searchParams.set("remoteControlToken", remoteControlToken)
 eventsUrl.searchParams.set("rendererId", rendererId)
-const eventsResponse = await fetch(eventsUrl)
+const eventController = new AbortController()
+const eventsResponse = await fetch(eventsUrl, { signal: eventController.signal })
 if (!eventsResponse.ok) process.exit(67)
 
 const reader = eventsResponse.body.getReader()
@@ -107,10 +108,22 @@ const stop = () => {
     return
   }
   stopping = true
+  eventController.abort()
   void reader.cancel().finally(() => process.exit(0))
 }
 process.once("SIGINT", stop)
 process.once("SIGTERM", stop)
+
+if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE?.startsWith("disconnect-before-ready")) {
+  if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE.endsWith("cleanup-failure")) {
+    await writeFile(`${profilePath}/retained`, "retained")
+    await chmod(profilePath, 0o000)
+  }
+  eventController.abort()
+  await reader.cancel().catch(() => {})
+  setInterval(() => {}, 1000)
+  await new Promise(() => {})
+}
 
 while (!stopping) {
   const { done, value } = await reader.read()
@@ -239,6 +252,12 @@ while (!stopping) {
       error: result === undefined ? "Unsupported fake command" : undefined,
     })
     if (!reply.ok) process.exit(68)
+    if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "disconnect-after-load" && command.action === "loadBinary") {
+      eventController.abort()
+      await reader.cancel().catch(() => {})
+      setInterval(() => {}, 1000)
+      await new Promise(() => {})
+    }
     if (command.action === "getStatus") {
       statusReplies += 1
       if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "crash-after-ready" && statusReplies >= 2) {

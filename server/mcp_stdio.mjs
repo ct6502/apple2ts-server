@@ -45,6 +45,7 @@ const CPU_PATCH_MAXIMUMS = Object.freeze({
   S: 255,
   PStatus: 255,
 })
+const SESSION_LIFECYCLE_URI = "apple2ts://session/lifecycle"
 
 class ConfirmedMutationRejection extends Error {
   constructor(error) {
@@ -1196,9 +1197,20 @@ const screenCaptureResult = ({ dataBase64, ...result }) => ({
 
 export const createMcpServer = (session) => {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION })
+  const resourceSubscriptions = new Set()
+  session.setLifecycleNotifier(() => resourceSubscriptions.has(SESSION_LIFECYCLE_URI)
+    ? server.server.sendResourceUpdated({ uri: SESSION_LIFECYCLE_URI })
+    : undefined)
   const core = () => session.requireCore()
 
   const resources = [
+    {
+      name: "session-lifecycle",
+      uri: SESSION_LIFECYCLE_URI,
+      title: "Apple2TS session lifecycle",
+      description: "Latest lifecycle state for the private emulator session.",
+      read: () => session.readLifecycle(),
+    },
     {
       name: "machine",
       uri: "apple2ts://machine",
@@ -1271,6 +1283,19 @@ export const createMcpServer = (session) => {
       }),
     )
   }
+
+  server.server.registerCapabilities({ resources: { subscribe: true } })
+  server.server.setRequestHandler("resources/subscribe", async ({ params }) => {
+    if (params.uri !== SESSION_LIFECYCLE_URI) {
+      throw new Error(`Resource does not support updates: ${params.uri}`)
+    }
+    resourceSubscriptions.add(params.uri)
+    return {}
+  })
+  server.server.setRequestHandler("resources/unsubscribe", async ({ params }) => {
+    resourceSubscriptions.delete(params.uri)
+    return {}
+  })
 
   server.registerTool(
     "start_session",
@@ -1454,6 +1479,8 @@ const waitFor = (promise, timeoutMs) =>
     })
   })
 
+const DEFAULT_RENDERER_DISCONNECT_GRACE_MS = 5000
+
 const launchChromium = async ({ executable, bridgeUrl, remoteControlToken, rendererId, mode }) => {
   if (!executable) throw new Error("APPLE2TS_CHROMIUM_EXECUTABLE is required")
   await access(executable, fsConstants.X_OK)
@@ -1566,6 +1593,14 @@ export const runStdio = async (options = {}) => {
   let activeSession = null
   let startingSession = null
   let stoppingSession = null
+  let lifecycleNotifier = null
+  let lifecycleState = {
+    sequence: 0,
+    state: "idle",
+    reason: null,
+    cleanup: null,
+    emulator: null,
+  }
   const throwIfShuttingDown = () => {
     if (shutdownController.signal.aborted) throw shutdownController.signal.reason
   }
@@ -1573,6 +1608,22 @@ export const runStdio = async (options = {}) => {
   const session = {
     fileStagingConfigured: Boolean(options.fileStagingRoot && options.fileSourceRoot),
     fileSourceRoot: options.fileSourceRoot,
+    setLifecycleNotifier(notifier) {
+      lifecycleNotifier = notifier
+    },
+    readLifecycle() {
+      return lifecycleState
+    },
+    async reportRendererClosed(emulator, cleanup) {
+      lifecycleState = {
+        sequence: lifecycleState.sequence + 1,
+        state: "closed",
+        reason: "renderer_closed",
+        cleanup,
+        emulator,
+      }
+      await lifecycleNotifier?.()
+    },
     requireCore() {
       if (!activeSession) throw new Error("No active Apple2TS session. Call start_session first.")
       return activeSession.core
@@ -1624,12 +1675,35 @@ export const runStdio = async (options = {}) => {
         let listener = null
         let renderer = null
         let core = null
+        let created = null
+        let rendererDisconnected = false
         try {
           listener = await startApple2tsServer({
             host: "127.0.0.1",
             port: Number(options.port ?? 0),
             distDir,
-            privateRenderer: { remoteControlToken, rendererId, controllerToken },
+            privateRenderer: {
+              remoteControlToken,
+              rendererId,
+              controllerToken,
+              disconnectGraceMs: Number(
+                options.rendererDisconnectGraceMs ?? DEFAULT_RENDERER_DISCONNECT_GRACE_MS,
+              ),
+              onDisconnect: () => {
+                if (stopping || stoppingSession) return
+                rendererDisconnected = true
+                process.stderr.write("Apple2TS MCP renderer disconnected; stopping owned session.\n")
+                if (!created) {
+                  sessionController.abort(new Error("Owned renderer disconnected during startup"))
+                  return
+                }
+                if (activeSession !== created) return
+                const emulator = created.core.identity
+                void session.stop("Owned renderer disconnected", {
+                  rendererClosedEmulator: emulator,
+                }).catch(reportFatal)
+              },
+            },
             logger: { log: (message) => process.stderr.write(`${message}\n`) },
           })
           throwIfShuttingDown()
@@ -1664,20 +1738,45 @@ export const runStdio = async (options = {}) => {
           }
           if (shutdownController.signal.aborted) throw shutdownController.signal.reason
 
-          const created = { core, renderer, controller: sessionController }
+          created = { core, renderer, controller: sessionController }
           activeSession = created
+          lifecycleState = {
+            ...lifecycleState,
+            state: "active",
+            reason: null,
+            cleanup: null,
+            emulator: core.identity,
+          }
           void renderer.exited.then((outcome) => {
-            if (activeSession !== created || stopping) return
+            if (activeSession !== created || stopping || stoppingSession) return
             process.stderr.write(`Apple2TS MCP renderer exited unexpectedly (${renderer.describeExit(outcome)}).\n`)
             void session.stop("Owned Chromium exited unexpectedly").catch(reportFatal)
           })
           return { emulator: core.identity }
         } catch (error) {
+          const cleanupFailures = []
           sessionController.abort(error)
-          await core?.neutralizeKeyboard().catch(() => {})
-          if (core) await Promise.resolve(core.cleanupStagedFiles()).catch(() => {})
-          await renderer?.stop().catch(() => {})
-          await stopApple2tsServer().catch(() => {})
+          await core?.neutralizeKeyboard().catch((failure) => cleanupFailures.push(failure))
+          if (core) {
+            await Promise.resolve(core.cleanupStagedFiles()).catch((failure) => cleanupFailures.push(failure))
+          }
+          await renderer?.stop().catch((failure) => cleanupFailures.push(failure))
+          await stopApple2tsServer().catch((failure) => cleanupFailures.push(failure))
+          if (rendererDisconnected && core) {
+            await session.reportRendererClosed(
+              core.identity,
+              cleanupFailures.length ? "failed" : "complete",
+            ).catch((failure) => cleanupFailures.push(failure))
+          }
+          if (cleanupFailures.length) {
+            const details = cleanupFailures
+              .map((failure) => failure instanceof Error ? failure.message : String(failure))
+              .join("; ")
+            throw new AggregateError(
+              [error, ...cleanupFailures],
+              `${error instanceof Error ? error.message : String(error)}; session cleanup failed: ${details}`,
+            )
+          }
           throw error
         }
       })().finally(() => {
@@ -1685,7 +1784,7 @@ export const runStdio = async (options = {}) => {
       })
       return startingSession
     },
-    async stop(reason) {
+    async stop(reason, { rendererClosedEmulator = null } = {}) {
       if (stoppingSession) return stoppingSession
       stoppingSession = (async () => {
         if (startingSession) await startingSession.catch(() => {})
@@ -1698,6 +1797,24 @@ export const runStdio = async (options = {}) => {
         await current.renderer.stop().catch((error) => failures.push(error))
         await stopApple2tsServer().catch((error) => failures.push(error))
         if (activeSession === current) activeSession = null
+        if (rendererClosedEmulator) {
+          lifecycleState = {
+            sequence: lifecycleState.sequence + 1,
+            state: "closed",
+            reason: "renderer_closed",
+            cleanup: failures.length ? "failed" : "complete",
+            emulator: rendererClosedEmulator,
+          }
+          await lifecycleNotifier?.().catch((error) => failures.push(error))
+        } else {
+          lifecycleState = {
+            ...lifecycleState,
+            state: "idle",
+            reason: "stopped",
+            cleanup: failures.length ? "failed" : "complete",
+            emulator: null,
+          }
+        }
         if (failures.length) throw new AggregateError(failures, "Apple2TS MCP session cleanup failed")
         return { stopped: true }
       })().finally(() => {
