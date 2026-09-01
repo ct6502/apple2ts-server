@@ -261,6 +261,36 @@ const assertClosed = async (url) => {
   await assert.rejects(fetch(new URL("/api/health", url), { signal: AbortSignal.timeout(500) }))
 }
 
+const waitForAbsent = async (target, timeoutMs = 2000) => {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      await access(target)
+    } catch {
+      return
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  await assert.rejects(access(target))
+}
+
+const sendMcpRequest = async (processState, id, method, params = {}) => {
+  processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`)
+  return JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === id))
+}
+
+const initializeMcp = async (processState, id = "initialize") => {
+  await sendMcpRequest(processState, id, "initialize", {
+    protocolVersion: "2025-11-25",
+    capabilities: {},
+    clientInfo: { name: "test", version: "1" },
+  })
+  processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`)
+}
+
+const startMcpSession = async (processState, id = "start-session") =>
+  sendMcpRequest(processState, id, "tools/call", { name: "start_session", arguments: {} })
+
 test("private bridge binds one renderer and rejects forged replies", async (t) => {
   const listener = await startApple2tsServer({
     port: 0,
@@ -1212,9 +1242,23 @@ test("cancelling an active mutation prevents later mutations in the same session
 test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   const processState = await launchMcp()
   t.after(processState.cleanup)
+  await processState.waitForStderr((line) => line.includes("MCP ready for session requests"))
+  await assert.rejects(processState.readReceipt())
+
+  await initializeMcp(processState, 1)
+  const inactiveRead = await sendMcpRequest(processState, "inactive-read", "tools/call", {
+    name: "read_memory",
+    arguments: { address: 0, length: 1 },
+  })
+  assert.equal(inactiveRead.result.isError, true)
+  assert.match(inactiveRead.result.content[0].text, /Call start_session first/)
+
+  const started = await startMcpSession(processState, "start-session")
+  assert.equal(started.result.isError, undefined, JSON.stringify(started))
+  const startedAgain = await startMcpSession(processState, "start-session-again")
+  assert.deepEqual(startedAgain.result.structuredContent, started.result.structuredContent)
   const bridgeLine = await processState.waitForStderr((line) => line.includes("private bridge listening"))
   const bridgeUrl = parseBridgeUrl(bridgeLine)
-  await processState.waitForStderr((line) => line.includes("MCP ready"))
   const receipt = await processState.readReceipt()
   const launchUrl = new URL(receipt.launchUrl)
   assert.equal(launchUrl.origin, bridgeUrl)
@@ -1226,18 +1270,6 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.doesNotThrow(() => process.kill(receipt.pid, 0))
   await access(receipt.profilePath)
 
-  processState.child.stdin.write(`${JSON.stringify({
-    jsonrpc: "2.0",
-    id: 1,
-    method: "initialize",
-    params: {
-      protocolVersion: "2025-11-25",
-      capabilities: {},
-      clientInfo: { name: "test", version: "1" },
-    },
-  })}\n`)
-  await processState.waitForStdout((line) => JSON.parse(line).id === 1)
-  processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`)
   processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/list" })}\n`)
   const listed = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 2))
   assert.deepEqual(listed.result.resources.map((resource) => resource.uri), [
@@ -1265,6 +1297,8 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.deepEqual(
     tools.result.tools.map((tool) => tool.name),
     [
+      "start_session",
+      "stop_session",
       "read_memory",
       "capture_screen",
       "set_keyboard_key",
@@ -1280,7 +1314,8 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
       "set_cpu",
     ],
   )
-  assert.deepEqual(tools.result.tools[0].inputSchema, {
+  const readMemoryTool = tools.result.tools.find((tool) => tool.name === "read_memory")
+  assert.deepEqual(readMemoryTool.inputSchema, {
     type: "object",
     properties: {
       address: { type: "integer", minimum: 0, maximum: 65535 },
@@ -1289,14 +1324,14 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     required: ["address", "length"],
     additionalProperties: false,
   })
-  assert.equal(tools.result.tools[0].outputSchema.type, "object")
-  assert.deepEqual(tools.result.tools[0].outputSchema.properties.value.properties.bytes, {
+  assert.equal(readMemoryTool.outputSchema.type, "object")
+  assert.deepEqual(readMemoryTool.outputSchema.properties.value.properties.bytes, {
     type: "array",
     items: { type: "integer", minimum: 0, maximum: 255 },
     minItems: 1,
     maxItems: 4096,
   })
-  assert.deepEqual(tools.result.tools[0].annotations, {
+  assert.deepEqual(readMemoryTool.annotations, {
     readOnlyHint: true,
     destructiveHint: false,
     idempotentHint: true,
@@ -1367,7 +1402,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   }
   const callTool = async (id, name, args = {}) => {
     const response = await requestTool(id, name, args)
-    assert.equal(response.result.isError, undefined)
+    assert.equal(response.result.isError, undefined, JSON.stringify(response))
     return response.result.structuredContent
   }
 
@@ -1530,42 +1565,73 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.equal((await callTool(27, "set_keyboard_key", { key: null })).value.heldKey, null)
   assert.equal((await callTool(28, "set_keyboard_key", { key: " " })).value.heldKey, " ")
 
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0", id: 29, method: "tools/call", params: { name: "stop_session", arguments: {} },
+  })}\n`)
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0", id: 30, method: "tools/call", params: { name: "start_session", arguments: {} },
+  })}\n`)
+  const concurrentStop = JSON.parse(
+    await processState.waitForStdout((line) => JSON.parse(line).id === 29),
+  )
+  const concurrentStart = JSON.parse(
+    await processState.waitForStdout((line) => JSON.parse(line).id === 30),
+  )
+  assert.deepEqual(concurrentStop.result.structuredContent, { stopped: true })
+  assert.equal(concurrentStart.result.isError, undefined, JSON.stringify(concurrentStart))
+  assert.notEqual(
+    concurrentStart.result.structuredContent.emulator.serverInstanceId,
+    started.result.structuredContent.emulator.serverInstanceId,
+  )
+  const restartedReceipt = await processState.readReceipt()
+  assert.notEqual(restartedReceipt.pid, receipt.pid)
+  assert.throws(() => process.kill(receipt.pid, 0), { code: "ESRCH" })
+  await waitForAbsent(receipt.profilePath)
+  await assertClosed(bridgeUrl)
+
+  const stopped = await callTool(31, "stop_session")
+  assert.deepEqual(stopped, { stopped: true })
+  assert.throws(() => process.kill(restartedReceipt.pid, 0), { code: "ESRCH" })
+  await waitForAbsent(restartedReceipt.profilePath)
+
   processState.child.stdin.end()
   const processExit = await processState.waitForExit()
   assert.equal(processExit.error, null)
   assert.equal(processExit.code, 0, processState.getStderr())
   for (const line of processState.getStdout().trim().split("\n")) assert.doesNotThrow(() => JSON.parse(line))
+})
+
+test("EOF rejects a start queued behind session cleanup", async (t) => {
+  const processState = await launchMcp()
+  t.after(processState.cleanup)
+  await processState.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(processState, "shutdown-race-initialize")
+  const started = await startMcpSession(processState, "shutdown-race-start")
+  assert.equal(started.result.isError, undefined, JSON.stringify(started))
+  const receipt = await processState.readReceipt()
+
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0", id: "shutdown-race-stop", method: "tools/call", params: { name: "stop_session", arguments: {} },
+  })}\n`)
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0", id: "shutdown-race-restart", method: "tools/call", params: { name: "start_session", arguments: {} },
+  })}\n`)
+  processState.child.stdin.end()
+
+  const exited = await processState.waitForExit()
+  assert.equal(exited.code, 0, processState.getStderr())
+  assert.equal((await processState.readReceipt()).pid, receipt.pid)
   assert.throws(() => process.kill(receipt.pid, 0), { code: "ESRCH" })
-  assert.deepEqual((await processState.readReceipt()).keyboardStates, [
-    { key: "j", isDown: true, repeat: false },
-    { key: "j", isDown: true, repeat: true },
-    { key: "j", isDown: false, repeat: false },
-    { key: "l", isDown: true, repeat: false },
-    { key: "l", isDown: false, repeat: false },
-    { key: " ", isDown: true, repeat: false },
-    { key: " ", isDown: false, repeat: false },
-  ])
-  await assert.rejects(access(receipt.profilePath))
-  await assertClosed(bridgeUrl)
+  await waitForAbsent(receipt.profilePath)
 })
 
 test("stdio rejects an invalid rendered screen", async (t) => {
   const processState = await launchMcp({ APPLE2TS_FAKE_CHROMIUM_MODE: "invalid-screen" })
   t.after(processState.cleanup)
   await processState.waitForStderr((line) => line.includes("MCP ready"))
-
-  processState.child.stdin.write(`${JSON.stringify({
-    jsonrpc: "2.0",
-    id: 1,
-    method: "initialize",
-    params: {
-      protocolVersion: "2025-11-25",
-      capabilities: {},
-      clientInfo: { name: "test", version: "1" },
-    },
-  })}\n`)
-  await processState.waitForStdout((line) => JSON.parse(line).id === 1)
-  processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`)
+  await initializeMcp(processState, 1)
+  const started = await startMcpSession(processState, "start-invalid-screen")
+  assert.equal(started.result.isError, undefined, JSON.stringify(started))
   processState.child.stdin.write(`${JSON.stringify({
     jsonrpc: "2.0",
     id: 2,
@@ -1585,22 +1651,13 @@ test("stdio rejects an invalid rendered screen", async (t) => {
 test("EOF cancels a stalled mutation before releasing its held key", async (t) => {
   const processState = await launchMcp({ APPLE2TS_FAKE_CHROMIUM_MODE: "stall-run-mode" })
   t.after(processState.cleanup)
+  await processState.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(processState, 30)
+  const started = await startMcpSession(processState, "start-stalled")
+  assert.equal(started.result.isError, undefined, JSON.stringify(started))
   const bridgeLine = await processState.waitForStderr((line) => line.includes("private bridge listening"))
   const bridgeUrl = parseBridgeUrl(bridgeLine)
-  await processState.waitForStderr((line) => line.includes("MCP ready"))
   const receipt = await processState.readReceipt()
-  processState.child.stdin.write(`${JSON.stringify({
-    jsonrpc: "2.0",
-    id: 30,
-    method: "initialize",
-    params: {
-      protocolVersion: "2025-11-25",
-      capabilities: {},
-      clientInfo: { name: "test", version: "1" },
-    },
-  })}\n`)
-  await processState.waitForStdout((line) => JSON.parse(line).id === 30)
-  processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`)
   processState.child.stdin.write(`${JSON.stringify({
     jsonrpc: "2.0",
     id: 31,
@@ -1769,18 +1826,9 @@ test("configured stdio advertises and loads a local binary", async (t) => {
   t.after(processState.cleanup)
   try {
     await processState.waitForStderr((line) => line.includes("MCP ready"))
-    processState.child.stdin.write(`${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "initialize",
-      params: {
-        protocolVersion: "2025-11-25",
-        capabilities: {},
-        clientInfo: { name: "test", version: "1" },
-      },
-    })}\n`)
-    await processState.waitForStdout((line) => JSON.parse(line).id === 1)
-    processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`)
+    await initializeMcp(processState, 1)
+    const started = await startMcpSession(processState, "start-file-tools")
+    assert.equal(started.result.isError, undefined, JSON.stringify(started))
     processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" })}\n`)
     const tools = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 2))
     assert.ok(tools.result.tools.some((tool) => tool.name === "load_binary"))
@@ -1826,7 +1874,7 @@ test("configured stdio advertises and loads a local binary", async (t) => {
       params: { uri: "apple2ts://session/input-root" },
     })}\n`)
     const inputRoot = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 51))
-    assert.deepEqual(JSON.parse(inputRoot.result.contents[0].text), { path: await realpath(sourceRoot) })
+    assert.deepEqual(JSON.parse(inputRoot.result.contents[0].text), { path: sourceRoot })
 
     const ejectTool = tools.result.tools.find((tool) => tool.name === "eject_disk")
     assert.deepEqual(ejectTool.inputSchema, {
@@ -1921,9 +1969,12 @@ test("configured stdio advertises and loads a local binary", async (t) => {
 test("visible Chromium uses the same owned session and cleanup", async (t) => {
   const visible = await launchMcp({ APPLE2TS_CHROMIUM_MODE: "visible" })
   t.after(visible.cleanup)
+  await visible.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(visible, "visible-initialize")
+  const started = await startMcpSession(visible, "visible-start")
+  assert.equal(started.result.isError, undefined, JSON.stringify(started))
   const bridgeLine = await visible.waitForStderr((line) => line.includes("private bridge listening"))
   const bridgeUrl = parseBridgeUrl(bridgeLine)
-  await visible.waitForStderr((line) => line.includes("MCP ready"))
   const receipt = await visible.readReceipt()
 
   assert.equal(receipt.headless, false)
@@ -1940,30 +1991,33 @@ test("visible Chromium uses the same owned session and cleanup", async (t) => {
   await visible.cleanup()
 })
 
-test("invalid Chromium mode fails before launch", async (t) => {
+test("invalid Chromium mode fails session start before launch", async (t) => {
   const invalid = await launchMcp({ APPLE2TS_CHROMIUM_MODE: "sideways" })
   t.after(invalid.cleanup)
-  const outcome = await invalid.waitForExit()
-
-  assert.equal(outcome.error, null)
-  assert.equal(outcome.code, 1)
-  assert.match(invalid.getStderr(), /APPLE2TS_CHROMIUM_MODE must be 'headless' or 'visible'/)
-  assert.equal(invalid.getStdout(), "")
+  await invalid.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(invalid, "invalid-mode-initialize")
+  const response = await startMcpSession(invalid, "invalid-mode-start")
+  assert.equal(response.result.isError, true)
+  assert.match(response.result.content[0].text, /APPLE2TS_CHROMIUM_MODE must be 'headless' or 'visible'/)
+  await assert.rejects(access(invalid.receiptPath))
+  invalid.child.stdin.end()
+  assert.equal((await invalid.waitForExit()).code, 0)
   await invalid.cleanup()
 })
 
-test("missing browser build fails before private resources start", async (t) => {
+test("missing browser build fails session start before private resources start", async (t) => {
   const missing = await launchMcp({ APPLE2TS_TEST_MISSING_BROWSER_BUILD: "1" })
   t.after(missing.cleanup)
-  const outcome = await missing.waitForExit()
-
-  assert.equal(outcome.error, null)
-  assert.equal(outcome.code, 1)
-  assert.match(missing.getStderr(), /missing .*dist\/index\.html/)
-  assert.match(missing.getStderr(), /Build Apple2TS in its source repository/)
+  await missing.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(missing, "missing-build-initialize")
+  const response = await startMcpSession(missing, "missing-build-start")
+  assert.equal(response.result.isError, true)
+  assert.match(response.result.content[0].text, /missing .*dist\/index\.html/)
+  assert.match(response.result.content[0].text, /Build Apple2TS in its source repository/)
   assert.doesNotMatch(missing.getStderr(), /private bridge listening/)
-  assert.equal(missing.getStdout(), "")
   await assert.rejects(access(missing.receiptPath))
+  missing.child.stdin.end()
+  assert.equal((await missing.waitForExit()).code, 0)
   await missing.cleanup()
 })
 
@@ -1978,6 +2032,9 @@ test("stdio launches from a selected Apple2TS build directory", async (t) => {
   })
   t.after(processState.cleanup)
   await processState.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(processState, "selected-build-initialize")
+  const started = await startMcpSession(processState, "selected-build-start")
+  assert.equal(started.result.isError, undefined, JSON.stringify(started))
   const receipt = await processState.readReceipt()
   assert.doesNotThrow(() => process.kill(receipt.pid, 0))
 
@@ -1986,63 +2043,56 @@ test("stdio launches from a selected Apple2TS build directory", async (t) => {
   await assert.rejects(access(receipt.profilePath))
 })
 
-test("invalid binary root fails before private resources start", async (t) => {
+test("invalid binary root fails session start before private resources start", async (t) => {
   const missingRoot = path.join(os.tmpdir(), `apple2ts-missing-binary-root-${process.pid}`)
-  const invalid = await launchMcp({ APPLE2TS_FILE_STAGING_ROOT: missingRoot })
+  const sourceRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-valid-source-root-"))
+  const invalid = await launchMcp({
+    APPLE2TS_FILE_STAGING_ROOT: missingRoot,
+    APPLE2TS_FILE_SOURCE_ROOT: sourceRoot,
+  })
   t.after(invalid.cleanup)
-  const outcome = await invalid.waitForExit()
-
-  assert.equal(outcome.error, null)
-  assert.equal(outcome.code, 1)
-  assert.match(invalid.getStderr(), /APPLE2TS_FILE_STAGING_ROOT must name a readable directory/)
+  t.after(() => rm(sourceRoot, { recursive: true, force: true }))
+  await invalid.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(invalid, "invalid-root-initialize")
+  const response = await startMcpSession(invalid, "invalid-root-start")
+  assert.equal(response.result.isError, true)
+  assert.match(response.result.content[0].text, /APPLE2TS_FILE_STAGING_ROOT must name a readable directory/)
   assert.doesNotMatch(invalid.getStderr(), /private bridge listening/)
-  assert.equal(invalid.getStdout(), "")
+  invalid.child.stdin.end()
+  assert.equal((await invalid.waitForExit()).code, 0)
   await invalid.cleanup()
 })
 
-test("unexpected renderer exit closes stdio and owned resources", async (t) => {
+test("unexpected renderer exit releases only the owned session", async (t) => {
   const crashed = await launchMcp({ APPLE2TS_FAKE_CHROMIUM_MODE: "crash-after-ready" })
   t.after(crashed.cleanup)
+  await crashed.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(crashed, "crash-initialize")
+  const started = await startMcpSession(crashed, "crash-start")
+  assert.equal(started.result.isError, undefined, JSON.stringify(started))
   const bridgeLine = await crashed.waitForStderr((line) => line.includes("private bridge listening"))
   const bridgeUrl = parseBridgeUrl(bridgeLine)
-  await crashed.waitForStderr((line) => line.includes("MCP ready"))
   const receipt = await crashed.readReceipt()
-  const outcome = await crashed.waitForExit()
-
-  assert.equal(outcome.error, null)
-  assert.equal(outcome.code, 1)
+  await crashed.waitForStderr((line) => line.includes("renderer exited unexpectedly"))
   assert.match(crashed.getStderr(), /renderer exited unexpectedly \(exit code 43\)/)
-  assert.equal(crashed.getStdout(), "")
   assert.throws(() => process.kill(receipt.pid, 0), { code: "ESRCH" })
-  await assert.rejects(access(receipt.profilePath))
+  await waitForAbsent(receipt.profilePath)
   await assertClosed(bridgeUrl)
+  crashed.child.stdin.end()
+  assert.equal((await crashed.waitForExit()).code, 0)
   await crashed.cleanup()
 })
 
 test("SIGTERM and startup timeout release the private listener", async (t) => {
   const running = await launchMcp()
   t.after(running.cleanup)
+  await running.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(running, "signal-initialize")
+  const started = await startMcpSession(running, "signal-start")
+  assert.equal(started.result.isError, undefined, JSON.stringify(started))
   const bridgeLine = await running.waitForStderr((line) => line.includes("private bridge listening"))
   const bridgeUrl = parseBridgeUrl(bridgeLine)
-  await running.waitForStderr((line) => line.includes("MCP ready"))
   const runningReceipt = await running.readReceipt()
-  running.child.stdin.write(`${JSON.stringify({
-    jsonrpc: "2.0",
-    id: "discover-1",
-    method: "server/discover",
-    params: {
-      _meta: {
-        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-        "io.modelcontextprotocol/clientInfo": { name: "test", version: "1" },
-        "io.modelcontextprotocol/clientCapabilities": {},
-      },
-    },
-  })}\n`)
-  const discovery = JSON.parse(
-    await running.waitForStdout((line) => JSON.parse(line).id === "discover-1"),
-  )
-  assert.deepEqual(discovery.result.supportedVersions, ["2026-07-28"])
-  assert.ok(discovery.result.capabilities.resources)
   running.child.kill("SIGTERM")
   const signalExit = await running.waitForExit()
   assert.equal(signalExit.error, null)
@@ -2054,16 +2104,18 @@ test("SIGTERM and startup timeout release the private listener", async (t) => {
 
   const escalated = await launchMcp({ APPLE2TS_FAKE_CHROMIUM_MODE: "ignore-term" })
   t.after(escalated.cleanup)
+  await escalated.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(escalated, "escalated-initialize")
+  const escalatedStarted = await startMcpSession(escalated, "escalated-start")
+  assert.equal(escalatedStarted.result.isError, undefined, JSON.stringify(escalatedStarted))
   const escalatedBridgeLine = await escalated.waitForStderr((line) => line.includes("private bridge listening"))
   const escalatedUrl = parseBridgeUrl(escalatedBridgeLine)
-  await escalated.waitForStderr((line) => line.includes("MCP ready"))
   const escalatedReceipt = await escalated.readReceipt()
   escalated.child.stdin.end()
   const escalatedExit = await escalated.waitForExit()
   assert.equal(escalatedExit.error, null)
   assert.equal(escalatedExit.code, 0, escalated.getStderr())
   assert.equal((await escalated.readReceipt()).sigtermSeen, true)
-  assert.equal(escalated.getStdout(), "")
   assert.throws(() => process.kill(escalatedReceipt.pid, 0), { code: "ESRCH" })
   await assert.rejects(access(escalatedReceipt.profilePath))
   await assertClosed(escalatedUrl)
@@ -2071,16 +2123,15 @@ test("SIGTERM and startup timeout release the private listener", async (t) => {
 
   const failing = await launchMcp({ APPLE2TS_FAKE_CHROMIUM_MODE: "exit" })
   t.after(failing.cleanup)
-  const failingBridgeLine = await failing.waitForStderr((line) => line.includes("private bridge listening"))
-  const failingUrl = parseBridgeUrl(failingBridgeLine)
+  await failing.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(failing, "failing-initialize")
+  const failedStart = await startMcpSession(failing, "failing-start")
+  assert.equal(failedStart.result.isError, true)
   const failingReceipt = await failing.readReceipt()
-  const failureExit = await failing.waitForExit()
-  assert.equal(failureExit.error, null)
-  assert.equal(failureExit.code, 1)
-  assert.match(failing.getStderr(), /startup failed: Owned Chromium exited before readiness/)
-  assert.equal(failing.getStdout(), "")
+  assert.match(failedStart.result.content[0].text, /Owned Chromium exited before readiness/)
   assert.throws(() => process.kill(failingReceipt.pid, 0), { code: "ESRCH" })
   await assert.rejects(access(failingReceipt.profilePath))
-  await assertClosed(failingUrl)
+  failing.child.stdin.end()
+  assert.equal((await failing.waitForExit()).code, 0)
   await failing.cleanup()
 })

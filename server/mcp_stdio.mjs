@@ -109,6 +109,20 @@ const emulatorIdentitySchema = {
   additionalProperties: false,
 }
 
+const sessionStartResultSchema = fromJsonSchema({
+  type: "object",
+  properties: { emulator: emulatorIdentitySchema },
+  required: ["emulator"],
+  additionalProperties: false,
+})
+
+const sessionStopResultSchema = fromJsonSchema({
+  type: "object",
+  properties: { stopped: { type: "boolean" } },
+  required: ["stopped"],
+  additionalProperties: false,
+})
+
 const driveReceiptSchema = {
   type: "object",
   properties: {
@@ -907,7 +921,7 @@ const mutationTools = [
     outputSchema: fileStageResultSchema,
     destructiveHint: false,
     idempotentHint: true,
-    enabled: (core) => Boolean(core.fileStager),
+    enabled: (session) => session.fileStagingConfigured,
     execute: (core, input) => core.stageFile(input),
   },
   {
@@ -928,7 +942,7 @@ const mutationTools = [
     outputSchema: driveResultSchema,
     destructiveHint: true,
     idempotentHint: false,
-    enabled: (core) => Boolean(core.fileStager),
+    enabled: (session) => session.fileStagingConfigured,
     execute: (core, input, signal) => core.mountDisk(input, signal),
   },
   {
@@ -1046,8 +1060,9 @@ const screenCaptureResult = ({ dataBase64, ...result }) => ({
   structuredContent: result,
 })
 
-export const createMcpServer = (core) => {
+export const createMcpServer = (session) => {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION })
+  const core = () => session.requireCore()
 
   const resources = [
     {
@@ -1055,52 +1070,52 @@ export const createMcpServer = (core) => {
       uri: "apple2ts://machine",
       title: "Apple2TS machine state",
       description: "Current state of the emulator bound to this process.",
-      read: () => core.readMachine(),
+      read: () => core().readMachine(),
     },
     {
       name: "cpu",
       uri: "apple2ts://cpu",
       title: "Apple2TS CPU state",
       description: "Current CPU state of the emulator bound to this process.",
-      read: () => core.readCpu(),
+      read: () => core().readCpu(),
     },
     {
       name: "breakpoints",
       uri: "apple2ts://debugger/breakpoints",
       title: "Apple2TS breakpoints",
       description: "Current breakpoints for the emulator bound to this process.",
-      read: () => core.readBreakpoints(),
+      read: () => core().readBreakpoints(),
     },
     {
       name: "drives",
       uri: "apple2ts://disks/current",
       title: "Apple2TS drives",
       description: "Current drives and mounted media for the emulator bound to this process.",
-      read: () => core.readDrives(),
+      read: () => core().readDrives(),
     },
     {
       name: "soft-switches",
       uri: "apple2ts://system/softswitches",
       title: "Apple2TS soft switches",
       description: "Current soft-switch state for the emulator bound to this process.",
-      read: () => core.readSoftSwitches(),
+      read: () => core().readSoftSwitches(),
     },
     {
       name: "text-screen",
       uri: "apple2ts://video/text",
       title: "Apple2TS text screen",
       description: "Current Apple II text screen for the emulator bound to this process.",
-      read: () => core.readTextScreen(),
+      read: () => core().readTextScreen(),
     },
   ]
 
-  if (core.fileStager) {
+  if (session.fileStagingConfigured) {
     resources.push({
       name: "task-input-root",
       uri: "apple2ts://session/input-root",
       title: "Apple2TS task input folder",
       description: "Folder where this MCP session accepts files for stage_file.",
-      read: () => ({ path: core.fileStager.sourceRoot }),
+      read: () => ({ path: session.fileSourceRoot }),
     })
   }
 
@@ -1124,6 +1139,58 @@ export const createMcpServer = (core) => {
   }
 
   server.registerTool(
+    "start_session",
+    {
+      title: "Start Apple2TS session",
+      description: "Start the private emulator session owned by this MCP process.",
+      inputSchema: noInputSchema,
+      outputSchema: sessionStartResultSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async () => {
+      try {
+        return toolResult(await session.start())
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+        }
+      }
+    },
+  )
+
+  server.registerTool(
+    "stop_session",
+    {
+      title: "Stop Apple2TS session",
+      description: "Stop the private emulator session owned by this MCP process.",
+      inputSchema: noInputSchema,
+      outputSchema: sessionStopResultSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async () => {
+      try {
+        return toolResult(await session.stop("MCP client stopped session"))
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+        }
+      }
+    },
+  )
+
+  server.registerTool(
     "read_memory",
     {
       title: "Read Apple II memory",
@@ -1139,7 +1206,7 @@ export const createMcpServer = (core) => {
     },
     async (input) => {
       try {
-        return toolResult(await core.readMemory(input))
+        return toolResult(await core().readMemory(input))
       } catch (error) {
         return {
           isError: true,
@@ -1165,7 +1232,7 @@ export const createMcpServer = (core) => {
     },
     async () => {
       try {
-        return screenCaptureResult(await core.captureScreen())
+        return screenCaptureResult(await core().captureScreen())
       } catch (error) {
         return {
           isError: true,
@@ -1175,7 +1242,7 @@ export const createMcpServer = (core) => {
     },
   )
 
-  if (core.fileStager) {
+  if (session.fileStagingConfigured) {
     server.registerTool(
       "load_binary",
       {
@@ -1192,7 +1259,7 @@ export const createMcpServer = (core) => {
       },
       async (input, context) => {
         try {
-          return toolResult(await core.loadBinary(input, context.mcpReq.signal))
+          return toolResult(await core().loadBinary(input, context.mcpReq.signal))
         } catch (error) {
           return {
             isError: true,
@@ -1204,7 +1271,7 @@ export const createMcpServer = (core) => {
   }
 
   for (const tool of mutationTools) {
-    if (tool.enabled && !tool.enabled(core)) continue
+    if (tool.enabled && !tool.enabled(session)) continue
     server.registerTool(
       tool.name,
       {
@@ -1219,7 +1286,7 @@ export const createMcpServer = (core) => {
           openWorldHint: false,
         },
       },
-      async (input, context) => toolResult(await tool.execute(core, input, context.mcpReq.signal)),
+      async (input, context) => toolResult(await tool.execute(core(), input, context.mcpReq.signal)),
     )
   }
 
@@ -1360,29 +1427,150 @@ const launchChromium = async ({ executable, bridgeUrl, remoteControlToken, rende
 
 export const runStdio = async (options = {}) => {
   const shutdownController = new AbortController()
-  const remoteControlToken = options.remoteControlToken || randomBytes(32).toString("base64url")
-  const controllerToken = options.controllerToken || randomBytes(32).toString("base64url")
-  const rendererId = options.rendererId || randomUUID()
-  const startupTimeoutMs = Number(options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS)
   let stdioHandle = null
-  let listenerPromise = Promise.resolve()
-  let rendererPromise = Promise.resolve(null)
-  let ownedRenderer = null
-  let core = null
   let stopping = null
+  let activeSession = null
+  let startingSession = null
+  let stoppingSession = null
+  const throwIfShuttingDown = () => {
+    if (shutdownController.signal.aborted) throw shutdownController.signal.reason
+  }
+
+  const session = {
+    fileStagingConfigured: Boolean(options.fileStagingRoot && options.fileSourceRoot),
+    fileSourceRoot: options.fileSourceRoot,
+    requireCore() {
+      if (!activeSession) throw new Error("No active Apple2TS session. Call start_session first.")
+      return activeSession.core
+    },
+    async start() {
+      throwIfShuttingDown()
+      if (stoppingSession) await stoppingSession
+      throwIfShuttingDown()
+      if (activeSession) return { emulator: activeSession.core.identity }
+      if (startingSession) return startingSession
+
+      startingSession = (async () => {
+        throwIfShuttingDown()
+        if (!options.chromiumExecutable) throw new Error("APPLE2TS_CHROMIUM_EXECUTABLE is required")
+        const binaryRoot = await resolveBinaryRoot(options.fileStagingRoot, "APPLE2TS_FILE_STAGING_ROOT")
+        const fileSourceRoot = await resolveBinaryRoot(options.fileSourceRoot, "APPLE2TS_FILE_SOURCE_ROOT")
+        throwIfShuttingDown()
+        if (binaryRoot && fileSourceRoot) {
+          try {
+            await access(binaryRoot, fsConstants.W_OK | fsConstants.X_OK)
+          } catch {
+            throw new Error("APPLE2TS_FILE_STAGING_ROOT must be writable when file staging is configured")
+          }
+        }
+        const chromiumMode = options.chromiumMode ?? "headless"
+        if (chromiumMode !== "headless" && chromiumMode !== "visible") {
+          throw new Error("APPLE2TS_CHROMIUM_MODE must be 'headless' or 'visible'")
+        }
+        const distDir = resolveBrowserBuildDir(options.distDir)
+        const browserBuildAvailable = options.hasBrowserBuild || hasBrowserBuild
+        if (options.requireBrowserBuild !== false && !(await browserBuildAvailable(distDir))) {
+          throw new Error(getMissingBrowserBuildMessage(distDir))
+        }
+        throwIfShuttingDown()
+
+        const remoteControlToken = options.remoteControlToken || randomBytes(32).toString("base64url")
+        const controllerToken = options.controllerToken || randomBytes(32).toString("base64url")
+        const rendererId = options.rendererId || randomUUID()
+        const sessionController = new AbortController()
+        let listener = null
+        let renderer = null
+        let core = null
+        try {
+          listener = await startApple2tsServer({
+            host: "127.0.0.1",
+            port: Number(options.port ?? 0),
+            distDir,
+            privateRenderer: { remoteControlToken, rendererId, controllerToken },
+            logger: { log: (message) => process.stderr.write(`${message}\n`) },
+          })
+          throwIfShuttingDown()
+          core = new Apple2tsCore(
+            listener.url,
+            controllerToken,
+            {
+              serverInstanceId: listener.serverInstanceId,
+              rendererId,
+              targetId: `${listener.serverInstanceId}:${rendererId}`,
+            },
+            sessionController.signal,
+            binaryRoot,
+            binaryRoot && fileSourceRoot ? new FileStager(fileSourceRoot, binaryRoot) : null,
+          )
+          renderer = await launchChromium({
+            executable: options.chromiumExecutable,
+            bridgeUrl: listener.url,
+            remoteControlToken,
+            rendererId,
+            mode: chromiumMode,
+          })
+          throwIfShuttingDown()
+          process.stderr.write(`Apple2TS MCP private bridge listening at ${listener.url}; waiting for renderer ${rendererId}.\n`)
+          const startupTimeoutMs = Number(options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS)
+          const startup = await Promise.race([
+            waitForRenderer(core, startupTimeoutMs, sessionController.signal).then(() => ({ ready: true })),
+            renderer.exited.then((outcome) => ({ ready: false, outcome })),
+          ])
+          if (!startup.ready) {
+            throw new Error(`Owned Chromium exited before readiness (${renderer.describeExit(startup.outcome)})`)
+          }
+          if (shutdownController.signal.aborted) throw shutdownController.signal.reason
+
+          const created = { core, renderer, controller: sessionController }
+          activeSession = created
+          void renderer.exited.then((outcome) => {
+            if (activeSession !== created || stopping) return
+            process.stderr.write(`Apple2TS MCP renderer exited unexpectedly (${renderer.describeExit(outcome)}).\n`)
+            void session.stop("Owned Chromium exited unexpectedly").catch(reportFatal)
+          })
+          return { emulator: core.identity }
+        } catch (error) {
+          sessionController.abort(error)
+          await core?.neutralizeKeyboard().catch(() => {})
+          if (core) await Promise.resolve(core.cleanupStagedFiles()).catch(() => {})
+          await renderer?.stop().catch(() => {})
+          await stopApple2tsServer().catch(() => {})
+          throw error
+        }
+      })().finally(() => {
+        startingSession = null
+      })
+      return startingSession
+    },
+    async stop(reason) {
+      if (stoppingSession) return stoppingSession
+      stoppingSession = (async () => {
+        if (startingSession) await startingSession.catch(() => {})
+        if (!activeSession) return { stopped: false }
+        const current = activeSession
+        const failures = []
+        current.controller.abort(new Error(reason))
+        await current.core.neutralizeKeyboard().catch((error) => failures.push(error))
+        await Promise.resolve(current.core.cleanupStagedFiles()).catch((error) => failures.push(error))
+        await current.renderer.stop().catch((error) => failures.push(error))
+        await stopApple2tsServer().catch((error) => failures.push(error))
+        if (activeSession === current) activeSession = null
+        if (failures.length) throw new AggregateError(failures, "Apple2TS MCP session cleanup failed")
+        return { stopped: true }
+      })().finally(() => {
+        stoppingSession = null
+      })
+      return stoppingSession
+    },
+  }
 
   const shutdown = (reason) => {
     if (stopping) return stopping
     stopping = (async () => {
       const failures = []
       shutdownController.abort(new Error(reason))
-      await core?.neutralizeKeyboard().catch((error) => failures.push(error))
-      await core?.cleanupStagedFiles().catch((error) => failures.push(error))
-      await listenerPromise.catch(() => {})
-      ownedRenderer ||= await rendererPromise.catch(() => null)
+      await session.stop(reason).catch((error) => failures.push(error))
       await stdioHandle?.close().catch((error) => failures.push(error))
-      await ownedRenderer?.stop().catch((error) => failures.push(error))
-      await stopApple2tsServer().catch((error) => failures.push(error))
       process.stdin.off("end", onStdinEnd)
       process.stdin.off("close", onStdinEnd)
       process.stdin.pause()
@@ -1407,75 +1595,10 @@ export const runStdio = async (options = {}) => {
   process.once("SIGTERM", onSigterm)
 
   try {
-    if (!options.chromiumExecutable) throw new Error("APPLE2TS_CHROMIUM_EXECUTABLE is required")
-    const binaryRoot = await resolveBinaryRoot(options.fileStagingRoot, "APPLE2TS_FILE_STAGING_ROOT")
-    const fileSourceRoot = await resolveBinaryRoot(options.fileSourceRoot, "APPLE2TS_FILE_SOURCE_ROOT")
-    if (binaryRoot && fileSourceRoot) {
-      try {
-        await access(binaryRoot, fsConstants.W_OK | fsConstants.X_OK)
-      } catch {
-        throw new Error("APPLE2TS_FILE_STAGING_ROOT must be writable when file staging is configured")
-      }
-    }
-    const distDir = resolveBrowserBuildDir(options.distDir)
-    const chromiumMode = options.chromiumMode ?? "headless"
-    if (chromiumMode !== "headless" && chromiumMode !== "visible") {
-      throw new Error("APPLE2TS_CHROMIUM_MODE must be 'headless' or 'visible'")
-    }
-    const browserBuildAvailable = options.hasBrowserBuild || hasBrowserBuild
-    if (options.requireBrowserBuild !== false && !(await browserBuildAvailable(distDir))) {
-      throw new Error(getMissingBrowserBuildMessage(distDir))
-    }
-    listenerPromise = startApple2tsServer({
-      host: "127.0.0.1",
-      port: Number(options.port ?? 0),
-      distDir,
-      privateRenderer: { remoteControlToken, rendererId, controllerToken },
-      logger: { log: (message) => process.stderr.write(`${message}\n`) },
-    })
-    const listener = await listenerPromise
-    core = new Apple2tsCore(
-      listener.url,
-      controllerToken,
-      {
-        serverInstanceId: listener.serverInstanceId,
-        rendererId,
-        targetId: `${listener.serverInstanceId}:${rendererId}`,
-      },
-      shutdownController.signal,
-      binaryRoot,
-      binaryRoot && fileSourceRoot ? new FileStager(fileSourceRoot, binaryRoot) : null,
-    )
-    rendererPromise = launchChromium({
-      executable: options.chromiumExecutable,
-      bridgeUrl: listener.url,
-      remoteControlToken,
-      rendererId,
-      mode: chromiumMode,
-    })
-    ownedRenderer = await rendererPromise
-
-    process.stderr.write(`Apple2TS MCP private bridge listening at ${listener.url}; waiting for renderer ${rendererId}.\n`)
-    const startup = await Promise.race([
-      waitForRenderer(core, startupTimeoutMs, shutdownController.signal).then(() => ({ ready: true })),
-      ownedRenderer.exited.then((outcome) => ({ ready: false, outcome })),
-    ])
-    if (!startup.ready) {
-      throw new Error(`Owned Chromium exited before readiness (${ownedRenderer.describeExit(startup.outcome)})`)
-    }
-    if (shutdownController.signal.aborted) return
-
-    void ownedRenderer.exited.then((outcome) => {
-      if (stopping) return
-      process.stderr.write(`Apple2TS MCP renderer exited unexpectedly (${ownedRenderer.describeExit(outcome)}).\n`)
-      process.exitCode = 1
-      void shutdown("Owned Chromium exited unexpectedly").catch(reportFatal)
-    })
-
-    stdioHandle = serveStdio(() => createMcpServer(core), {
+    stdioHandle = serveStdio(() => createMcpServer(session), {
       onerror: (error) => process.stderr.write(`Apple2TS MCP protocol error: ${error.message}\n`),
     })
-    process.stderr.write(`Apple2TS MCP ready for renderer ${rendererId}.\n`)
+    process.stderr.write("Apple2TS MCP ready for session requests.\n")
   } catch (error) {
     if (!shutdownController.signal.aborted) {
       process.stderr.write(`Apple2TS MCP startup failed: ${error instanceof Error ? error.message : String(error)}\n`)
