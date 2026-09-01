@@ -2063,6 +2063,46 @@ test("invalid binary root fails session start before private resources start", a
   await invalid.cleanup()
 })
 
+test("matching source and staging roots fail session start before private resources start", async (t) => {
+  const sharedRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-shared-file-root-"))
+  const invalid = await launchMcp({
+    APPLE2TS_FILE_STAGING_ROOT: sharedRoot,
+    APPLE2TS_FILE_SOURCE_ROOT: sharedRoot,
+  })
+  t.after(invalid.cleanup)
+  t.after(() => rm(sharedRoot, { recursive: true, force: true }))
+  await invalid.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(invalid, "matching-roots-initialize")
+  const response = await startMcpSession(invalid, "matching-roots-start")
+  assert.equal(response.result.isError, true)
+  assert.match(response.result.content[0].text, /must not be inside/)
+  assert.doesNotMatch(invalid.getStderr(), /private bridge listening/)
+  invalid.child.stdin.end()
+  assert.equal((await invalid.waitForExit()).code, 0)
+  await invalid.cleanup()
+})
+
+test("staging inside the source root fails session start before private resources start", async (t) => {
+  const sourceRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-nested-file-root-"))
+  const stagingRoot = path.join(sourceRoot, "staging")
+  await mkdir(stagingRoot)
+  const invalid = await launchMcp({
+    APPLE2TS_FILE_STAGING_ROOT: stagingRoot,
+    APPLE2TS_FILE_SOURCE_ROOT: sourceRoot,
+  })
+  t.after(invalid.cleanup)
+  t.after(() => rm(sourceRoot, { recursive: true, force: true }))
+  await invalid.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(invalid, "nested-roots-initialize")
+  const response = await startMcpSession(invalid, "nested-roots-start")
+  assert.equal(response.result.isError, true)
+  assert.match(response.result.content[0].text, /must not be inside/)
+  assert.doesNotMatch(invalid.getStderr(), /private bridge listening/)
+  invalid.child.stdin.end()
+  assert.equal((await invalid.waitForExit()).code, 0)
+  await invalid.cleanup()
+})
+
 test("unexpected renderer exit releases only the owned session", async (t) => {
   const crashed = await launchMcp({ APPLE2TS_FAKE_CHROMIUM_MODE: "crash-after-ready" })
   t.after(crashed.cleanup)
