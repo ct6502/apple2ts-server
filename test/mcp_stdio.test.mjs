@@ -1923,14 +1923,14 @@ test("file staging removes a failed temporary copy and mounts a staged hard driv
     rm(binaryRoot, { recursive: true, force: true }),
   ]))
   const disk = Buffer.from("ProDOS test disk")
-  await writeFile(path.join(sourceRoot, "eamon.po"), disk)
+  await writeFile(path.join(sourceRoot, "eamon.hdv"), disk)
   const stager = new FileStager(await realpath(sourceRoot), await realpath(binaryRoot))
   t.after(() => stager.cleanup())
-  const stagedName = `${createHash("sha256").update(disk).digest("hex")}.po`
+  const stagedName = `${createHash("sha256").update(disk).digest("hex")}.hdv`
   const stageDirectory = await stager.getStageDirectory()
   await mkdir(path.join(stageDirectory, stagedName))
 
-  await assert.rejects(stager.stage("eamon.po"))
+  await assert.rejects(stager.stage("eamon.hdv"))
   assert.deepEqual(await readdir(stageDirectory), [stagedName])
 
   await rm(path.join(stageDirectory, stagedName), { recursive: true })
@@ -1949,10 +1949,10 @@ test("file staging removes a failed temporary copy and mounts a staged hard driv
     return { emulator: identity, state: { driveId: "hd1", mounted: true } }
   }
   await assert.rejects(
-    core.mountDisk({ driveId: "hd1", path: "eamon.po" }),
+    core.mountDisk({ driveId: "hd1", path: "eamon.hdv" }),
     /file staged by this MCP session/,
   )
-  const staged = await core.stageFile({ path: "eamon.po" })
+  const staged = await core.stageFile({ path: "eamon.hdv" })
   const mounted = await core.mountDisk({ driveId: "hd1", path: staged.path })
 
   assert.deepEqual(mounted.state, { driveId: "hd1", mounted: true })
@@ -1991,7 +1991,7 @@ test("configured stdio advertises and loads a local binary", async (t) => {
   await writeFile(path.join(binaryRoot, "fixture.po"), "")
   await truncate(path.join(binaryRoot, "fixture.po"), 32 * 1024 * 1024)
   await writeFile(path.join(sourceRoot, "fixture.bin"), Buffer.from([0xA9, 0x42, 0x60]))
-  await writeFile(path.join(sourceRoot, "eamon.po"), Buffer.from("ProDOS test disk"))
+  await writeFile(path.join(sourceRoot, "eamon.hdv"), Buffer.from("ProDOS test disk"))
   const processState = await launchMcp({
     APPLE2TS_FILE_STAGING_ROOT: binaryRoot,
     APPLE2TS_FILE_SOURCE_ROOT: sourceRoot,
@@ -2090,11 +2090,11 @@ test("configured stdio advertises and loads a local binary", async (t) => {
       jsonrpc: "2.0",
       id: 5,
       method: "tools/call",
-      params: { name: "stage_file", arguments: { path: "eamon.po" } },
+      params: { name: "stage_file", arguments: { path: "eamon.hdv" } },
     })}\n`)
     const staged = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 5))
     assert.equal(staged.result.isError, undefined)
-    assert.match(staged.result.structuredContent.path, /^\.apple2ts-mcp-stage-[^/]+\/[0-9a-f]{64}\.po$/)
+    assert.match(staged.result.structuredContent.path, /^\.apple2ts-mcp-stage-[^/]+\/[0-9a-f]{64}\.hdv$/)
 
     processState.child.stdin.write(`${JSON.stringify({
       jsonrpc: "2.0",
