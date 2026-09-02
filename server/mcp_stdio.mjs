@@ -46,6 +46,47 @@ const CPU_PATCH_MAXIMUMS = Object.freeze({
   PStatus: 255,
 })
 const SESSION_LIFECYCLE_URI = "apple2ts://session/lifecycle"
+const SESSION_EVENT_VERSION = 1
+
+const resolveSessionEventFile = async (value, stagingRoot) => {
+  if (!value) return null
+  if (!stagingRoot) throw new Error("APPLE2TS_SESSION_EVENT_FILE requires APPLE2TS_FILE_STAGING_ROOT")
+  const requested = path.resolve(value)
+  const parent = await realpath(path.dirname(requested))
+  if (parent !== stagingRoot) {
+    throw new Error("APPLE2TS_SESSION_EVENT_FILE must be directly inside APPLE2TS_FILE_STAGING_ROOT")
+  }
+  const target = path.join(parent, path.basename(requested))
+  const existing = await lstat(target).catch((error) => {
+    if (error?.code === "ENOENT") return null
+    throw error
+  })
+  if (existing && !existing.isFile()) {
+    throw new Error("APPLE2TS_SESSION_EVENT_FILE must name a regular file")
+  }
+  if (existing) {
+    throw new Error("APPLE2TS_SESSION_EVENT_FILE contains an unconsumed session event")
+  }
+  return target
+}
+
+const publishSessionEvent = async (target, event) => {
+  if (!target) return
+  const temporary = path.join(
+    path.dirname(target),
+    `.${path.basename(target)}.${randomUUID()}.tmp`,
+  )
+  try {
+    await writeFile(
+      temporary,
+      `${JSON.stringify({ version: SESSION_EVENT_VERSION, ...event })}\n`,
+      { encoding: "utf8", flag: "wx", mode: 0o600 },
+    )
+    await rename(temporary, target)
+  } finally {
+    await rm(temporary, { force: true })
+  }
+}
 
 class ConfirmedMutationRejection extends Error {
   constructor(error) {
@@ -1614,15 +1655,24 @@ export const runStdio = async (options = {}) => {
     readLifecycle() {
       return lifecycleState
     },
-    async reportRendererClosed(emulator, cleanup) {
+    async reportRendererClosed(emulator, cleanup, eventFile, event, reason) {
       lifecycleState = {
         sequence: lifecycleState.sequence + 1,
         state: "closed",
-        reason: "renderer_closed",
+        reason,
         cleanup,
         emulator,
       }
-      await lifecycleNotifier?.()
+      const failures = []
+      await Promise.resolve(lifecycleNotifier?.()).catch((error) => failures.push(error))
+      await publishSessionEvent(eventFile, {
+        event,
+        sequence: lifecycleState.sequence,
+        cleanup,
+        reporting: failures.length ? "failed" : "complete",
+        emulator,
+      }).catch((error) => failures.push(error))
+      if (failures.length) throw new AggregateError(failures, "Apple2TS session event reporting failed")
     },
     requireCore() {
       if (!activeSession) throw new Error("No active Apple2TS session. Call start_session first.")
@@ -1657,6 +1707,7 @@ export const runStdio = async (options = {}) => {
             throw new Error("APPLE2TS_FILE_STAGING_ROOT must be writable when file staging is configured")
           }
         }
+        const sessionEventFile = await resolveSessionEventFile(options.sessionEventFile, binaryRoot)
         const chromiumMode = options.chromiumMode ?? "headless"
         if (chromiumMode !== "headless" && chromiumMode !== "visible") {
           throw new Error("APPLE2TS_CHROMIUM_MODE must be 'headless' or 'visible'")
@@ -1676,7 +1727,7 @@ export const runStdio = async (options = {}) => {
         let renderer = null
         let core = null
         let created = null
-        let rendererDisconnected = false
+        let terminationEvent = null
         try {
           listener = await startApple2tsServer({
             host: "127.0.0.1",
@@ -1691,7 +1742,7 @@ export const runStdio = async (options = {}) => {
               ),
               onDisconnect: () => {
                 if (stopping || stoppingSession) return
-                rendererDisconnected = true
+                terminationEvent = "browser-closed"
                 process.stderr.write("Apple2TS MCP renderer disconnected; stopping owned session.\n")
                 if (!created) {
                   sessionController.abort(new Error("Owned renderer disconnected during startup"))
@@ -1734,11 +1785,12 @@ export const runStdio = async (options = {}) => {
             renderer.exited.then((outcome) => ({ ready: false, outcome })),
           ])
           if (!startup.ready) {
+            terminationEvent = "browser-failed"
             throw new Error(`Owned Chromium exited before readiness (${renderer.describeExit(startup.outcome)})`)
           }
           if (shutdownController.signal.aborted) throw shutdownController.signal.reason
 
-          created = { core, renderer, controller: sessionController }
+          created = { core, renderer, controller: sessionController, sessionEventFile }
           activeSession = created
           lifecycleState = {
             ...lifecycleState,
@@ -1749,8 +1801,23 @@ export const runStdio = async (options = {}) => {
           }
           void renderer.exited.then((outcome) => {
             if (activeSession !== created || stopping || stoppingSession) return
-            process.stderr.write(`Apple2TS MCP renderer exited unexpectedly (${renderer.describeExit(outcome)}).\n`)
-            void session.stop("Owned Chromium exited unexpectedly").catch(reportFatal)
+            const closedNormally = chromiumMode === "visible"
+              && outcome.code === 0
+              && !outcome.signal
+              && !outcome.error
+            const sessionEvent = closedNormally ? "browser-closed" : "browser-failed"
+            const lifecycleReason = closedNormally ? "renderer_closed" : "renderer_failed"
+            const exitDescription = renderer.describeExit(outcome)
+            process.stderr.write(closedNormally
+              ? `Apple2TS MCP visible browser closed (${exitDescription}).\n`
+              : `Apple2TS MCP renderer exited unexpectedly (${exitDescription}).\n`)
+            void session.stop(closedNormally
+              ? "Owned visible Chromium closed"
+              : "Owned Chromium exited unexpectedly", {
+              rendererClosedEmulator: created.core.identity,
+              sessionEvent,
+              lifecycleReason,
+            }).catch(reportFatal)
           })
           return { emulator: core.identity }
         } catch (error) {
@@ -1762,10 +1829,13 @@ export const runStdio = async (options = {}) => {
           }
           await renderer?.stop().catch((failure) => cleanupFailures.push(failure))
           await stopApple2tsServer().catch((failure) => cleanupFailures.push(failure))
-          if (rendererDisconnected && core) {
+          if (terminationEvent && core) {
             await session.reportRendererClosed(
               core.identity,
               cleanupFailures.length ? "failed" : "complete",
+              sessionEventFile,
+              terminationEvent,
+              terminationEvent === "browser-failed" ? "renderer_failed" : "renderer_closed",
             ).catch((failure) => cleanupFailures.push(failure))
           }
           if (cleanupFailures.length) {
@@ -1784,7 +1854,11 @@ export const runStdio = async (options = {}) => {
       })
       return startingSession
     },
-    async stop(reason, { rendererClosedEmulator = null } = {}) {
+    async stop(reason, {
+      rendererClosedEmulator = null,
+      sessionEvent = "browser-closed",
+      lifecycleReason = "renderer_closed",
+    } = {}) {
       if (stoppingSession) return stoppingSession
       stoppingSession = (async () => {
         if (startingSession) await startingSession.catch(() => {})
@@ -1798,14 +1872,13 @@ export const runStdio = async (options = {}) => {
         await stopApple2tsServer().catch((error) => failures.push(error))
         if (activeSession === current) activeSession = null
         if (rendererClosedEmulator) {
-          lifecycleState = {
-            sequence: lifecycleState.sequence + 1,
-            state: "closed",
-            reason: "renderer_closed",
-            cleanup: failures.length ? "failed" : "complete",
-            emulator: rendererClosedEmulator,
-          }
-          await lifecycleNotifier?.().catch((error) => failures.push(error))
+          await session.reportRendererClosed(
+            rendererClosedEmulator,
+            failures.length ? "failed" : "complete",
+            current.sessionEventFile,
+            sessionEvent,
+            lifecycleReason,
+          ).catch((error) => failures.push(error))
         } else {
           lifecycleState = {
             ...lifecycleState,
@@ -1879,6 +1952,7 @@ if (isMain) {
     chromiumMode: process.env.APPLE2TS_CHROMIUM_MODE,
     fileSourceRoot: process.env.APPLE2TS_FILE_SOURCE_ROOT,
     fileStagingRoot: process.env.APPLE2TS_FILE_STAGING_ROOT,
+    sessionEventFile: process.env.APPLE2TS_SESSION_EVENT_FILE,
     distDir: process.env.APPLE2TS_DIST_DIR,
   })
 }
