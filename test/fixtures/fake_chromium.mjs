@@ -263,6 +263,9 @@ while (!stopping) {
       if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "crash-after-ready" && statusReplies >= 2) {
         setTimeout(() => process.exit(43), 50)
       }
+      if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "close-after-ready" && statusReplies >= 2) {
+        setTimeout(() => process.exit(0), 50)
+      }
     }
   }
 }

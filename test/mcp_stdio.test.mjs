@@ -289,6 +289,19 @@ const waitForAbsent = async (target, timeoutMs = 2000) => {
   await assert.rejects(access(target))
 }
 
+const waitForPresent = async (target, timeoutMs = 2000) => {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      await access(target)
+      return
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+  await access(target)
+}
+
 const sendMcpRequest = async (processState, id, method, params = {}) => {
   processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`)
   return JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === id))
@@ -2337,9 +2350,10 @@ test("visible Chromium uses the same owned session and cleanup", async (t) => {
   await visible.cleanup()
 })
 
-test("closing an owned visible renderer cleans its session and permits another start", async (t) => {
+test("closing an owned visible renderer preserves its launcher receipt until exit", async (t) => {
   const stagingRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-visible-close-stage-"))
   const sourceRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-visible-close-source-"))
+  const eventFile = path.join(stagingRoot, "launcher-event.json")
   await writeFile(path.join(sourceRoot, "fixture.bin"), Buffer.from([0xA9, 0x42, 0x60]))
   const visible = await launchMcp({
     APPLE2TS_CHROMIUM_MODE: "visible",
@@ -2347,6 +2361,7 @@ test("closing an owned visible renderer cleans its session and permits another s
     APPLE2TS_TEST_RENDERER_DISCONNECT_GRACE_MS: "50",
     APPLE2TS_FILE_STAGING_ROOT: stagingRoot,
     APPLE2TS_FILE_SOURCE_ROOT: sourceRoot,
+    APPLE2TS_TEST_SESSION_EVENT_FILE: eventFile,
   })
   t.after(visible.cleanup)
   t.after(() => rm(stagingRoot, { recursive: true, force: true }))
@@ -2406,6 +2421,15 @@ test("closing an owned visible renderer cleans its session and permits another s
     cleanup: "complete",
     emulator: started.result.structuredContent.emulator,
   })
+  await waitForPresent(eventFile)
+  assert.deepEqual(JSON.parse(await readFile(eventFile, "utf8")), {
+    version: 1,
+    event: "browser-closed",
+    sequence: 1,
+    cleanup: "complete",
+    reporting: "complete",
+    emulator: started.result.structuredContent.emulator,
+  })
 
   const alreadyStopped = await sendMcpRequest(visible, "visible-close-stop", "tools/call", {
     name: "stop_session",
@@ -2414,21 +2438,8 @@ test("closing an owned visible renderer cleans its session and permits another s
   assert.deepEqual(alreadyStopped.result.structuredContent, { stopped: false })
 
   const restarted = await startMcpSession(visible, "visible-close-restart")
-  assert.equal(restarted.result.isError, undefined, JSON.stringify(restarted))
-  assert.notEqual(
-    restarted.result.structuredContent.emulator.serverInstanceId,
-    started.result.structuredContent.emulator.serverInstanceId,
-  )
-  const restartedReceipt = await visible.readReceipt()
-  assert.notEqual(restartedReceipt.pid, receipt.pid)
-  assert.equal(restartedReceipt.headless, false)
-  const stopped = await sendMcpRequest(visible, "visible-close-final-stop", "tools/call", {
-    name: "stop_session",
-    arguments: {},
-  })
-  assert.deepEqual(stopped.result.structuredContent, { stopped: true })
-  await waitForAbsent(restartedReceipt.profilePath)
-  assert.throws(() => process.kill(restartedReceipt.pid, 0), { code: "ESRCH" })
+  assert.equal(restarted.result.isError, true)
+  assert.match(restarted.result.content[0].text, /unconsumed session event/)
 
   visible.child.stdin.end()
   const outcome = await visible.waitForExit()
@@ -2611,8 +2622,15 @@ test("staging inside the source root fails session start before private resource
 })
 
 test("unexpected renderer exit releases only the owned session", async (t) => {
-  const crashed = await launchMcp({ APPLE2TS_FAKE_CHROMIUM_MODE: "crash-after-ready" })
+  const stagingRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-browser-failure-stage-"))
+  const eventFile = path.join(stagingRoot, "launcher-event.json")
+  const crashed = await launchMcp({
+    APPLE2TS_FAKE_CHROMIUM_MODE: "crash-after-ready",
+    APPLE2TS_FILE_STAGING_ROOT: stagingRoot,
+    APPLE2TS_TEST_SESSION_EVENT_FILE: eventFile,
+  })
   t.after(crashed.cleanup)
+  t.after(() => rm(stagingRoot, { recursive: true, force: true }))
   await crashed.waitForStderr((line) => line.includes("MCP ready"))
   await initializeMcp(crashed, "crash-initialize")
   const started = await startMcpSession(crashed, "crash-start")
@@ -2625,11 +2643,62 @@ test("unexpected renderer exit releases only the owned session", async (t) => {
   assert.throws(() => process.kill(receipt.pid, 0), { code: "ESRCH" })
   await waitForAbsent(receipt.profilePath)
   await assertClosed(bridgeUrl)
+  assert.deepEqual(JSON.parse(await readFile(eventFile, "utf8")), {
+    version: 1,
+    event: "browser-failed",
+    sequence: 1,
+    cleanup: "complete",
+    reporting: "complete",
+    emulator: started.result.structuredContent.emulator,
+  })
   crashed.child.stdin.end()
-  assert.equal((await crashed.waitForExit()).code, 0)
+  assert.equal((await crashed.waitForExit()).code, 0, crashed.getStderr())
   await crashed.cleanup()
 })
 
+test("clean visible browser exit reports an intentional renderer closure", async (t) => {
+  const eventRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-browser-close-event-"))
+  const eventFile = path.join(eventRoot, "launcher-event.json")
+  const closed = await launchMcp({
+    APPLE2TS_CHROMIUM_MODE: "visible",
+    APPLE2TS_FAKE_CHROMIUM_MODE: "close-after-ready",
+    APPLE2TS_TEST_SESSION_EVENT_FILE: eventFile,
+  })
+  t.after(closed.cleanup)
+  t.after(() => rm(eventRoot, { recursive: true, force: true }))
+  await closed.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(closed, "clean-close-initialize")
+  const started = await startMcpSession(closed, "clean-close-start")
+  assert.equal(started.result.isError, undefined, JSON.stringify(started))
+  const bridgeLine = await closed.waitForStderr((line) => line.includes("private bridge listening"))
+  const bridgeUrl = parseBridgeUrl(bridgeLine)
+  const receipt = await closed.readReceipt()
+  await closed.waitForStderr((line) => line.includes("visible browser closed"))
+  assert.throws(() => process.kill(receipt.pid, 0), { code: "ESRCH" })
+  await waitForAbsent(receipt.profilePath)
+  await assertClosed(bridgeUrl)
+  assert.deepEqual(JSON.parse(await readFile(eventFile, "utf8")), {
+    version: 1,
+    event: "browser-closed",
+    sequence: 1,
+    cleanup: "complete",
+    reporting: "complete",
+    emulator: started.result.structuredContent.emulator,
+  })
+  const lifecycle = await sendMcpRequest(closed, "clean-close-lifecycle", "resources/read", {
+    uri: "apple2ts://session/lifecycle",
+  })
+  assert.deepEqual(JSON.parse(lifecycle.result.contents[0].text), {
+    sequence: 1,
+    state: "closed",
+    reason: "renderer_closed",
+    cleanup: "complete",
+    emulator: started.result.structuredContent.emulator,
+  })
+  closed.child.stdin.end()
+  assert.equal((await closed.waitForExit()).code, 0, closed.getStderr())
+  await closed.cleanup()
+})
 test("SIGTERM and startup timeout release the private listener", async (t) => {
   const running = await launchMcp()
   t.after(running.cleanup)
