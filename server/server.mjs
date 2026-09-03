@@ -574,6 +574,23 @@ const getMemoryDumpFromReply = async (client) => {
   }
 }
 
+const getMemoryViewFromReply = async (client, request) => {
+  const reply = await dispatchCommand(client, "getMemoryView", request, true)
+  const result = reply.result
+  if (
+    !result
+    || !Array.isArray(result.bytes)
+    || result.bytes.length !== request.length
+    || !Array.isArray(result.effectiveSegments)
+    || !result.mapping
+    || typeof result.mapping !== "object"
+  ) {
+    throw new Error("Memory view was not available from the browser client.")
+  }
+  client.lastSeenAt = Date.now()
+  return result
+}
+
 const MAX_SCREEN_CAPTURE_BASE64_LENGTH = 64 * 1024 * 1024
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
 
@@ -1226,6 +1243,49 @@ const server = createServer(async (req, res) => {
       }
       try {
         writeEnvelope(res, 200, await getRenderedScreenFromReply(client))
+      } catch (error) {
+        writeErrorEnvelope(
+          res,
+          400,
+          "BAD_REQUEST",
+          error instanceof Error ? error.message : String(error),
+        )
+      }
+      return
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/private/memory") {
+      if (!privateRenderer) {
+        writeErrorEnvelope(res, 404, "NOT_FOUND", "Physical memory requires a private emulator session.")
+        return
+      }
+      const client = getConnectedClient()
+      if (!client) {
+        writeNoConnectedClientError(res)
+        return
+      }
+      try {
+        const address = parseInteger(url.searchParams.get("start"))
+        const length = parseInteger(url.searchParams.get("length"))
+        const space = url.searchParams.get("space") || "active"
+        const auxBankText = url.searchParams.get("auxBank")
+        const auxBank = auxBankText === null ? undefined : parseInteger(auxBankText)
+        if (address === null || length === null) {
+          throw new Error("start and length query parameters are required")
+        }
+        validateMemoryBounds(address, length)
+        if (!["active", "main", "aux"].includes(space)) {
+          throw new Error("space must be 'active', 'main', or 'aux'")
+        }
+        if (auxBankText !== null && auxBank === null) {
+          throw new Error("auxBank must be an integer")
+        }
+        writeEnvelope(res, 200, await getMemoryViewFromReply(client, {
+          address,
+          length,
+          space,
+          ...(auxBank === undefined ? {} : {auxBank}),
+        }))
       } catch (error) {
         writeErrorEnvelope(
           res,

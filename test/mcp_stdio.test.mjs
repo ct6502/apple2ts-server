@@ -1494,6 +1494,8 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     properties: {
       address: { type: "integer", minimum: 0, maximum: 65535 },
       length: { type: "integer", minimum: 1, maximum: 4096 },
+      space: { type: "string", enum: ["active", "main", "aux"], default: "active" },
+      auxBank: { type: "integer", minimum: 0, maximum: 127 },
     },
     required: ["address", "length"],
     additionalProperties: false,
@@ -1549,9 +1551,60 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.equal(memory.result.isError, undefined)
   assert.deepEqual(memory.result.structuredContent, {
     emulator: payload.emulator,
-    value: { address: 65534, length: 2, bytes: [171, 205] },
+    value: {
+      address: 65534,
+      length: 2,
+      bytes: [171, 205],
+      requestedSpace: "active",
+      requestedAuxBank: null,
+      effectiveAuxBank: null,
+      effectiveSegments: [{address: 65534, length: 2, space: "system"}],
+      mapping: {
+        RAMRD: false,
+        RAMWRT: false,
+        ALTZP: false,
+        "80STORE": false,
+        PAGE2: false,
+        HIRES: false,
+      },
+    },
   })
   assert.deepEqual(JSON.parse(memory.result.content[0].text), memory.result.structuredContent)
+
+  const physical = await sendMcpRequest(processState, "physical-memory", "tools/call", {
+    name: "read_memory",
+    arguments: {address: 0x03A4, length: 1, space: "aux"},
+  })
+  assert.equal(physical.result.isError, undefined, JSON.stringify(physical))
+  assert.deepEqual(physical.result.structuredContent.value, {
+    address: 0x03A4,
+    length: 1,
+    bytes: [0x22],
+    requestedSpace: "aux",
+    requestedAuxBank: null,
+    effectiveAuxBank: 0,
+    effectiveSegments: [{address: 0x03A4, length: 1, space: "aux", auxBank: 0}],
+    mapping: {
+      RAMRD: false,
+      RAMWRT: false,
+      ALTZP: false,
+      "80STORE": false,
+      PAGE2: false,
+      HIRES: false,
+    },
+  })
+
+  for (const args of [
+    {address: 0xC000, length: 1, space: "main"},
+    {address: 0xBFFF, length: 2, space: "aux"},
+    {address: 0, length: 1, space: "main", auxBank: 0},
+  ]) {
+    const rejected = await sendMcpRequest(processState, `physical-reject-${JSON.stringify(args)}`, "tools/call", {
+      name: "read_memory",
+      arguments: args,
+    })
+    assert.equal(rejected.result.isError, true)
+  }
 
   processState.child.stdin.write(`${JSON.stringify({
     jsonrpc: "2.0",
