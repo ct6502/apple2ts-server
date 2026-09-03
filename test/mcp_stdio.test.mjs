@@ -1543,8 +1543,15 @@ test("execution state rejects inconsistent expectations and ignores stale observ
     { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
   )
   core.observeExecution(executionSnapshot(3, "paused", { PC: 0x6003 }))
+  const sameSequenceWait = core.waitForExecutionStop({ timeoutMs: 5, afterSequence: 3 })
+  core.observeExecution(executionSnapshot(3, "paused", { PC: 0x6010, A: 0x41 }))
+  assert.deepEqual(
+    { PC: (await core.readExecution()).state.PC, A: (await core.readExecution()).state.A },
+    { PC: 0x6010, A: 0x41 },
+  )
+  assert.equal((await sameSequenceWait).outcome, "timeout")
   core.observeExecution(executionSnapshot(2, "running", { PC: 0x1234 }))
-  assert.equal((await core.readExecution()).state.PC, 0x6003)
+  assert.equal((await core.readExecution()).state.PC, 0x6010)
   await assert.rejects(core.waitForExecutionStop({
     timeoutMs: 10,
     expectedBreakpointId: "bp:24579",
@@ -2078,6 +2085,14 @@ test("stdio exposes coherent execution state and waits for worker-confirmed stop
     return JSON.parse(response.result.contents[0].text)
   }
 
+  const initialExecution = await readResource("execution-initial", "apple2ts://session/execution")
+  const setCpu = await call("execution-set-cpu", "set_cpu", { PC: 0x6010, PStatus: 0x20 })
+  assert.equal(setCpu.result.isError, undefined, JSON.stringify(setCpu))
+  const afterSetCpu = await readResource("execution-after-set-cpu", "apple2ts://session/execution")
+  assert.equal(afterSetCpu.state.executionSequence, initialExecution.state.executionSequence)
+  assert.equal(afterSetCpu.state.PC, 0x6010)
+  assert.equal(afterSetCpu.state.PStatus, 0x20)
+
   assert.equal((await call("execution-breakpoint", "set_breakpoint", { address: 0x6003 })).result.isError, undefined)
   const before = await readResource("execution-before", "apple2ts://session/execution")
   assert.equal(before.state.state, "paused")
@@ -2106,11 +2121,13 @@ test("stdio exposes coherent execution state and waits for worker-confirmed stop
   const concurrentRead = JSON.parse(
     await processState.waitForStdout((line) => JSON.parse(line).id === "execution-concurrent-read"),
   )
-  assert.equal(JSON.parse(concurrentRead.result.contents[0].text).state.PC, 768)
+  assert.equal(JSON.parse(concurrentRead.result.contents[0].text).state.PC, 0x6010)
 
-  const waited = JSON.parse(
+  const waitedResponse = JSON.parse(
     await processState.waitForStdout((line) => JSON.parse(line).id === "execution-wait"),
-  ).result.structuredContent
+  )
+  assert.equal(waitedResponse.result.isError, undefined, JSON.stringify(waitedResponse))
+  const waited = waitedResponse.result.structuredContent
   assert.equal(waited.outcome, "stopped")
   assert.equal(waited.expectationMatched, false)
   assert.ok(waited.state.executionSequence > before.state.executionSequence)
@@ -2253,7 +2270,12 @@ test("real renderer reports the finite program stop atomically", {
 
   const staged = (await call("real-stage", "stage_file", { path: "finite.bin" })).result.structuredContent
   await call("real-load", "load_binary", { path: staged.path, address: 0x6000 })
+  const beforeCpuPatch = await readExecution("real-before-cpu")
   await call("real-cpu", "set_cpu", { PC: 0x6000, PStatus: 0x24 })
+  const afterCpuPatch = await readExecution("real-after-cpu")
+  assert.equal(afterCpuPatch.state.executionSequence, beforeCpuPatch.state.executionSequence)
+  assert.equal(afterCpuPatch.state.PC, 0x6000)
+  assert.equal(afterCpuPatch.state.PStatus, 0x24)
   await call("real-success", "set_breakpoint", { address: 0x6009 })
   await call("real-failure", "set_breakpoint", { address: 0x600A })
   const before = await readExecution("real-before")

@@ -403,11 +403,6 @@ const getSnapshotResources = (snapshots) =>
     active: Boolean(snapshot.active),
   }))
 
-const getStatusFromReply = async (client, action, payload) => {
-  const reply = await dispatchCommand(client, action, payload, true)
-  return reply.result
-}
-
 const getStatusFromCommandResult = (result) => {
   if (!result || typeof result !== "object") {
     return null
@@ -429,6 +424,11 @@ const updateClientStatusFromCommandResult = (client, result) => {
   }
   client.lastSeenAt = Date.now()
   return status
+}
+
+const getStatusFromReply = async (client, action, payload) => {
+  const reply = await dispatchCommand(client, action, payload, true)
+  return updateClientStatusFromCommandResult(client, reply.result) ?? reply.result
 }
 
 const getFreshMachineResource = async (client) => {
