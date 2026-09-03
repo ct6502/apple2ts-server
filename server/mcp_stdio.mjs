@@ -1156,6 +1156,19 @@ const toolResult = (result) => ({
   structuredContent: result,
 })
 
+const memoryReadResult = (result) => {
+  const {address, length, requestedSpace} = result.value
+  const space = requestedSpace === "active"
+    ? "active memory"
+    : requestedSpace === "aux" ? "auxiliary RAM" : "main RAM"
+  const byteLabel = length === 1 ? "byte" : "bytes"
+  const addressLabel = address.toString(16).toUpperCase().padStart(4, "0")
+  return {
+    content: [{type: "text", text: `Read ${length} ${byteLabel} from ${space} at $${addressLabel}.`}],
+    structuredContent: result,
+  }
+}
+
 const screenCaptureResult = ({ dataBase64, ...result }) => ({
   content: [
     { type: "image", data: dataBase64, mimeType: result.image.mimeType },
@@ -1310,7 +1323,7 @@ export const createMcpServer = (session) => {
     },
     async (input) => {
       try {
-        return toolResult(await core().readMemory(input))
+        return memoryReadResult(await core().readMemory(input))
       } catch (error) {
         return {
           isError: true,

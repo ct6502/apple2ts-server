@@ -1619,7 +1619,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
       },
     },
   })
-  assert.deepEqual(JSON.parse(memory.result.content[0].text), memory.result.structuredContent)
+  assert.equal(memory.result.content[0].text, "Read 2 bytes from active memory at $FFFE.")
 
   const physical = await sendMcpRequest(processState, "physical-memory", "tools/call", {
     name: "read_memory",
@@ -1642,6 +1642,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
       HIRES: false,
     },
   })
+  assert.equal(physical.result.content[0].text, "Read 1 byte from auxiliary RAM at $03A4.")
 
   const selectedPhysical = await sendMcpRequest(processState, "selected-physical-memory", "tools/call", {
     name: "read_memory",
