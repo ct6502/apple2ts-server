@@ -83,6 +83,10 @@ let buffer = ""
 let stopping = false
 let statusReplies = 0
 const status = structuredClone(statusFixture)
+const snapshotStatus = () => {
+  status.statusSequence += 1
+  return structuredClone(status)
+}
 status.drives = [{
   index: 0,
   drive: 1,
@@ -121,7 +125,7 @@ const initialState = await postJson("/api/client/state", {
   clientId,
   remoteControlToken,
   rendererId,
-  state: status,
+  state: snapshotStatus(),
 })
 if (!initialState.ok) process.exit(69)
 
@@ -173,7 +177,7 @@ while (!stopping) {
         await updateReceipt({ stalledRunMode: true })
         continue
       }
-      result = status
+      result = snapshotStatus()
       if (
         process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "execution-stop"
         && status.machine.runMode === -1
@@ -198,15 +202,15 @@ while (!stopping) {
             clientId,
             remoteControlToken,
             rendererId,
-            state: status,
+            state: snapshotStatus(),
           })
         }, Number(process.env.APPLE2TS_FAKE_EXECUTION_STOP_DELAY_MS || 5))
       }
     } else if (command.action === "setSpeedMode") {
       status.machine.speedMode = command.payload.speedMode
-      result = status
+      result = snapshotStatus()
     } else if (command.action === "getStatus") {
-      result = status
+      result = snapshotStatus()
     } else if (command.action === "getMemory") {
       result = { memoryDump }
     } else if (command.action === "getMemoryView") {
@@ -256,7 +260,7 @@ while (!stopping) {
         height: 1,
       }
     } else if (command.action === "loadBinary") {
-      result = status
+      result = snapshotStatus()
     } else if (command.action === "mountDisk") {
       const driveIndex = Number(command.payload.driveIndex)
       const drive = status.drives.find((candidate) => candidate.index === driveIndex)
@@ -274,7 +278,7 @@ while (!stopping) {
         drive.status = ""
         drive.byteLength = 0
       }
-      result = status
+      result = snapshotStatus()
     } else if (command.action === "getBreakpoints") {
       result = { breakpoints }
     } else if (command.action === "setBreakpoints") {
@@ -295,11 +299,11 @@ while (!stopping) {
         S: StackPtr,
         PStatus,
       }
-      result = status
+      result = snapshotStatus()
     } else if (command.action === "setKeyboardState") {
       keyboardStates.push(command.payload)
       await updateReceipt({ keyboardStates })
-      result = status
+      result = snapshotStatus()
     }
     const reply = await postJson("/api/client/reply", {
       clientId,

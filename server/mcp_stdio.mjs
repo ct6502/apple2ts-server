@@ -238,7 +238,7 @@ const executionSnapshotSchema = {
     state: { type: "string", enum: ["running", "paused"] },
     pauseReason: {
       type: ["string", "null"],
-      enum: [null, "idle", "explicit", "breakpoint", "watchpoint", "step", "cycle-limit", "run-to-return"],
+      enum: [null, "idle", "explicit", "breakpoint", "watchpoint", "step", "cycle-limit"],
     },
     breakpoint: {
       oneOf: [
@@ -800,6 +800,7 @@ export class Apple2tsCore {
     this.mutationFailure = null
     this.heldKey = null
     this.execution = null
+    this.executionStatusSequence = -1
     this.executionWaiters = new Set()
     this.executionReaders = new Set()
     this.executionClosed = false
@@ -822,16 +823,27 @@ export class Apple2tsCore {
   }
 
   observeExecution(statusOrExecution) {
-    const execution = statusOrExecution?.machine?.execution ?? statusOrExecution
+    const wrappedStatus = Boolean(statusOrExecution?.machine?.execution)
+    const execution = wrappedStatus ? statusOrExecution.machine.execution : statusOrExecution
+    const statusSequence = wrappedStatus
+      ? statusOrExecution.statusSequence
+      : undefined
     if (
       !execution
       || !Number.isInteger(execution.executionSequence)
       || execution.executionSequence < 0
       || (this.execution && execution.executionSequence < this.execution.executionSequence)
+      || (
+        this.execution
+        && execution.executionSequence === this.execution.executionSequence
+        && this.executionStatusSequence >= 0
+        && (!Number.isInteger(statusSequence) || statusSequence <= this.executionStatusSequence)
+      )
     ) {
       return
     }
     this.execution = structuredClone(execution)
+    if (Number.isInteger(statusSequence)) this.executionStatusSequence = statusSequence
     for (const reader of [...this.executionReaders]) reader(this.execution)
     if (this.execution.state !== "paused") return
     for (const waiter of [...this.executionWaiters]) {
@@ -897,16 +909,15 @@ export class Apple2tsCore {
         state: structuredClone(state),
       }
     }
+    if (this.executionClosed) {
+      return { emulator: this.identity, outcome: "session_closed", state: structuredClone(this.execution) }
+    }
     if (
       this.execution.state === "paused"
       && (input.afterSequence === undefined || this.execution.executionSequence > afterSequence)
     ) {
       return stoppedResult(this.execution)
     }
-    if (this.executionClosed) {
-      return { emulator: this.identity, outcome: "session_closed", state: structuredClone(this.execution) }
-    }
-
     return new Promise((resolve, reject) => {
       let timeout
       const finish = (result, error) => {

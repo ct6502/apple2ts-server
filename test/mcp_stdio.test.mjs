@@ -1552,6 +1552,18 @@ test("execution state rejects inconsistent expectations and ignores stale observ
   assert.equal((await sameSequenceWait).outcome, "timeout")
   core.observeExecution(executionSnapshot(2, "running", { PC: 0x1234 }))
   assert.equal((await core.readExecution()).state.PC, 0x6010)
+  core.observeExecution({
+    statusSequence: 12,
+    machine: { execution: executionSnapshot(3, "paused", { PC: 0x6020 }) },
+  })
+  core.observeExecution({
+    statusSequence: 11,
+    machine: { execution: executionSnapshot(3, "paused", { PC: 0x6003 }) },
+  })
+  core.observeExecution({
+    machine: { execution: executionSnapshot(3, "paused", { PC: 0x6004 }) },
+  })
+  assert.equal((await core.readExecution()).state.PC, 0x6020)
   await assert.rejects(core.waitForExecutionStop({
     timeoutMs: 10,
     expectedBreakpointId: "bp:24579",
@@ -1561,6 +1573,9 @@ test("execution state rejects inconsistent expectations and ignores stale observ
     timeoutMs: 10,
     expectedBreakpointId: "bp:65536",
   }), /address between 0 and 65535/)
+
+  core.closeExecution()
+  assert.equal((await core.waitForExecutionStop({ timeoutMs: 10 })).outcome, "session_closed")
 })
 
 test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
