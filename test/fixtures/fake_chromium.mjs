@@ -55,6 +55,10 @@ const decoder = new TextDecoder()
 const memoryDump = new Array(65536).fill(0)
 memoryDump[65534] = 171
 memoryDump[65535] = 205
+const mainMemory = [...memoryDump]
+const auxMemory = new Array(65536).fill(0)
+mainMemory[0x03A4] = 0x11
+auxMemory[0x03A4] = 0x22
 let breakpoints = []
 let buffer = ""
 let stopping = false
@@ -140,6 +144,31 @@ while (!stopping) {
       result = status
     } else if (command.action === "getMemory") {
       result = { memoryDump }
+    } else if (command.action === "getMemoryView") {
+      const {address, length, space, auxBank} = command.payload
+      const source = space === "aux" ? auxMemory : mainMemory
+      result = {
+        address,
+        length,
+        requestedSpace: space,
+        requestedAuxBank: auxBank ?? null,
+        effectiveAuxBank: space === "aux" ? auxBank ?? 0 : null,
+        effectiveSegments: [{
+          address,
+          length,
+          space: space === "active" && address >= 0xC000 ? "system" : space === "aux" ? "aux" : "main",
+          ...(space === "aux" ? {auxBank: auxBank ?? 0} : {}),
+        }],
+        mapping: {
+          RAMRD: false,
+          RAMWRT: false,
+          ALTZP: false,
+          "80STORE": false,
+          PAGE2: false,
+          HIRES: false,
+        },
+        bytes: source.slice(address, address + length),
+      }
     } else if (command.action === "captureScreen") {
       result = {
         mimeType: "image/png",

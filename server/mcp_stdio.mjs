@@ -182,6 +182,8 @@ const memoryReadInputSchema = fromJsonSchema({
   properties: {
     address: { type: "integer", minimum: 0, maximum: 65535 },
     length: { type: "integer", minimum: 1, maximum: 4096 },
+    space: { type: "string", enum: ["active", "main", "aux"], default: "active" },
+    auxBank: { type: "integer", minimum: 0, maximum: 127 },
   },
   required: ["address", "length"],
   additionalProperties: false,
@@ -202,8 +204,48 @@ const memoryReadOutputSchema = fromJsonSchema({
           minItems: 1,
           maxItems: 4096,
         },
+        requestedSpace: { type: "string", enum: ["active", "main", "aux"] },
+        requestedAuxBank: { type: ["integer", "null"], minimum: 0, maximum: 127 },
+        effectiveAuxBank: { type: ["integer", "null"], minimum: 0, maximum: 127 },
+        effectiveSegments: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            properties: {
+              address: { type: "integer", minimum: 0, maximum: 65535 },
+              length: { type: "integer", minimum: 1, maximum: 4096 },
+              space: { type: "string", enum: ["main", "aux", "system"] },
+              auxBank: { type: "integer", minimum: 0, maximum: 127 },
+            },
+            required: ["address", "length", "space"],
+            additionalProperties: false,
+          },
+        },
+        mapping: {
+          type: "object",
+          properties: {
+            RAMRD: { type: "boolean" },
+            RAMWRT: { type: "boolean" },
+            ALTZP: { type: "boolean" },
+            "80STORE": { type: "boolean" },
+            PAGE2: { type: "boolean" },
+            HIRES: { type: "boolean" },
+          },
+          required: ["RAMRD", "RAMWRT", "ALTZP", "80STORE", "PAGE2", "HIRES"],
+          additionalProperties: false,
+        },
       },
-      required: ["address", "length", "bytes"],
+      required: [
+        "address",
+        "length",
+        "bytes",
+        "requestedSpace",
+        "requestedAuxBank",
+        "effectiveAuxBank",
+        "effectiveSegments",
+        "mapping",
+      ],
       additionalProperties: false,
     },
   },
@@ -908,7 +950,7 @@ export class Apple2tsCore {
     }, signal)
   }
 
-  async readMemory({ address, length }) {
+  async readMemory({ address, length, space = "active", auxBank }) {
     if (!Number.isInteger(address) || address < 0 || address > 65535) {
       throw new Error("address must be an integer between 0 and 65535")
     }
@@ -918,18 +960,36 @@ export class Apple2tsCore {
     if (address + length > 65536) {
       throw new Error("Requested memory range exceeds 64 KB address space")
     }
+    if (!(["active", "main", "aux"].includes(space))) {
+      throw new Error("space must be 'active', 'main', or 'aux'")
+    }
+    if (auxBank !== undefined && space !== "aux") {
+      throw new Error("auxBank is valid only when space is 'aux'")
+    }
+    if (auxBank !== undefined && (!Number.isInteger(auxBank) || auxBank < 0 || auxBank > 127)) {
+      throw new Error("auxBank must be an integer between 0 and 127")
+    }
+    if (space !== "active" && address + length > 0xC000) {
+      throw new Error("Physical memory reads must fit within RAM at $0000-$BFFF")
+    }
     const query = new URLSearchParams({
       start: String(address),
       length: String(length),
-      format: "bytes",
+      space,
     })
-    const result = await this.request(`/api/debug/memory?${query}`)
+    if (auxBank !== undefined) query.set("auxBank", String(auxBank))
+    const result = await this.request(`/api/private/memory?${query}`)
     return {
       emulator: result.emulator,
       value: {
-        address: result.state.start,
+        address: result.state.address,
         length: result.state.length,
-        bytes: result.state.data,
+        bytes: result.state.bytes,
+        requestedSpace: result.state.requestedSpace,
+        requestedAuxBank: result.state.requestedAuxBank,
+        effectiveAuxBank: result.state.effectiveAuxBank,
+        effectiveSegments: result.state.effectiveSegments,
+        mapping: result.state.mapping,
       },
     }
   }
@@ -1236,7 +1296,7 @@ export const createMcpServer = (session) => {
     "read_memory",
     {
       title: "Read Apple II memory",
-      description: "Read a bounded memory range from the emulator bound to this process.",
+      description: "Read a bounded active, main, or auxiliary memory range from the emulator bound to this process. Explicit physical reads are side-effect-free and require a paused emulator.",
       inputSchema: memoryReadInputSchema,
       outputSchema: memoryReadOutputSchema,
       annotations: {
