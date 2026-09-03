@@ -2156,6 +2156,55 @@ test("stdio exposes coherent execution state and waits for worker-confirmed stop
   assert.deepEqual((await call("execution-stop-again", "stop_session")).result.structuredContent, { stopped: false })
 })
 
+test("stdio cancellation aborts an execution wait without poisoning the session", async (t) => {
+  const processState = await launchMcp()
+  t.after(processState.cleanup)
+  await processState.waitForStderr((line) => line.includes("MCP ready for session requests"))
+  await initializeMcp(processState)
+  assert.equal((await startMcpSession(processState)).result.isError, undefined)
+  const resumed = await sendMcpRequest(processState, "cancel-resume", "tools/call", {
+    name: "resume",
+    arguments: {},
+  })
+  assert.equal(resumed.result.isError, undefined)
+  const running = await sendMcpRequest(processState, "cancel-read", "resources/read", {
+    uri: "apple2ts://session/execution",
+  })
+  const sequence = JSON.parse(running.result.contents[0].text).state.executionSequence
+
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: "cancel-wait",
+    method: "tools/call",
+    params: {
+      name: "wait_for_execution_stop",
+      arguments: {timeoutMs: 1000, afterSequence: sequence},
+    },
+  })}\n`)
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0",
+    method: "notifications/cancelled",
+    params: {requestId: "cancel-wait", reason: "test cancellation"},
+  })}\n`)
+
+  const usable = await sendMcpRequest(processState, "cancel-usable", "resources/read", {
+    uri: "apple2ts://session/execution",
+  })
+  assert.ok(Number.isInteger(JSON.parse(usable.result.contents[0].text).state.executionSequence))
+  const stopped = await sendMcpRequest(processState, "cancel-stop", "tools/call", {
+    name: "stop_session",
+    arguments: {},
+  })
+  assert.deepEqual(stopped.result.structuredContent, {stopped: true})
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(
+    processState.getStdout().split("\n").filter(Boolean)
+      .some((line) => JSON.parse(line).id === "cancel-wait"),
+    false,
+  )
+  assert.equal((await startMcpSession(processState, "cancel-restart")).result.isError, undefined)
+})
+
 test("real renderer reports the finite program stop atomically", {
   skip: !process.env.APPLE2TS_REAL_CHROMIUM_EXECUTABLE || !process.env.APPLE2TS_REAL_DIST_DIR,
 }, async (t) => {
