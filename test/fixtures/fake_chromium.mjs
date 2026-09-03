@@ -15,24 +15,14 @@ const remoteControlToken = launchUrl.searchParams.get("remoteControlToken")
 const rendererId = launchUrl.searchParams.get("rendererId")
 const receiptPath = process.env.APPLE2TS_FAKE_CHROMIUM_RECEIPT
 
-if (receiptPath) {
-  await writeFile(receiptPath, JSON.stringify({
-    pid: process.pid,
-    profilePath,
-    launchUrl: launchUrl.href,
-    headless: process.argv.includes("--headless=new"),
-  }))
-}
-
 let receiptUpdateSequence = 0
 let receiptUpdates = Promise.resolve()
-const updateReceipt = (patch) => {
+const writeReceipt = (makeReceipt) => {
   if (!receiptPath) return Promise.resolve()
   receiptUpdates = receiptUpdates.then(async () => {
-    const receipt = JSON.parse(readFileSync(receiptPath, "utf8"))
     const temporaryPath = `${receiptPath}.${process.pid}.${receiptUpdateSequence++}.tmp`
     try {
-      await writeFile(temporaryPath, JSON.stringify({ ...receipt, ...patch }))
+      await writeFile(temporaryPath, JSON.stringify(makeReceipt()))
       await rename(temporaryPath, receiptPath)
     } finally {
       await rm(temporaryPath, { force: true })
@@ -40,6 +30,17 @@ const updateReceipt = (patch) => {
   })
   return receiptUpdates
 }
+const updateReceipt = (patch) => writeReceipt(() => ({
+  ...JSON.parse(readFileSync(receiptPath, "utf8")),
+  ...patch,
+}))
+
+await writeReceipt(() => ({
+  pid: process.pid,
+  profilePath,
+  launchUrl: launchUrl.href,
+  headless: process.argv.includes("--headless=new"),
+}))
 
 if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "exit") process.exit(42)
 if (launchUrl.searchParams.get("remoteControl") !== "1" || !remoteControlToken || !rendererId) process.exit(65)
