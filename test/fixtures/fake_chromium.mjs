@@ -273,6 +273,16 @@ while (!stopping) {
       }
     } else if (command.action === "setCpuState") {
       status.machine.machineState = command.payload.state
+      const { PC, Accum, XReg, YReg, StackPtr, PStatus } = command.payload.state
+      status.machine.execution = {
+        ...status.machine.execution,
+        PC,
+        A: Accum,
+        X: XReg,
+        Y: YReg,
+        S: StackPtr,
+        PStatus,
+      }
       result = status
     } else if (command.action === "setKeyboardState") {
       keyboardStates.push(command.payload)
