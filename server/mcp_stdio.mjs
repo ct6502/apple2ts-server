@@ -48,14 +48,10 @@ const CPU_PATCH_MAXIMUMS = Object.freeze({
 const SESSION_LIFECYCLE_URI = "apple2ts://session/lifecycle"
 const SESSION_EVENT_VERSION = 1
 
-const resolveSessionEventFile = async (value, stagingRoot) => {
+const resolveSessionEventFile = async (value) => {
   if (!value) return null
-  if (!stagingRoot) throw new Error("APPLE2TS_SESSION_EVENT_FILE requires APPLE2TS_FILE_STAGING_ROOT")
   const requested = path.resolve(value)
   const parent = await realpath(path.dirname(requested))
-  if (parent !== stagingRoot) {
-    throw new Error("APPLE2TS_SESSION_EVENT_FILE must be directly inside APPLE2TS_FILE_STAGING_ROOT")
-  }
   const target = path.join(parent, path.basename(requested))
   const existing = await lstat(target).catch((error) => {
     if (error?.code === "ENOENT") return null
@@ -1707,7 +1703,7 @@ export const runStdio = async (options = {}) => {
             throw new Error("APPLE2TS_FILE_STAGING_ROOT must be writable when file staging is configured")
           }
         }
-        const sessionEventFile = await resolveSessionEventFile(options.sessionEventFile, binaryRoot)
+        const sessionEventFile = await resolveSessionEventFile(options.sessionEventFile)
         const chromiumMode = options.chromiumMode ?? "headless"
         if (chromiumMode !== "headless" && chromiumMode !== "visible") {
           throw new Error("APPLE2TS_CHROMIUM_MODE must be 'headless' or 'visible'")
