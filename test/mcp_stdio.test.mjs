@@ -1546,9 +1546,22 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     arguments: {},
   })
   assert.equal(running.result.isError, undefined, JSON.stringify(running))
-  for (const [id, args] of [
-    ["memory-running-omitted", {address: 0, length: 1}],
-    ["memory-running-active", {address: 0, length: 1, space: "active"}],
+  for (const [id, args, message] of [
+    [
+      "memory-running-omitted",
+      {address: 0, length: 1},
+      "Memory dump unavailable for the requested range. Pause the emulator first.",
+    ],
+    [
+      "memory-running-active",
+      {address: 0, length: 1, space: "active"},
+      "Memory dump unavailable for the requested range. Pause the emulator first.",
+    ],
+    [
+      "memory-running-main",
+      {address: 0, length: 1, space: "main"},
+      "Memory is available only while the emulator is paused",
+    ],
   ]) {
     const rejected = await sendMcpRequest(processState, id, "tools/call", {
       name: "read_memory",
@@ -1556,7 +1569,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     })
     assert.equal(rejected.result.isError, true)
     assert.equal(rejected.result.structuredContent, undefined)
-    assert.match(rejected.result.content[0].text, /Memory is available only while the emulator is paused/)
+    assert.equal(rejected.result.content[0].text.includes(message), true)
   }
   const repaused = await sendMcpRequest(processState, "memory-repause", "tools/call", {
     name: "pause",
