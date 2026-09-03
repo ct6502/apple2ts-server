@@ -231,6 +231,101 @@ const machineResultSchema = fromJsonSchema({
   additionalProperties: false,
 })
 
+const executionSnapshotSchema = {
+  type: "object",
+  properties: {
+    executionSequence: { type: "integer", minimum: 0 },
+    state: { type: "string", enum: ["running", "paused"] },
+    pauseReason: {
+      type: ["string", "null"],
+      enum: [null, "idle", "explicit", "breakpoint", "watchpoint", "step", "cycle-limit", "run-to-return"],
+    },
+    breakpoint: {
+      oneOf: [
+        { type: "null" },
+        {
+          type: "object",
+          properties: {
+            breakpointId: { type: "string" },
+            address: { type: "integer" },
+          },
+          required: ["breakpointId", "address"],
+          additionalProperties: false,
+        },
+      ],
+    },
+    PC: { type: "integer", minimum: 0, maximum: 65535 },
+    A: { type: "integer", minimum: 0, maximum: 255 },
+    X: { type: "integer", minimum: 0, maximum: 255 },
+    Y: { type: "integer", minimum: 0, maximum: 255 },
+    S: { type: "integer", minimum: 0, maximum: 255 },
+    PStatus: { type: "integer", minimum: 0, maximum: 255 },
+    machineName: { type: "string" },
+    memoryConfiguration: {
+      type: "object",
+      properties: {
+        slot3Card: { type: "string" },
+        ramWorksKb: { type: "integer", minimum: 0 },
+      },
+      required: ["slot3Card", "ramWorksKb"],
+      additionalProperties: false,
+    },
+  },
+  required: [
+    "executionSequence", "state", "pauseReason", "breakpoint",
+    "PC", "A", "X", "Y", "S", "PStatus", "machineName", "memoryConfiguration",
+  ],
+  additionalProperties: false,
+}
+
+const executionWaitInputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    timeoutMs: { type: "integer", minimum: 1, maximum: 120000 },
+    afterSequence: { type: "integer", minimum: 0 },
+    expectedBreakpointId: { type: "string", pattern: "^bp:[0-9]+$" },
+    expectedBreakpointAddress: { type: "integer", minimum: 0, maximum: 65535 },
+  },
+  required: ["timeoutMs"],
+  additionalProperties: false,
+})
+
+const executionWaitResultSchema = fromJsonSchema({
+  oneOf: [
+    {
+      type: "object",
+      properties: {
+        emulator: emulatorIdentitySchema,
+        outcome: { const: "stopped" },
+        expectationMatched: { type: ["boolean", "null"] },
+        state: executionSnapshotSchema,
+      },
+      required: ["emulator", "outcome", "expectationMatched", "state"],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: {
+        emulator: emulatorIdentitySchema,
+        outcome: { const: "timeout" },
+        state: executionSnapshotSchema,
+      },
+      required: ["emulator", "outcome", "state"],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: {
+        emulator: emulatorIdentitySchema,
+        outcome: { const: "session_closed" },
+        state: { oneOf: [{ type: "null" }, executionSnapshotSchema] },
+      },
+      required: ["emulator", "outcome", "state"],
+      additionalProperties: false,
+    },
+  ],
+})
+
 const memoryReadInputSchema = fromJsonSchema({
   type: "object",
   properties: {
@@ -704,6 +799,10 @@ export class Apple2tsCore {
     this.mutations = Promise.resolve()
     this.mutationFailure = null
     this.heldKey = null
+    this.execution = null
+    this.executionWaiters = new Set()
+    this.executionReaders = new Set()
+    this.executionClosed = false
   }
 
   async request(pathname, options, signal = this.signal, timeoutMs) {
@@ -720,6 +819,134 @@ export class Apple2tsCore {
 
   readMachine() {
     return this.request("/api/machine")
+  }
+
+  observeExecution(statusOrExecution) {
+    const execution = statusOrExecution?.machine?.execution ?? statusOrExecution
+    if (
+      !execution
+      || !Number.isInteger(execution.executionSequence)
+      || execution.executionSequence < 0
+      || (this.execution && execution.executionSequence < this.execution.executionSequence)
+    ) {
+      return
+    }
+    this.execution = structuredClone(execution)
+    for (const reader of [...this.executionReaders]) reader(this.execution)
+    if (this.execution.state !== "paused") return
+    for (const waiter of [...this.executionWaiters]) {
+      if (this.execution.executionSequence > waiter.afterSequence) waiter.stop(this.execution)
+    }
+  }
+
+  async readExecution() {
+    if (!this.execution) {
+      await new Promise((resolve, reject) => {
+        const finish = (error) => {
+          clearTimeout(timeout)
+          this.signal?.removeEventListener("abort", onAbort)
+          this.executionReaders.delete(onExecution)
+          if (error) reject(error)
+          else resolve()
+        }
+        const onExecution = () => finish()
+        const onAbort = () => finish(this.signal.reason ?? new Error("Execution state read cancelled"))
+        const timeout = setTimeout(
+          () => finish(new Error("Timed out waiting for worker execution state")),
+          READ_TIMEOUT_MS,
+        )
+        this.executionReaders.add(onExecution)
+        this.signal?.addEventListener("abort", onAbort, { once: true })
+        if (this.execution) finish()
+        else if (this.signal?.aborted) onAbort()
+      })
+    }
+    if (!this.execution) throw new Error("Execution state was not available from the browser client")
+    return { emulator: this.identity, state: structuredClone(this.execution) }
+  }
+
+  async waitForExecutionStop(input, signal) {
+    const expectedIdAddress = input.expectedBreakpointId === undefined
+      ? null
+      : Number(input.expectedBreakpointId.slice("bp:".length))
+    if (
+      expectedIdAddress !== null
+      && (!Number.isSafeInteger(expectedIdAddress) || expectedIdAddress < 0 || expectedIdAddress > 65535)
+    ) {
+      throw new Error("expectedBreakpointId must identify an address between 0 and 65535")
+    }
+    if (
+      expectedIdAddress !== null
+      && input.expectedBreakpointAddress !== undefined
+      && expectedIdAddress !== input.expectedBreakpointAddress
+    ) {
+      throw new Error("expectedBreakpointId and expectedBreakpointAddress must identify the same breakpoint")
+    }
+    if (!this.execution) await this.readExecution()
+    const afterSequence = input.afterSequence ?? this.execution.executionSequence
+    const stoppedResult = (state) => {
+      const expectedAddress = input.expectedBreakpointAddress
+        ?? expectedIdAddress
+      const expectationMatched = expectedAddress === null
+        ? null
+        : state.breakpoint?.address === expectedAddress
+      return {
+        emulator: this.identity,
+        outcome: "stopped",
+        expectationMatched,
+        state: structuredClone(state),
+      }
+    }
+    if (
+      this.execution.state === "paused"
+      && (input.afterSequence === undefined || this.execution.executionSequence > afterSequence)
+    ) {
+      return stoppedResult(this.execution)
+    }
+    if (this.executionClosed) {
+      return { emulator: this.identity, outcome: "session_closed", state: structuredClone(this.execution) }
+    }
+
+    return new Promise((resolve, reject) => {
+      let timeout
+      const finish = (result, error) => {
+        clearTimeout(timeout)
+        signal?.removeEventListener("abort", onAbort)
+        this.executionWaiters.delete(waiter)
+        if (error) reject(error)
+        else resolve(result)
+      }
+      const onAbort = () => finish(null, signal.reason ?? new Error("Execution wait cancelled"))
+      const waiter = {
+        afterSequence,
+        stop: (state) => finish(stoppedResult(state)),
+        close: () => finish({
+          emulator: this.identity,
+          outcome: "session_closed",
+          state: this.execution ? structuredClone(this.execution) : null,
+        }),
+      }
+      timeout = setTimeout(() => finish({
+        emulator: this.identity,
+        outcome: "timeout",
+        state: structuredClone(this.execution),
+      }), input.timeoutMs)
+      this.executionWaiters.add(waiter)
+      signal?.addEventListener("abort", onAbort, { once: true })
+      if (signal?.aborted) onAbort()
+      if (this.executionClosed) waiter.close()
+      else if (
+        this.execution.state === "paused"
+        && this.execution.executionSequence > afterSequence
+      ) waiter.stop(this.execution)
+    })
+  }
+
+  closeExecution() {
+    if (this.executionClosed) return
+    this.executionClosed = true
+    for (const reader of [...this.executionReaders]) reader(null)
+    for (const waiter of [...this.executionWaiters]) waiter.close()
   }
 
   readCpu() {
@@ -1264,6 +1491,13 @@ export const createMcpServer = (session) => {
       read: () => core().readMachine(),
     },
     {
+      name: "execution",
+      uri: "apple2ts://session/execution",
+      title: "Apple2TS execution state",
+      description: "Worker-confirmed execution state for the emulator bound to this process.",
+      read: () => core().readExecution(),
+    },
+    {
       name: "cpu",
       uri: "apple2ts://cpu",
       title: "Apple2TS CPU state",
@@ -1421,6 +1655,32 @@ export const createMcpServer = (session) => {
   )
 
   server.registerTool(
+    "wait_for_execution_stop",
+    {
+      title: "Wait for Apple II execution to stop",
+      description: "Wait for a worker-confirmed stop without changing emulator execution.",
+      inputSchema: executionWaitInputSchema,
+      outputSchema: executionWaitResultSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async (input, context) => {
+      try {
+        return toolResult(await core().waitForExecutionStop(input, context.mcpReq.signal))
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+        }
+      }
+    },
+  )
+
+  server.registerTool(
     "capture_screen",
     {
       title: "Capture Apple II screen",
@@ -1504,7 +1764,7 @@ const waitForRenderer = async (core, timeoutMs, signal) => {
   while (Date.now() < deadline) {
     if (signal.aborted) throw signal.reason
     try {
-      await Promise.all([core.readMachine(), core.readCpu()])
+      await Promise.all([core.readMachine(), core.readCpu(), core.readExecution()])
       return
     } catch (error) {
       lastError = error
@@ -1779,6 +2039,7 @@ export const runStdio = async (options = {}) => {
                 }).catch(reportFatal)
               },
             },
+            onClientState: (state) => core?.observeExecution(state),
             logger: { log: (message) => process.stderr.write(`${message}\n`) },
           })
           throwIfShuttingDown()
@@ -1896,6 +2157,7 @@ export const runStdio = async (options = {}) => {
         if (!activeSession) return { stopped: false }
         const current = activeSession
         const failures = []
+        current.core.closeExecution()
         current.controller.abort(new Error(reason))
         await current.core.neutralizeKeyboard().catch((error) => failures.push(error))
         await Promise.resolve(current.core.cleanupStagedFiles()).catch((error) => failures.push(error))

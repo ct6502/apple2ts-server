@@ -16,6 +16,7 @@ let commandTimeoutMs = Number(process.env.COMMAND_TIMEOUT_MS || 10000)
 let serverInstanceId = randomUUID()
 let privateRenderer = null
 let logger = console
+let clientStateObserver = null
 
 const clients = new Map()
 const pendingCommands = new Map()
@@ -424,6 +425,7 @@ const updateClientStatusFromCommandResult = (client, result) => {
   const status = getStatusFromCommandResult(result)
   if (status) {
     client.latestState = status
+    clientStateObserver?.(status)
   }
   client.lastSeenAt = Date.now()
   return status
@@ -962,6 +964,7 @@ const server = createServer(async (req, res) => {
       }
       client.lastSeenAt = Date.now()
       client.latestState = body.state || null
+      clientStateObserver?.(client.latestState)
       writeJson(res, 200, { ok: true })
       return
     }
@@ -1967,6 +1970,7 @@ export const startApple2tsServer = async (options = {}) => {
   commandTimeoutMs = Number(options.commandTimeoutMs ?? process.env.COMMAND_TIMEOUT_MS ?? 10000)
   serverInstanceId = options.serverInstanceId || randomUUID()
   logger = options.logger || console
+  clientStateObserver = typeof options.onClientState === "function" ? options.onClientState : null
   if (
     options.privateRenderer &&
     (!options.privateRenderer.remoteControlToken ||
@@ -2027,6 +2031,7 @@ export const stopApple2tsServer = async () => {
   }
   clients.clear()
   privateRenderer = null
+  clientStateObserver = null
 
   if (!server.listening) return
   await new Promise((resolve, reject) => {
