@@ -205,8 +205,8 @@ const memoryReadOutputSchema = fromJsonSchema({
           maxItems: 4096,
         },
         requestedSpace: { type: "string", enum: ["active", "main", "aux"] },
-        requestedAuxBank: { type: ["integer", "null"], minimum: 0, maximum: 127 },
-        effectiveAuxBank: { type: ["integer", "null"], minimum: 0, maximum: 127 },
+        requestedAuxBank: { type: "integer", minimum: 0, maximum: 127 },
+        effectiveAuxBank: { type: "integer", minimum: 0, maximum: 127 },
         effectiveSegments: {
           type: "array",
           minItems: 1,
@@ -241,8 +241,6 @@ const memoryReadOutputSchema = fromJsonSchema({
         "length",
         "bytes",
         "requestedSpace",
-        "requestedAuxBank",
-        "effectiveAuxBank",
         "effectiveSegments",
         "mapping",
       ],
@@ -986,8 +984,12 @@ export class Apple2tsCore {
         length: result.state.length,
         bytes: result.state.bytes,
         requestedSpace: result.state.requestedSpace,
-        requestedAuxBank: result.state.requestedAuxBank,
-        effectiveAuxBank: result.state.effectiveAuxBank,
+        ...(Number.isInteger(result.state.requestedAuxBank)
+          ? {requestedAuxBank: result.state.requestedAuxBank}
+          : {}),
+        ...(Number.isInteger(result.state.effectiveAuxBank)
+          ? {effectiveAuxBank: result.state.effectiveAuxBank}
+          : {}),
         effectiveSegments: result.state.effectiveSegments,
         mapping: result.state.mapping,
       },
