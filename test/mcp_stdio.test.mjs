@@ -1489,6 +1489,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     ],
   )
   const readMemoryTool = tools.result.tools.find((tool) => tool.name === "read_memory")
+  assert.match(readMemoryTool.description, /Request the smallest useful range/)
   assert.deepEqual(readMemoryTool.inputSchema, {
     type: "object",
     properties: {
