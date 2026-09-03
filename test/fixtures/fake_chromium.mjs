@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { readFileSync, writeFileSync } from "node:fs"
-import { chmod, writeFile } from "node:fs/promises"
+import { chmod, rename, rm, writeFile } from "node:fs/promises"
 
 import { statusFixture } from "./status_fixture.mjs"
 
@@ -22,6 +22,23 @@ if (receiptPath) {
     launchUrl: launchUrl.href,
     headless: process.argv.includes("--headless=new"),
   }))
+}
+
+let receiptUpdateSequence = 0
+let receiptUpdates = Promise.resolve()
+const updateReceipt = (patch) => {
+  if (!receiptPath) return Promise.resolve()
+  receiptUpdates = receiptUpdates.then(async () => {
+    const receipt = JSON.parse(readFileSync(receiptPath, "utf8"))
+    const temporaryPath = `${receiptPath}.${process.pid}.${receiptUpdateSequence++}.tmp`
+    try {
+      await writeFile(temporaryPath, JSON.stringify({ ...receipt, ...patch }))
+      await rename(temporaryPath, receiptPath)
+    } finally {
+      await rm(temporaryPath, { force: true })
+    }
+  })
+  return receiptUpdates
 }
 
 if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "exit") process.exit(42)
@@ -109,10 +126,7 @@ if (!initialState.ok) process.exit(69)
 
 const stop = () => {
   if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "ignore-term") {
-    if (receiptPath) {
-      const receipt = JSON.parse(readFileSync(receiptPath, "utf8"))
-      writeFileSync(receiptPath, JSON.stringify({ ...receipt, sigtermSeen: true }))
-    }
+    void updateReceipt({ sigtermSeen: true })
     return
   }
   stopping = true
@@ -155,10 +169,7 @@ while (!stopping) {
       status.machine.execution.pauseReason = status.machine.runMode === -2 ? "explicit" : null
       status.machine.execution.breakpoint = null
       if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "stall-run-mode") {
-        if (receiptPath) {
-          const receipt = JSON.parse(readFileSync(receiptPath, "utf8"))
-          writeFileSync(receiptPath, JSON.stringify({ ...receipt, stalledRunMode: true }))
-        }
+        await updateReceipt({ stalledRunMode: true })
         continue
       }
       result = status
@@ -286,10 +297,7 @@ while (!stopping) {
       result = status
     } else if (command.action === "setKeyboardState") {
       keyboardStates.push(command.payload)
-      if (receiptPath) {
-        const receipt = JSON.parse(readFileSync(receiptPath, "utf8"))
-        writeFileSync(receiptPath, JSON.stringify({ ...receipt, keyboardStates }))
-      }
+      await updateReceipt({ keyboardStates })
       result = status
     }
     const reply = await postJson("/api/client/reply", {
