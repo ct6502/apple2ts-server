@@ -1507,6 +1507,22 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     minItems: 1,
     maxItems: 4096,
   })
+  assert.equal(
+    readMemoryTool.outputSchema.properties.value.properties.requestedAuxBank.type,
+    "integer",
+  )
+  assert.equal(
+    readMemoryTool.outputSchema.properties.value.properties.effectiveAuxBank.type,
+    "integer",
+  )
+  assert.equal(
+    readMemoryTool.outputSchema.properties.value.required.includes("requestedAuxBank"),
+    false,
+  )
+  assert.equal(
+    readMemoryTool.outputSchema.properties.value.required.includes("effectiveAuxBank"),
+    false,
+  )
   assert.deepEqual(readMemoryTool.annotations, {
     readOnlyHint: true,
     destructiveHint: false,
@@ -1592,8 +1608,6 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
       length: 2,
       bytes: [171, 205],
       requestedSpace: "active",
-      requestedAuxBank: null,
-      effectiveAuxBank: null,
       effectiveSegments: [{address: 65534, length: 2, space: "system"}],
       mapping: {
         RAMRD: false,
@@ -1617,7 +1631,6 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     length: 1,
     bytes: [0x22],
     requestedSpace: "aux",
-    requestedAuxBank: null,
     effectiveAuxBank: 0,
     effectiveSegments: [{address: 0x03A4, length: 1, space: "aux", auxBank: 0}],
     mapping: {
@@ -1629,6 +1642,14 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
       HIRES: false,
     },
   })
+
+  const selectedPhysical = await sendMcpRequest(processState, "selected-physical-memory", "tools/call", {
+    name: "read_memory",
+    arguments: {address: 0x03A4, length: 1, space: "aux", auxBank: 0},
+  })
+  assert.equal(selectedPhysical.result.isError, undefined, JSON.stringify(selectedPhysical))
+  assert.equal(selectedPhysical.result.structuredContent.value.requestedAuxBank, 0)
+  assert.equal(selectedPhysical.result.structuredContent.value.effectiveAuxBank, 0)
 
   for (const args of [
     {address: 0xC000, length: 1, space: "main"},
