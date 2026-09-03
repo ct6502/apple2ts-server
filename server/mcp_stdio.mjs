@@ -1311,7 +1311,7 @@ export const createMcpServer = (session) => {
     "read_memory",
     {
       title: "Read Apple II memory",
-      description: "Read a bounded active, main, or auxiliary memory range from the emulator bound to this process. Explicit physical reads are side-effect-free and require a paused emulator.",
+      description: "Read a bounded active, main, or auxiliary memory range from the emulator bound to this process. Explicit physical reads are side-effect-free and require a paused emulator. Request the smallest useful range because results contain one integer per byte and large reads can consume substantial client or model context.",
       inputSchema: memoryReadInputSchema,
       outputSchema: memoryReadOutputSchema,
       annotations: {
