@@ -1468,6 +1468,94 @@ test("cancelling an active mutation prevents later mutations in the same session
   await assert.rejects(core.resume(), /restart this MCP session/)
 })
 
+const executionSnapshot = (sequence, state, overrides = {}) => ({
+  executionSequence: sequence,
+  state,
+  pauseReason: state === "paused" ? "explicit" : null,
+  breakpoint: null,
+  PC: 0x6000,
+  A: 1,
+  X: 2,
+  Y: 3,
+  S: 0xFF,
+  PStatus: 0x24,
+  machineName: "APPLE2EE",
+  memoryConfiguration: { slot3Card: "aux", ramWorksKb: 64 },
+  ...overrides,
+})
+
+test("execution waiters are bounded, cancellable, nonblocking, and lost-wakeup safe", async () => {
+  const core = new Apple2tsCore(
+    "http://unused.invalid",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  core.observeExecution(executionSnapshot(4, "running"))
+
+  const wait = core.waitForExecutionStop({
+    timeoutMs: 1000,
+    afterSequence: 4,
+    expectedBreakpointAddress: 0x6004,
+  })
+  core.request = async (pathname) => ({ emulator: core.identity, state: { pathname } })
+  assert.deepEqual((await core.readCpu()).state, { pathname: "/api/debug/cpu" })
+
+  core.observeExecution(executionSnapshot(5, "paused", {
+    pauseReason: "breakpoint",
+    breakpoint: { breakpointId: "bp:24579", address: 0x6003 },
+    PC: 0x6003,
+  }))
+  const stopped = await wait
+  assert.equal(stopped.outcome, "stopped")
+  assert.equal(stopped.expectationMatched, false)
+  assert.equal(stopped.state.executionSequence, 5)
+  assert.equal(stopped.state.breakpoint.breakpointId, "bp:24579")
+
+  core.observeExecution(executionSnapshot(6, "running"))
+  core.observeExecution(executionSnapshot(7, "paused"))
+  const fastStop = await core.waitForExecutionStop({ timeoutMs: 1000, afterSequence: 6 })
+  assert.equal(fastStop.outcome, "stopped")
+  assert.equal(fastStop.state.executionSequence, 7)
+
+  const alreadyPaused = await core.waitForExecutionStop({ timeoutMs: 1000 })
+  assert.equal(alreadyPaused.outcome, "stopped")
+  assert.equal(alreadyPaused.state.executionSequence, 7)
+
+  core.observeExecution(executionSnapshot(8, "running"))
+  const timedOut = await core.waitForExecutionStop({ timeoutMs: 5, afterSequence: 8 })
+  assert.equal(timedOut.outcome, "timeout")
+  assert.equal(timedOut.state.executionSequence, 8)
+
+  const cancellation = new AbortController()
+  const cancelled = core.waitForExecutionStop({ timeoutMs: 1000, afterSequence: 8 }, cancellation.signal)
+  cancellation.abort(new Error("cancelled by caller"))
+  await assert.rejects(cancelled, /cancelled by caller/)
+
+  const closed = core.waitForExecutionStop({ timeoutMs: 1000, afterSequence: 8 })
+  core.closeExecution()
+  assert.equal((await closed).outcome, "session_closed")
+})
+
+test("execution state rejects inconsistent expectations and ignores stale observations", async () => {
+  const core = new Apple2tsCore(
+    "http://unused.invalid",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  core.observeExecution(executionSnapshot(3, "paused", { PC: 0x6003 }))
+  core.observeExecution(executionSnapshot(2, "running", { PC: 0x1234 }))
+  assert.equal((await core.readExecution()).state.PC, 0x6003)
+  await assert.rejects(core.waitForExecutionStop({
+    timeoutMs: 10,
+    expectedBreakpointId: "bp:24579",
+    expectedBreakpointAddress: 0x6004,
+  }), /must identify the same breakpoint/)
+  await assert.rejects(core.waitForExecutionStop({
+    timeoutMs: 10,
+    expectedBreakpointId: "bp:65536",
+  }), /address between 0 and 65535/)
+})
+
 test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   const processState = await launchMcp()
   t.after(processState.cleanup)
@@ -1504,6 +1592,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.deepEqual(listed.result.resources.map((resource) => resource.uri), [
     "apple2ts://session/lifecycle",
     "apple2ts://machine",
+    "apple2ts://session/execution",
     "apple2ts://cpu",
     "apple2ts://debugger/breakpoints",
     "apple2ts://disks/current",
@@ -1530,6 +1619,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
       "start_session",
       "stop_session",
       "read_memory",
+      "wait_for_execution_stop",
       "capture_screen",
       "set_keyboard_key",
       "eject_disk",
@@ -1966,6 +2056,183 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.equal(processExit.error, null)
   assert.equal(processExit.code, 0, processState.getStderr())
   for (const line of processState.getStdout().trim().split("\n")) assert.doesNotThrow(() => JSON.parse(line))
+})
+
+test("stdio exposes coherent execution state and waits for worker-confirmed stops", async (t) => {
+  const processState = await launchMcp({
+    APPLE2TS_FAKE_CHROMIUM_MODE: "execution-stop",
+    APPLE2TS_FAKE_EXECUTION_STOP_DELAY_MS: "100",
+  })
+  t.after(processState.cleanup)
+  await processState.waitForStderr((line) => line.includes("MCP ready for session requests"))
+  await initializeMcp(processState)
+  const started = await startMcpSession(processState)
+  assert.equal(started.result.isError, undefined, JSON.stringify(started))
+
+  const call = (id, name, args = {}) => sendMcpRequest(processState, id, "tools/call", {
+    name,
+    arguments: args,
+  })
+  const readResource = async (id, uri) => {
+    const response = await sendMcpRequest(processState, id, "resources/read", { uri })
+    return JSON.parse(response.result.contents[0].text)
+  }
+
+  assert.equal((await call("execution-breakpoint", "set_breakpoint", { address: 0x6003 })).result.isError, undefined)
+  const before = await readResource("execution-before", "apple2ts://session/execution")
+  assert.equal(before.state.state, "paused")
+
+  const resumed = await call("execution-resume", "resume")
+  assert.equal(resumed.result.structuredContent.state.runMode, "running")
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: "execution-wait",
+    method: "tools/call",
+    params: {
+      name: "wait_for_execution_stop",
+      arguments: {
+        timeoutMs: 1000,
+        afterSequence: before.state.executionSequence,
+        expectedBreakpointAddress: 0x6004,
+      },
+    },
+  })}\n`)
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: "execution-concurrent-read",
+    method: "resources/read",
+    params: { uri: "apple2ts://cpu" },
+  })}\n`)
+  const concurrentRead = JSON.parse(
+    await processState.waitForStdout((line) => JSON.parse(line).id === "execution-concurrent-read"),
+  )
+  assert.equal(JSON.parse(concurrentRead.result.contents[0].text).state.PC, 768)
+
+  const waited = JSON.parse(
+    await processState.waitForStdout((line) => JSON.parse(line).id === "execution-wait"),
+  ).result.structuredContent
+  assert.equal(waited.outcome, "stopped")
+  assert.equal(waited.expectationMatched, false)
+  assert.ok(waited.state.executionSequence > before.state.executionSequence)
+  assert.deepEqual(waited.state.breakpoint, { breakpointId: "bp:24579", address: 0x6003 })
+  assert.equal(waited.state.PC, 0x6003)
+
+  const after = await readResource("execution-after", "apple2ts://session/execution")
+  assert.deepEqual(after, { emulator: waited.emulator, state: waited.state })
+  const alreadyPaused = await call("execution-already-paused", "wait_for_execution_stop", { timeoutMs: 50 })
+  assert.equal(alreadyPaused.result.structuredContent.outcome, "stopped")
+
+  await call("execution-clear", "clear_all_breakpoints")
+  await call("execution-resume-timeout", "resume")
+  const running = await readResource("execution-running", "apple2ts://session/execution")
+  const timedOut = await call("execution-timeout", "wait_for_execution_stop", {
+    timeoutMs: 10,
+    afterSequence: running.state.executionSequence,
+  })
+  assert.equal(timedOut.result.structuredContent.outcome, "timeout")
+  assert.equal(timedOut.result.structuredContent.state.executionSequence, running.state.executionSequence)
+
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: "execution-close-wait",
+    method: "tools/call",
+    params: {
+      name: "wait_for_execution_stop",
+      arguments: { timeoutMs: 1000, afterSequence: running.state.executionSequence },
+    },
+  })}\n`)
+  processState.child.stdin.write(`${JSON.stringify({
+    jsonrpc: "2.0", id: "execution-stop", method: "tools/call",
+    params: { name: "stop_session", arguments: {} },
+  })}\n`)
+  const closedWait = JSON.parse(
+    await processState.waitForStdout((line) => JSON.parse(line).id === "execution-close-wait"),
+  )
+  const stoppedSession = JSON.parse(
+    await processState.waitForStdout((line) => JSON.parse(line).id === "execution-stop"),
+  )
+  assert.equal(closedWait.result.structuredContent.outcome, "session_closed")
+  assert.deepEqual(stoppedSession.result.structuredContent, { stopped: true })
+  assert.deepEqual((await call("execution-stop-again", "stop_session")).result.structuredContent, { stopped: false })
+})
+
+test("real renderer reports the finite program stop atomically", {
+  skip: !process.env.APPLE2TS_REAL_CHROMIUM_EXECUTABLE || !process.env.APPLE2TS_REAL_DIST_DIR,
+}, async (t) => {
+  const taskRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-execution-acceptance-"))
+  const sourceRoot = path.join(taskRoot, "source")
+  const stagingRoot = path.join(taskRoot, "staging")
+  const chromiumTempRoot = path.join(taskRoot, "chromium")
+  await Promise.all([
+    mkdir(sourceRoot),
+    mkdir(stagingRoot),
+    mkdir(chromiumTempRoot),
+  ])
+  await writeFile(path.join(sourceRoot, "finite.bin"), Buffer.from([
+    0xA2, 0xF0, 0x9A, // LDX #$F0; TXS
+    0xA9, 0x41,       // LDA #$41
+    0xA2, 0x42,       // LDX #$42
+    0xA0, 0x43,       // LDY #$43
+    0xEA, 0x00,       // success NOP; failure BRK
+  ]))
+
+  const processState = await launchMcp({
+    APPLE2TS_CHROMIUM_EXECUTABLE: process.env.APPLE2TS_REAL_CHROMIUM_EXECUTABLE,
+    APPLE2TS_DIST_DIR: process.env.APPLE2TS_REAL_DIST_DIR,
+    APPLE2TS_FILE_SOURCE_ROOT: sourceRoot,
+    APPLE2TS_FILE_STAGING_ROOT: stagingRoot,
+    APPLE2TS_STARTUP_TIMEOUT_MS: "10000",
+    TMPDIR: chromiumTempRoot,
+  })
+  t.after(async () => {
+    await processState.cleanup()
+    await rm(taskRoot, { recursive: true, force: true })
+  })
+  await processState.waitForStderr((line) => line.includes("MCP ready for session requests"))
+  await initializeMcp(processState)
+  assert.equal((await startMcpSession(processState)).result.isError, undefined)
+  const call = (id, name, args = {}) => sendMcpRequest(processState, id, "tools/call", {
+    name,
+    arguments: args,
+  })
+  const readExecution = async (id) => {
+    const response = await sendMcpRequest(processState, id, "resources/read", {
+      uri: "apple2ts://session/execution",
+    })
+    return JSON.parse(response.result.contents[0].text)
+  }
+
+  const staged = (await call("real-stage", "stage_file", { path: "finite.bin" })).result.structuredContent
+  await call("real-load", "load_binary", { path: staged.path, address: 0x6000 })
+  await call("real-cpu", "set_cpu", { PC: 0x6000, PStatus: 0x24 })
+  await call("real-success", "set_breakpoint", { address: 0x6009 })
+  await call("real-failure", "set_breakpoint", { address: 0x600A })
+  const before = await readExecution("real-before")
+  await call("real-resume", "resume")
+  const stopped = (await call("real-wait", "wait_for_execution_stop", {
+    timeoutMs: 2000,
+    afterSequence: before.state.executionSequence,
+    expectedBreakpointAddress: 0x6009,
+  })).result.structuredContent
+
+  assert.equal(stopped.outcome, "stopped")
+  assert.equal(stopped.expectationMatched, true)
+  assert.ok(stopped.state.executionSequence > before.state.executionSequence)
+  assert.equal(stopped.state.pauseReason, "breakpoint")
+  assert.deepEqual(stopped.state.breakpoint, { breakpointId: "bp:24585", address: 0x6009 })
+  assert.deepEqual(
+    { A: stopped.state.A, X: stopped.state.X, Y: stopped.state.Y, S: stopped.state.S },
+    { A: 0x41, X: 0x42, Y: 0x43, S: 0xF0 },
+  )
+  assert.deepEqual(await readExecution("real-after"), {
+    emulator: stopped.emulator,
+    state: stopped.state,
+  })
+
+  processState.child.stdin.end()
+  assert.deepEqual(await processState.waitForExit(), { code: 0, signal: null, error: null })
+  assert.deepEqual(await readdir(stagingRoot), [])
+  assert.deepEqual(await readdir(chromiumTempRoot), [])
 })
 
 test("EOF rejects a start queued behind session cleanup", async (t) => {

@@ -122,6 +122,13 @@ session ends. A binary can be up to 49,152 bytes and must fit in main RAM at
 `$0000-$BFFF`. A floppy image can be up to 2 MiB; a hard-drive image can be up
 to 32 MiB.
 
+Read `apple2ts://session/execution` for one worker-confirmed execution snapshot,
+including the stop reason, breakpoint, CPU registers, machine model, and memory
+configuration. `wait_for_execution_stop` waits for a newer stop without
+changing execution. Pass the last observed `executionSequence` as
+`afterSequence` to avoid missing a fast stop; an unexpected breakpoint is
+returned immediately with `expectationMatched: false`.
+
 ### Server Docs URLs
 
 - OpenAPI: `/openapi.json`

@@ -99,6 +99,14 @@ const canHaltAtAddress = (breakpoint) => breakpoint.watchpoint === false
   && breakpoint.action1?.action === ""
   && breakpoint.action2?.action === ""
 
+const initialState = await postJson("/api/client/state", {
+  clientId,
+  remoteControlToken,
+  rendererId,
+  state: status,
+})
+if (!initialState.ok) process.exit(69)
+
 const stop = () => {
   if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "ignore-term") {
     if (receiptPath) {
@@ -142,6 +150,10 @@ while (!stopping) {
       status.machine.runMode = command.payload.runMode === -4 || command.payload.runMode === -3
         ? -1
         : command.payload.runMode
+      status.machine.execution.executionSequence += 1
+      status.machine.execution.state = status.machine.runMode === -2 ? "paused" : "running"
+      status.machine.execution.pauseReason = status.machine.runMode === -2 ? "explicit" : null
+      status.machine.execution.breakpoint = null
       if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "stall-run-mode") {
         if (receiptPath) {
           const receipt = JSON.parse(readFileSync(receiptPath, "utf8"))
@@ -150,6 +162,34 @@ while (!stopping) {
         continue
       }
       result = status
+      if (
+        process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "execution-stop"
+        && status.machine.runMode === -1
+        && breakpoints.length > 0
+      ) {
+        const breakpoint = breakpoints[0]
+        setTimeout(() => {
+          status.machine.runMode = -2
+          status.machine.machineState.PC = breakpoint.address
+          status.machine.execution = {
+            ...status.machine.execution,
+            executionSequence: status.machine.execution.executionSequence + 1,
+            state: "paused",
+            pauseReason: "breakpoint",
+            breakpoint: {
+              breakpointId: `bp:${breakpoint.address}`,
+              address: breakpoint.address,
+            },
+            PC: breakpoint.address,
+          }
+          void postJson("/api/client/state", {
+            clientId,
+            remoteControlToken,
+            rendererId,
+            state: status,
+          })
+        }, Number(process.env.APPLE2TS_FAKE_EXECUTION_STOP_DELAY_MS || 5))
+      }
     } else if (command.action === "setSpeedMode") {
       status.machine.speedMode = command.payload.speedMode
       result = status
