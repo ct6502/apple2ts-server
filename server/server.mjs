@@ -1264,10 +1264,11 @@ const server = createServer(async (req, res) => {
         writeNoConnectedClientError(res)
         return
       }
+      let space = "active"
       try {
         const address = parseInteger(url.searchParams.get("start"))
         const length = parseInteger(url.searchParams.get("length"))
-        const space = url.searchParams.get("space") || "active"
+        space = url.searchParams.get("space") || "active"
         const auxBankText = url.searchParams.get("auxBank")
         const auxBank = auxBankText === null ? undefined : parseInteger(auxBankText)
         if (address === null || length === null) {
@@ -1287,11 +1288,14 @@ const server = createServer(async (req, res) => {
           ...(auxBank === undefined ? {} : {auxBank}),
         }))
       } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error)
         writeErrorEnvelope(
           res,
           400,
           "BAD_REQUEST",
-          error instanceof Error ? error.message : String(error),
+          space === "active" && detail === "Memory is available only while the emulator is paused"
+            ? "Memory dump unavailable for the requested range. Pause the emulator first."
+            : detail,
         )
       }
       return
