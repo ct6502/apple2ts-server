@@ -2700,6 +2700,31 @@ test("clean visible browser exit reports an intentional renderer closure", async
   assert.equal((await closed.waitForExit()).code, 0, closed.getStderr())
   await closed.cleanup()
 })
+
+test("renderer exit does not replace a receipt created after session start", async (t) => {
+  const eventRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-browser-event-collision-"))
+  const eventFile = path.join(eventRoot, "launcher-event.json")
+  const existing = '{"owner":"launcher"}\n'
+  const crashed = await launchMcp({
+    APPLE2TS_FAKE_CHROMIUM_MODE: "crash-after-ready",
+    APPLE2TS_TEST_SESSION_EVENT_FILE: eventFile,
+  })
+  t.after(crashed.cleanup)
+  t.after(() => rm(eventRoot, { recursive: true, force: true }))
+  await crashed.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(crashed, "event-collision-initialize")
+  const started = await startMcpSession(crashed, "event-collision-start")
+  assert.equal(started.result.isError, undefined, JSON.stringify(started))
+  await writeFile(eventFile, existing, { flag: "wx" })
+  await crashed.waitForStderr((line) => line.includes("renderer exited unexpectedly"))
+  await crashed.waitForStderr((line) => line.includes("MCP cleanup failed"))
+  assert.equal(await readFile(eventFile, "utf8"), existing)
+
+  crashed.child.stdin.end()
+  assert.equal((await crashed.waitForExit()).code, 1, crashed.getStderr())
+  await crashed.cleanup()
+})
+
 test("SIGTERM and startup timeout release the private listener", async (t) => {
   const running = await launchMcp()
   t.after(running.cleanup)

@@ -3,7 +3,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { spawn } from "node:child_process"
 import { constants as fsConstants } from "node:fs"
-import { access, lstat, mkdtemp, open, realpath, rename, rm, stat, writeFile } from "node:fs/promises"
+import { access, link, lstat, mkdtemp, open, realpath, rename, rm, stat, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
@@ -78,7 +78,7 @@ const publishSessionEvent = async (target, event) => {
       `${JSON.stringify({ version: SESSION_EVENT_VERSION, ...event })}\n`,
       { encoding: "utf8", flag: "wx", mode: 0o600 },
     )
-    await rename(temporary, target)
+    await link(temporary, target)
   } finally {
     await rm(temporary, { force: true })
   }
