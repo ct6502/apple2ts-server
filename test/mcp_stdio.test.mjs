@@ -2351,9 +2351,10 @@ test("visible Chromium uses the same owned session and cleanup", async (t) => {
 })
 
 test("closing an owned visible renderer preserves its launcher receipt until exit", async (t) => {
+  const eventRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-visible-close-event-"))
   const stagingRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-visible-close-stage-"))
   const sourceRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-visible-close-source-"))
-  const eventFile = path.join(stagingRoot, "launcher-event.json")
+  const eventFile = path.join(eventRoot, "launcher-event.json")
   await writeFile(path.join(sourceRoot, "fixture.bin"), Buffer.from([0xA9, 0x42, 0x60]))
   const visible = await launchMcp({
     APPLE2TS_CHROMIUM_MODE: "visible",
@@ -2364,6 +2365,7 @@ test("closing an owned visible renderer preserves its launcher receipt until exi
     APPLE2TS_TEST_SESSION_EVENT_FILE: eventFile,
   })
   t.after(visible.cleanup)
+  t.after(() => rm(eventRoot, { recursive: true, force: true }))
   t.after(() => rm(stagingRoot, { recursive: true, force: true }))
   t.after(() => rm(sourceRoot, { recursive: true, force: true }))
 
@@ -2621,16 +2623,15 @@ test("staging inside the source root fails session start before private resource
   await invalid.cleanup()
 })
 
-test("unexpected renderer exit releases only the owned session", async (t) => {
-  const stagingRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-browser-failure-stage-"))
-  const eventFile = path.join(stagingRoot, "launcher-event.json")
+test("unexpected renderer exit publishes its receipt without file ingress", async (t) => {
+  const eventRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-browser-failure-event-"))
+  const eventFile = path.join(eventRoot, "launcher-event.json")
   const crashed = await launchMcp({
     APPLE2TS_FAKE_CHROMIUM_MODE: "crash-after-ready",
-    APPLE2TS_FILE_STAGING_ROOT: stagingRoot,
     APPLE2TS_TEST_SESSION_EVENT_FILE: eventFile,
   })
   t.after(crashed.cleanup)
-  t.after(() => rm(stagingRoot, { recursive: true, force: true }))
+  t.after(() => rm(eventRoot, { recursive: true, force: true }))
   await crashed.waitForStderr((line) => line.includes("MCP ready"))
   await initializeMcp(crashed, "crash-initialize")
   const started = await startMcpSession(crashed, "crash-start")
