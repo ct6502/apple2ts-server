@@ -145,6 +145,18 @@ while (!stopping) {
     } else if (command.action === "getMemory") {
       result = { memoryDump }
     } else if (command.action === "getMemoryView") {
+      if (status.machine.runMode !== -2) {
+        const reply = await postJson("/api/client/reply", {
+          clientId,
+          remoteControlToken,
+          rendererId,
+          commandId: command.commandId,
+          ok: false,
+          error: "Memory is available only while the emulator is paused",
+        })
+        if (!reply.ok) process.exit(68)
+        continue
+      }
       const {address, length, space, auxBank} = command.payload
       const source = space === "aux" ? auxMemory : mainMemory
       result = {

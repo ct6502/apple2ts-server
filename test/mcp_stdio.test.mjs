@@ -1541,6 +1541,29 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     additionalProperties: false,
   })
 
+  const running = await sendMcpRequest(processState, "memory-running", "tools/call", {
+    name: "resume",
+    arguments: {},
+  })
+  assert.equal(running.result.isError, undefined, JSON.stringify(running))
+  for (const [id, args] of [
+    ["memory-running-omitted", {address: 0, length: 1}],
+    ["memory-running-active", {address: 0, length: 1, space: "active"}],
+  ]) {
+    const rejected = await sendMcpRequest(processState, id, "tools/call", {
+      name: "read_memory",
+      arguments: args,
+    })
+    assert.equal(rejected.result.isError, true)
+    assert.equal(rejected.result.structuredContent, undefined)
+    assert.match(rejected.result.content[0].text, /Memory is available only while the emulator is paused/)
+  }
+  const repaused = await sendMcpRequest(processState, "memory-repause", "tools/call", {
+    name: "pause",
+    arguments: {},
+  })
+  assert.equal(repaused.result.isError, undefined, JSON.stringify(repaused))
+
   processState.child.stdin.write(`${JSON.stringify({
     jsonrpc: "2.0",
     id: 5,
