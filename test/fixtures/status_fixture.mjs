@@ -1,4 +1,5 @@
 export const statusFixture = {
+  statusSequence: 0,
   machine: {
     runMode: -2,
     speedMode: 1,
