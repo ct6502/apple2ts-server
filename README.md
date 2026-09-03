@@ -102,8 +102,9 @@ state. The server sends this notification only after the renderer has failed
 to reconnect and session cleanup has finished. Reading the resource reports
 whether cleanup completed.
 An outer launcher can set `APPLE2TS_SESSION_EVENT_FILE` to an exact path in a
-task-owned directory. The launcher owns that directory and its cleanup; the
-server writes only the configured receipt and a neighboring temporary file.
+task-owned directory that the monitored child cannot write. The launcher owns
+that directory and its cleanup; the server writes only the configured receipt
+and a neighboring temporary file.
 After session cleanup, the server atomically publishes a versioned
 `browser-closed` or `browser-failed` receipt. It refuses to replace an existing
 receipt, which remains until the launcher consumes it and removes its task
