@@ -317,8 +317,8 @@ const initializeMcp = async (processState, id = "initialize") => {
   return initialized
 }
 
-const startMcpSession = async (processState, id = "start-session") =>
-  sendMcpRequest(processState, id, "tools/call", { name: "start_session", arguments: {} })
+const startMcpSession = async (processState, id = "start-session", args = {}) =>
+  sendMcpRequest(processState, id, "tools/call", { name: "start_session", arguments: args })
 
 test("private bridge binds one renderer and rejects forged replies", async (t) => {
   const listener = await startApple2tsServer({
@@ -1544,6 +1544,14 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
       "set_cpu",
     ],
   )
+  const startSessionTool = tools.result.tools.find((tool) => tool.name === "start_session")
+  assert.deepEqual(startSessionTool.inputSchema, {
+    type: "object",
+    properties: {
+      visibility: { type: "string", enum: ["headless", "visible"] },
+    },
+    additionalProperties: false,
+  })
   const readMemoryTool = tools.result.tools.find((tool) => tool.name === "read_memory")
   assert.match(readMemoryTool.description, /Request the smallest useful range/)
   assert.deepEqual(readMemoryTool.inputSchema, {
@@ -2348,6 +2356,65 @@ test("visible Chromium uses the same owned session and cleanup", async (t) => {
   await assert.rejects(access(receipt.profilePath))
   await assertClosed(bridgeUrl)
   await visible.cleanup()
+})
+
+test("start_session selects visibility for each new owned session", async (t) => {
+  const processState = await launchMcp()
+  t.after(processState.cleanup)
+  await processState.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(processState, "visibility-initialize")
+
+  const visible = await startMcpSession(processState, "visibility-visible", {
+    visibility: "visible",
+  })
+  assert.equal(visible.result.isError, undefined, JSON.stringify(visible))
+  assert.equal((await processState.readReceipt()).headless, false)
+
+  const same = await startMcpSession(processState, "visibility-same")
+  assert.deepEqual(same.result.structuredContent, visible.result.structuredContent)
+  const mismatch = await startMcpSession(processState, "visibility-mismatch", {
+    visibility: "headless",
+  })
+  assert.equal(mismatch.result.isError, true)
+  assert.match(mismatch.result.content[0].text, /Stop the active visible session/)
+
+  const stopped = await sendMcpRequest(processState, "visibility-stop", "tools/call", {
+    name: "stop_session",
+    arguments: {},
+  })
+  assert.deepEqual(stopped.result.structuredContent, { stopped: true })
+  await rm(processState.receiptPath, { force: true })
+
+  const headless = await startMcpSession(processState, "visibility-headless", {
+    visibility: "headless",
+  })
+  assert.equal(headless.result.isError, undefined, JSON.stringify(headless))
+  assert.equal((await processState.readReceipt()).headless, true)
+})
+
+test("start_session rejects conflicting visibility while a session starts", async (t) => {
+  const processState = await launchMcp({
+    APPLE2TS_FAKE_CHROMIUM_MODE: "disconnect-before-ready",
+    APPLE2TS_TEST_RENDERER_DISCONNECT_GRACE_MS: "100",
+  })
+  t.after(processState.cleanup)
+  await processState.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(processState, "starting-visibility-initialize")
+
+  const bridgeLine = processState.waitForStderr((line) => line.includes("private bridge listening"))
+  const starting = startMcpSession(processState, "starting-visibility-visible", {
+    visibility: "visible",
+  })
+  await bridgeLine
+  const mismatch = await startMcpSession(processState, "starting-visibility-headless", {
+    visibility: "headless",
+  })
+  assert.equal(mismatch.result.isError, true)
+  assert.match(mismatch.result.content[0].text, /starting visible session/)
+  assert.equal((await starting).result.isError, true)
+
+  processState.child.stdin.end()
+  assert.equal((await processState.waitForExit()).code, 0)
 })
 
 test("closing an owned visible renderer preserves its launcher receipt until exit", async (t) => {

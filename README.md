@@ -91,9 +91,11 @@ private emulator is no longer needed. A host whose configuration uses an
 }
 ```
 
-Replace the paths for your installation. To open the browser window, add
-`"APPLE2TS_CHROMIUM_MODE": "visible"` to `env`. When the host closes the stdio
-connection, the server stops any active browser and removes its private profile.
+Replace the paths for your installation. `start_session` accepts an optional
+`visibility` of `headless` or `visible`; omitting it uses
+`APPLE2TS_CHROMIUM_MODE`, or `headless` when that setting is absent. When the
+host closes the stdio connection, the server stops any active browser and
+removes its private profile.
 Closing the owned visible window also ends that emulator session. A direct MCP
 consumer may then call `start_session` again.
 Consumers can subscribe to `apple2ts://session/lifecycle`, then await its

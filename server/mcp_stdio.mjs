@@ -97,6 +97,14 @@ const noInputSchema = fromJsonSchema({
   additionalProperties: false,
 })
 
+const sessionStartInputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    visibility: { type: "string", enum: ["headless", "visible"] },
+  },
+  additionalProperties: false,
+})
+
 const speedInputSchema = fromJsonSchema({
   type: "object",
   properties: {
@@ -1338,8 +1346,8 @@ export const createMcpServer = (session) => {
     "start_session",
     {
       title: "Start Apple2TS session",
-      description: "Start the private emulator session owned by this MCP process.",
-      inputSchema: noInputSchema,
+      description: "Start a headless or visible private emulator session owned by this MCP process. Omit visibility to use the configured default.",
+      inputSchema: sessionStartInputSchema,
       outputSchema: sessionStartResultSchema,
       annotations: {
         readOnlyHint: false,
@@ -1348,9 +1356,9 @@ export const createMcpServer = (session) => {
         openWorldHint: false,
       },
     },
-    async () => {
+    async (input) => {
       try {
-        return toolResult(await session.start())
+        return toolResult(await session.start(input))
       } catch (error) {
         return {
           isError: true,
@@ -1629,6 +1637,7 @@ export const runStdio = async (options = {}) => {
   let stopping = null
   let activeSession = null
   let startingSession = null
+  let startingSessionVisibility = null
   let stoppingSession = null
   let lifecycleNotifier = null
   let lifecycleState = {
@@ -1674,13 +1683,36 @@ export const runStdio = async (options = {}) => {
       if (!activeSession) throw new Error("No active Apple2TS session. Call start_session first.")
       return activeSession.core
     },
-    async start() {
+    async start({ visibility } = {}) {
+      const chromiumMode = visibility ?? options.chromiumMode ?? "headless"
+      if (chromiumMode !== "headless" && chromiumMode !== "visible") {
+        throw new Error(
+          visibility === undefined
+            ? "APPLE2TS_CHROMIUM_MODE must be 'headless' or 'visible'"
+            : "Session visibility must be 'headless' or 'visible'",
+        )
+      }
       throwIfShuttingDown()
       if (stoppingSession) await stoppingSession
       throwIfShuttingDown()
-      if (activeSession) return { emulator: activeSession.core.identity }
-      if (startingSession) return startingSession
+      if (activeSession) {
+        if (visibility !== undefined && activeSession.visibility !== chromiumMode) {
+          throw new Error(
+            `Stop the active ${activeSession.visibility} session before starting a ${chromiumMode} session`,
+          )
+        }
+        return { emulator: activeSession.core.identity }
+      }
+      if (startingSession) {
+        if (visibility !== undefined && startingSessionVisibility !== chromiumMode) {
+          throw new Error(
+            `Wait for or stop the starting ${startingSessionVisibility} session before starting a ${chromiumMode} session`,
+          )
+        }
+        return startingSession
+      }
 
+      startingSessionVisibility = chromiumMode
       startingSession = (async () => {
         throwIfShuttingDown()
         if (!options.chromiumExecutable) throw new Error("APPLE2TS_CHROMIUM_EXECUTABLE is required")
@@ -1704,10 +1736,6 @@ export const runStdio = async (options = {}) => {
           }
         }
         const sessionEventFile = await resolveSessionEventFile(options.sessionEventFile)
-        const chromiumMode = options.chromiumMode ?? "headless"
-        if (chromiumMode !== "headless" && chromiumMode !== "visible") {
-          throw new Error("APPLE2TS_CHROMIUM_MODE must be 'headless' or 'visible'")
-        }
         const distDir = resolveBrowserBuildDir(options.distDir)
         const browserBuildAvailable = options.hasBrowserBuild || hasBrowserBuild
         if (options.requireBrowserBuild !== false && !(await browserBuildAvailable(distDir))) {
@@ -1786,7 +1814,13 @@ export const runStdio = async (options = {}) => {
           }
           if (shutdownController.signal.aborted) throw shutdownController.signal.reason
 
-          created = { core, renderer, controller: sessionController, sessionEventFile }
+          created = {
+            core,
+            renderer,
+            controller: sessionController,
+            sessionEventFile,
+            visibility: chromiumMode,
+          }
           activeSession = created
           lifecycleState = {
             ...lifecycleState,
@@ -1847,6 +1881,7 @@ export const runStdio = async (options = {}) => {
         }
       })().finally(() => {
         startingSession = null
+        startingSessionVisibility = null
       })
       return startingSession
     },
