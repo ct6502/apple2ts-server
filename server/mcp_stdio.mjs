@@ -37,6 +37,14 @@ const MAX_FLOPPY_IMAGE_BYTES = 2 * 1024 * 1024
 const MAX_HARD_DRIVE_IMAGE_BYTES = 32 * 1024 * 1024
 const STANDARD_FLOPPY_IMAGE_BYTES = 143360
 const DRIVE_IDS = ["hd1", "hd2", "fd1", "fd2"]
+const CPU_PATCH_MAXIMUMS = Object.freeze({
+  PC: 65535,
+  A: 255,
+  X: 255,
+  Y: 255,
+  S: 255,
+  PStatus: 255,
+})
 
 class ConfirmedMutationRejection extends Error {
   constructor(error) {
@@ -356,10 +364,13 @@ const cpuPatchInputSchema = fromJsonSchema({
   type: "object",
   properties: {
     PC: { type: "integer", minimum: 0, maximum: 65535 },
+    A: { type: "integer", minimum: 0, maximum: 255 },
+    X: { type: "integer", minimum: 0, maximum: 255 },
+    Y: { type: "integer", minimum: 0, maximum: 255 },
     S: { type: "integer", minimum: 0, maximum: 255 },
     PStatus: { type: "integer", minimum: 0, maximum: 255 },
   },
-  anyOf: [{ required: ["PC"] }, { required: ["S"] }, { required: ["PStatus"] }],
+  anyOf: ["PC", "A", "X", "Y", "S", "PStatus"].map((field) => ({ required: [field] })),
   additionalProperties: false,
 })
 
@@ -371,10 +382,13 @@ const cpuResultSchema = fromJsonSchema({
       type: "object",
       properties: {
         PC: { type: "integer", minimum: 0, maximum: 65535 },
+        A: { type: "integer", minimum: 0, maximum: 255 },
+        X: { type: "integer", minimum: 0, maximum: 255 },
+        Y: { type: "integer", minimum: 0, maximum: 255 },
         S: { type: "integer", minimum: 0, maximum: 255 },
         PStatus: { type: "integer", minimum: 0, maximum: 255 },
       },
-      required: ["PC", "S", "PStatus"],
+      required: ["PC", "A", "X", "Y", "S", "PStatus"],
       additionalProperties: false,
     },
   },
@@ -925,23 +939,14 @@ export class Apple2tsCore {
 
   setCpu(patch, signal) {
     const fields = Object.keys(patch)
-    if (fields.length < 1 || fields.some((field) => !["PC", "S", "PStatus"].includes(field))) {
-      throw new Error("set_cpu accepts PC, S, and PStatus")
+    if (fields.length < 1 || fields.some((field) => !Object.hasOwn(CPU_PATCH_MAXIMUMS, field))) {
+      throw new Error("set_cpu accepts PC, A, X, Y, S, and PStatus")
     }
-    if ("PC" in patch && (!Number.isInteger(patch.PC) || patch.PC < 0 || patch.PC > 65535)) {
-      throw new Error("PC must be an integer between 0 and 65535")
-    }
-    if (
-      "S" in patch
-      && (!Number.isInteger(patch.S) || patch.S < 0 || patch.S > 255)
-    ) {
-      throw new Error("S must be an integer between 0 and 255")
-    }
-    if (
-      "PStatus" in patch
-      && (!Number.isInteger(patch.PStatus) || patch.PStatus < 0 || patch.PStatus > 255)
-    ) {
-      throw new Error("PStatus must be an integer between 0 and 255")
+    for (const field of fields) {
+      const maximum = CPU_PATCH_MAXIMUMS[field]
+      if (!Number.isInteger(patch[field]) || patch[field] < 0 || patch[field] > maximum) {
+        throw new Error(`${field} must be an integer between 0 and ${maximum}`)
+      }
     }
 
     return this.serializeMutation(async () => {
@@ -950,6 +955,9 @@ export class Apple2tsCore {
         emulator: result.emulator,
         value: {
           PC: result.state.PC,
+          A: result.state.A,
+          X: result.state.X,
+          Y: result.state.Y,
           S: result.state.S,
           PStatus: result.state.PStatus,
         },
@@ -1151,7 +1159,7 @@ const mutationTools = [
   {
     name: "set_cpu",
     title: "Set Apple II CPU state",
-    description: "Set the program counter, stack pointer, or processor status and return confirmed CPU state.",
+    description: "Set CPU registers or processor status and return confirmed CPU state.",
     inputSchema: cpuPatchInputSchema,
     outputSchema: cpuResultSchema,
     destructiveHint: true,
