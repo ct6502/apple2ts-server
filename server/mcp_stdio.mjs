@@ -327,6 +327,32 @@ const memoryReadInputSchema = fromJsonSchema({
   additionalProperties: false,
 })
 
+const memoryMappingSchema = {
+  type: "object",
+  properties: {
+    RAMRD: { type: "boolean" },
+    RAMWRT: { type: "boolean" },
+    ALTZP: { type: "boolean" },
+    "80STORE": { type: "boolean" },
+    PAGE2: { type: "boolean" },
+    HIRES: { type: "boolean" },
+  },
+  required: ["RAMRD", "RAMWRT", "ALTZP", "80STORE", "PAGE2", "HIRES"],
+  additionalProperties: false,
+}
+
+const memorySegmentSchema = (maximumLength) => ({
+  type: "object",
+  properties: {
+    address: { type: "integer", minimum: 0, maximum: 65535 },
+    length: { type: "integer", minimum: 1, maximum: maximumLength },
+    space: { type: "string", enum: ["main", "aux", "system"] },
+    auxBank: { type: "integer", minimum: 0, maximum: 127 },
+  },
+  required: ["address", "length", "space"],
+  additionalProperties: false,
+})
+
 const memoryReadOutputSchema = fromJsonSchema({
   type: "object",
   properties: {
@@ -348,31 +374,9 @@ const memoryReadOutputSchema = fromJsonSchema({
         effectiveSegments: {
           type: "array",
           minItems: 1,
-          items: {
-            type: "object",
-            properties: {
-              address: { type: "integer", minimum: 0, maximum: 65535 },
-              length: { type: "integer", minimum: 1, maximum: 4096 },
-              space: { type: "string", enum: ["main", "aux", "system"] },
-              auxBank: { type: "integer", minimum: 0, maximum: 127 },
-            },
-            required: ["address", "length", "space"],
-            additionalProperties: false,
-          },
+          items: memorySegmentSchema(4096),
         },
-        mapping: {
-          type: "object",
-          properties: {
-            RAMRD: { type: "boolean" },
-            RAMWRT: { type: "boolean" },
-            ALTZP: { type: "boolean" },
-            "80STORE": { type: "boolean" },
-            PAGE2: { type: "boolean" },
-            HIRES: { type: "boolean" },
-          },
-          required: ["RAMRD", "RAMWRT", "ALTZP", "80STORE", "PAGE2", "HIRES"],
-          additionalProperties: false,
-        },
+        mapping: memoryMappingSchema,
       },
       required: [
         "address",
@@ -381,6 +385,62 @@ const memoryReadOutputSchema = fromJsonSchema({
         "requestedSpace",
         "effectiveSegments",
         "mapping",
+      ],
+      additionalProperties: false,
+    },
+  },
+  required: ["emulator", "value"],
+  additionalProperties: false,
+})
+
+const memorySearchInputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    address: { type: "integer", minimum: 0, maximum: 65535 },
+    length: { type: "integer", minimum: 1, maximum: 65536 },
+    space: { type: "string", enum: ["active", "main", "aux"], default: "active" },
+    auxBank: { type: "integer", minimum: 0, maximum: 127 },
+    bytes: {
+      type: "array",
+      items: { type: "integer", minimum: 0, maximum: 255 },
+      minItems: 1,
+      maxItems: 32,
+    },
+    maxMatches: { type: "integer", minimum: 1, maximum: 64, default: 32 },
+  },
+  required: ["address", "length", "bytes"],
+  additionalProperties: false,
+})
+
+const memorySearchOutputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    emulator: emulatorIdentitySchema,
+    value: {
+      type: "object",
+      properties: {
+        address: { type: "integer", minimum: 0, maximum: 65535 },
+        length: { type: "integer", minimum: 1, maximum: 65536 },
+        requestedSpace: { type: "string", enum: ["active", "main", "aux"] },
+        requestedAuxBank: { type: "integer", minimum: 0, maximum: 127 },
+        effectiveAuxBank: { type: "integer", minimum: 0, maximum: 127 },
+        effectiveSegments: {
+          type: "array",
+          minItems: 1,
+          items: memorySegmentSchema(65536),
+        },
+        mapping: memoryMappingSchema,
+        matches: {
+          type: "array",
+          maxItems: 64,
+          items: { type: "integer", minimum: 0, maximum: 65535 },
+        },
+        totalMatchCount: { type: "integer", minimum: 0, maximum: 65536 },
+        truncated: { type: "boolean" },
+      },
+      required: [
+        "address", "length", "requestedSpace", "effectiveSegments", "mapping",
+        "matches", "totalMatchCount", "truncated",
       ],
       additionalProperties: false,
     },
@@ -612,6 +672,30 @@ const confirmDriveState = (result, driveId, mounted, operation) => {
   return {
     emulator: result.emulator,
     state: { driveId: result.state.driveId, mounted: result.state.mounted },
+  }
+}
+
+const validateMemoryRequest = ({ address, length, space, auxBank }, maximumLength) => {
+  if (!Number.isInteger(address) || address < 0 || address > 65535) {
+    throw new Error("address must be an integer between 0 and 65535")
+  }
+  if (!Number.isInteger(length) || length < 1 || length > maximumLength) {
+    throw new Error(`length must be an integer between 1 and ${maximumLength}`)
+  }
+  if (address + length > 65536) {
+    throw new Error("Requested memory range exceeds 64 KB address space")
+  }
+  if (!(["active", "main", "aux"].includes(space))) {
+    throw new Error("space must be 'active', 'main', or 'aux'")
+  }
+  if (auxBank !== undefined && space !== "aux") {
+    throw new Error("auxBank is valid only when space is 'aux'")
+  }
+  if (auxBank !== undefined && (!Number.isInteger(auxBank) || auxBank < 0 || auxBank > 127)) {
+    throw new Error("auxBank must be an integer between 0 and 127")
+  }
+  if (space !== "active" && address + length > 0xC000) {
+    throw new Error("Physical memory reads must fit within RAM at $0000-$BFFF")
   }
 }
 
@@ -1066,27 +1150,7 @@ export class Apple2tsCore {
   }
 
   async readMemory({ address, length, space = "active", auxBank }) {
-    if (!Number.isInteger(address) || address < 0 || address > 65535) {
-      throw new Error("address must be an integer between 0 and 65535")
-    }
-    if (!Number.isInteger(length) || length < 1 || length > 4096) {
-      throw new Error("length must be an integer between 1 and 4096")
-    }
-    if (address + length > 65536) {
-      throw new Error("Requested memory range exceeds 64 KB address space")
-    }
-    if (!(["active", "main", "aux"].includes(space))) {
-      throw new Error("space must be 'active', 'main', or 'aux'")
-    }
-    if (auxBank !== undefined && space !== "aux") {
-      throw new Error("auxBank is valid only when space is 'aux'")
-    }
-    if (auxBank !== undefined && (!Number.isInteger(auxBank) || auxBank < 0 || auxBank > 127)) {
-      throw new Error("auxBank must be an integer between 0 and 127")
-    }
-    if (space !== "active" && address + length > 0xC000) {
-      throw new Error("Physical memory reads must fit within RAM at $0000-$BFFF")
-    }
+    validateMemoryRequest({address, length, space, auxBank}, 4096)
     const query = new URLSearchParams({
       start: String(address),
       length: String(length),
@@ -1109,6 +1173,44 @@ export class Apple2tsCore {
           : {}),
         effectiveSegments: result.state.effectiveSegments,
         mapping: result.state.mapping,
+      },
+    }
+  }
+
+  async findMemory(
+    { address, length, space = "active", auxBank, bytes, maxMatches = 32 },
+    signal,
+  ) {
+    validateMemoryRequest({address, length, space, auxBank}, 65536)
+    if (!Array.isArray(bytes) || bytes.length < 1 || bytes.length > 32
+      || bytes.some((byte) => !Number.isInteger(byte) || byte < 0 || byte > 255)) {
+      throw new Error("bytes must contain 1 to 32 integers between 0 and 255")
+    }
+    if (!Number.isInteger(maxMatches) || maxMatches < 1 || maxMatches > 64) {
+      throw new Error("maxMatches must be an integer between 1 and 64")
+    }
+    const requestSignal = signal ? AbortSignal.any([this.signal, signal]) : this.signal
+    const result = await this.request("/api/private/memory/find", {
+      method: "POST",
+      body: {address, length, space, ...(auxBank === undefined ? {} : {auxBank}), bytes, maxMatches},
+    }, requestSignal, READ_TIMEOUT_MS)
+    return {
+      emulator: result.emulator,
+      value: {
+        address: result.state.address,
+        length: result.state.length,
+        requestedSpace: result.state.requestedSpace,
+        ...(Number.isInteger(result.state.requestedAuxBank)
+          ? {requestedAuxBank: result.state.requestedAuxBank}
+          : {}),
+        ...(Number.isInteger(result.state.effectiveAuxBank)
+          ? {effectiveAuxBank: result.state.effectiveAuxBank}
+          : {}),
+        effectiveSegments: result.state.effectiveSegments,
+        mapping: result.state.mapping,
+        matches: result.state.matches,
+        totalMatchCount: result.state.totalMatchCount,
+        truncated: result.state.truncated,
       },
     }
   }
@@ -1289,6 +1391,16 @@ const memoryReadResult = (result) => {
   }
 }
 
+const memorySearchResult = (result) => {
+  const {matches, totalMatchCount, truncated} = result.value
+  const suffix = truncated ? `; returned the first ${matches.length}` : ""
+  const matchLabel = totalMatchCount === 1 ? "match" : "matches"
+  return {
+    content: [{type: "text", text: `Found ${totalMatchCount} memory ${matchLabel}${suffix}.`}],
+    structuredContent: result,
+  }
+}
+
 const screenCaptureResult = ({ dataBase64, ...result }) => ({
   content: [
     { type: "image", data: dataBase64, mimeType: result.image.mimeType },
@@ -1465,6 +1577,32 @@ export const createMcpServer = (session) => {
     async (input) => {
       try {
         return memoryReadResult(await core().readMemory(input))
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+        }
+      }
+    },
+  )
+
+  server.registerTool(
+    "find_memory",
+    {
+      title: "Find bytes in Apple II memory",
+      description: "Search one bounded active, main, or auxiliary memory range while the emulator is paused. Returns only capped matching addresses and mapping metadata, not the scanned bytes.",
+      inputSchema: memorySearchInputSchema,
+      outputSchema: memorySearchOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async (input, context) => {
+      try {
+        return memorySearchResult(await core().findMemory(input, context.mcpReq.signal))
       } catch (error) {
         return {
           isError: true,

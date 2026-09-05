@@ -1570,6 +1570,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
       "start_session",
       "stop_session",
       "read_memory",
+      "find_memory",
       "wait_for_execution_stop",
       "capture_screen",
       "prepare_mount_disk",
@@ -1637,6 +1638,22 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     idempotentHint: true,
     openWorldHint: false,
   })
+  const findMemoryTool = tools.result.tools.find((tool) => tool.name === "find_memory")
+  assert.deepEqual(findMemoryTool.inputSchema.properties.bytes, {
+    type: "array",
+    items: { type: "integer", minimum: 0, maximum: 255 },
+    minItems: 1,
+    maxItems: 32,
+  })
+  assert.deepEqual(findMemoryTool.inputSchema.properties.maxMatches, {
+    type: "integer",
+    minimum: 1,
+    maximum: 64,
+    default: 32,
+  })
+  assert.equal(findMemoryTool.outputSchema.properties.value.properties.bytes, undefined)
+  assert.equal(findMemoryTool.outputSchema.properties.value.properties.matches.maxItems, 64)
+  assert.deepEqual(findMemoryTool.annotations, readMemoryTool.annotations)
   const keyboardTool = tools.result.tools.find((tool) => tool.name === "set_keyboard_key")
   assert.deepEqual(keyboardTool.inputSchema.properties.key.type, ["string", "null"])
   assert.equal(keyboardTool.inputSchema.properties.key.minLength, 1)
@@ -1699,6 +1716,12 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     assert.equal(rejected.result.structuredContent, undefined)
     assert.equal(rejected.result.content[0].text.includes(message), true)
   }
+  const searchWhileRunning = await sendMcpRequest(processState, "memory-search-running", "tools/call", {
+    name: "find_memory",
+    arguments: {address: 0, length: 1, bytes: [0]},
+  })
+  assert.equal(searchWhileRunning.result.isError, true)
+  assert.match(searchWhileRunning.result.content[0].text, /paused/)
   const repaused = await sendMcpRequest(processState, "memory-repause", "tools/call", {
     name: "pause",
     arguments: {},
@@ -1763,6 +1786,59 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.equal(selectedPhysical.result.isError, undefined, JSON.stringify(selectedPhysical))
   assert.equal(selectedPhysical.result.structuredContent.value.requestedAuxBank, 0)
   assert.equal(selectedPhysical.result.structuredContent.value.effectiveAuxBank, 0)
+
+  const search = await sendMcpRequest(processState, "find-memory", "tools/call", {
+    name: "find_memory",
+    arguments: {address: 0x03A0, length: 16, space: "main", bytes: [0x11], maxMatches: 8},
+  })
+  assert.equal(search.result.isError, undefined, JSON.stringify(search))
+  assert.deepEqual(search.result.structuredContent, {
+    emulator: payload.emulator,
+    value: {
+      address: 0x03A0,
+      length: 16,
+      requestedSpace: "main",
+      effectiveSegments: [{address: 0x03A0, length: 16, space: "main"}],
+      mapping: {
+        RAMRD: false,
+        RAMWRT: false,
+        ALTZP: false,
+        "80STORE": false,
+        PAGE2: false,
+        HIRES: false,
+      },
+      matches: [0x03A4],
+      totalMatchCount: 1,
+      truncated: false,
+    },
+  })
+  assert.equal(search.result.content[0].text, "Found 1 memory match.")
+
+  for (const argumentsValue of [
+    {address: 0, length: 1, bytes: []},
+    {address: 0, length: 1, bytes: [0], maxMatches: 65},
+    {address: 0, length: 65537, bytes: [0]},
+    {address: 0, length: 1, space: "main", auxBank: 0, bytes: [0]},
+    {address: 0xC000, length: 1, space: "main", bytes: [0]},
+  ]) {
+    const rejected = await sendMcpRequest(
+      processState,
+      `find-memory-invalid-${JSON.stringify(argumentsValue)}`,
+      "tools/call",
+      {name: "find_memory", arguments: argumentsValue},
+    )
+    assert.equal(rejected.result.isError, true)
+  }
+
+  const truncatedSearch = await sendMcpRequest(processState, "find-memory-truncated", "tools/call", {
+    name: "find_memory",
+    arguments: {address: 0x03A0, length: 16, space: "main", bytes: [0], maxMatches: 2},
+  })
+  assert.equal(truncatedSearch.result.isError, undefined, JSON.stringify(truncatedSearch))
+  assert.deepEqual(truncatedSearch.result.structuredContent.value.matches, [0x03A0, 0x03A1])
+  assert.equal(truncatedSearch.result.structuredContent.value.totalMatchCount, 15)
+  assert.equal(truncatedSearch.result.structuredContent.value.truncated, true)
+  assert.equal(truncatedSearch.result.content[0].text, "Found 15 memory matches; returned the first 2.")
 
   for (const args of [
     {address: 0xC000, length: 1, space: "main"},
@@ -2168,7 +2244,7 @@ test("stdio cancellation aborts an execution wait without poisoning the session"
   assert.equal((await startMcpSession(processState, "cancel-restart")).result.isError, undefined)
 })
 
-test("real renderer reports the finite program stop atomically", {
+test("real renderer searches memory and reports the finite program stop atomically", {
   skip: !process.env.APPLE2TS_REAL_CHROMIUM_EXECUTABLE || !process.env.APPLE2TS_REAL_DIST_DIR,
 }, async (t) => {
   const taskRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-execution-acceptance-"))
@@ -2198,6 +2274,8 @@ test("real renderer reports the finite program stop atomically", {
   })
   await processState.waitForStderr((line) => line.includes("MCP ready for session requests"))
   await initializeMcp(processState)
+  const discovered = await sendMcpRequest(processState, "real-tools", "tools/list")
+  assert.equal(discovered.result.tools.some((tool) => tool.name === "find_memory"), true)
   assert.equal((await startMcpSession(processState)).result.isError, undefined)
   const call = (id, name, args = {}) => sendMcpRequest(processState, id, "tools/call", {
     name,
@@ -2215,6 +2293,57 @@ test("real renderer reports the finite program stop atomically", {
     address: 0x6000,
   })).result.structuredContent
   await runUpload(prepared.ticket)
+  await call("real-pause-for-search", "pause")
+  const beforeSearch = await readExecution("real-before-search")
+  const mainSearch = (await call("real-find-main", "find_memory", {
+    address: 0x6000,
+    length: 11,
+    space: "main",
+    bytes: [0xA2, 0xF0],
+  })).result.structuredContent
+  assert.deepEqual(mainSearch.value.matches, [0x6000])
+  assert.equal(mainSearch.value.totalMatchCount, 1)
+  assert.equal(mainSearch.value.truncated, false)
+  assert.equal(mainSearch.emulator.targetId, beforeSearch.emulator.targetId)
+
+  const auxSearch = (await call("real-find-aux", "find_memory", {
+    address: 0x6000,
+    length: 11,
+    space: "aux",
+    bytes: [0xA2, 0xF0],
+  })).result.structuredContent
+  assert.deepEqual(auxSearch.value.matches, [])
+
+  const activeSearch = (await call("real-find-active", "find_memory", {
+    address: 0x6000,
+    length: 11,
+    bytes: [0xA2, 0xF0],
+  })).result.structuredContent
+  assert.deepEqual(activeSearch.value.matches, [0x6000])
+
+  const truncatedSearch = (await call("real-find-truncated", "find_memory", {
+    address: 0x6000,
+    length: 11,
+    space: "main",
+    bytes: [0xA2],
+    maxMatches: 1,
+  })).result.structuredContent
+  assert.deepEqual(truncatedSearch.value.matches, [0x6000])
+  assert.equal(truncatedSearch.value.totalMatchCount, 2)
+  assert.equal(truncatedSearch.value.truncated, true)
+  assert.deepEqual(await readExecution("real-after-search"), beforeSearch)
+
+  await call("real-resume-before-rejection", "resume")
+  const runningSearch = await call("real-find-running", "find_memory", {
+    address: 0x6000,
+    length: 11,
+    bytes: [0xA2, 0xF0],
+  })
+  assert.equal(runningSearch.result.isError, true)
+  assert.match(runningSearch.result.content[0].text, /paused/)
+  assert.equal((await readExecution("real-running-after-rejection")).state.state, "running")
+  await call("real-repause-after-rejection", "pause")
+
   const beforeCpuPatch = await readExecution("real-before-cpu")
   await call("real-cpu", "set_cpu", { PC: 0x6000, PStatus: 0x24 })
   const afterCpuPatch = await readExecution("real-after-cpu")
@@ -2295,6 +2424,25 @@ test("stdio rejects an invalid rendered screen", async (t) => {
 
   processState.child.stdin.end()
   assert.equal((await processState.waitForExit()).code, 0)
+})
+
+test("stdio rejects an inconsistent memory-search receipt", async (t) => {
+  const processState = await launchMcp({ APPLE2TS_FAKE_CHROMIUM_MODE: "invalid-memory-search" })
+  t.after(processState.cleanup)
+  await processState.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(processState, "invalid-search-initialize")
+  assert.equal((await startMcpSession(processState, "invalid-search-start")).result.isError, undefined)
+  const paused = await sendMcpRequest(processState, "invalid-search-pause", "tools/call", {
+    name: "pause",
+    arguments: {},
+  })
+  assert.equal(paused.result.isError, undefined)
+  const response = await sendMcpRequest(processState, "invalid-search", "tools/call", {
+    name: "find_memory",
+    arguments: {address: 0, length: 1, bytes: [0]},
+  })
+  assert.equal(response.result.isError, true)
+  assert.match(response.result.content[0].text, /Memory search was not available/)
 })
 
 test("EOF cancels a stalled mutation before releasing its held key", async (t) => {
