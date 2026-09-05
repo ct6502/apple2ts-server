@@ -534,6 +534,14 @@ test("private bridge rejects invalid and unavailable memory ranges", async (t) =
     assert.equal(result.body.error.code, "BAD_REQUEST", pathname)
   }
 
+  const invalidWatchpoint = await fetch(new URL("/api/private/memory/write-watchpoint", listener.url), {
+    method: "PUT",
+    headers: {Authorization: `Bearer ${controllerToken}`, "Content-Type": "application/json"},
+    body: JSON.stringify({address: 0, length: 0}),
+  })
+  assert.equal(invalidWatchpoint.status, 400)
+  assert.equal((await invalidWatchpoint.json()).error.code, "BAD_REQUEST")
+
   const unavailableRequest = readPrivateJson(
     listener.url,
     "/api/debug/memory?start=3&length=2",
@@ -1433,11 +1441,40 @@ test("cancelling an active mutation prevents later mutations in the same session
   await assert.rejects(core.resume(), /restart this MCP session/)
 })
 
+test("write watchpoint mutations require matching worker confirmations", async () => {
+  const identity = { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" }
+  const core = new Apple2tsCore("http://unused.invalid", controllerToken, identity)
+  core.request = async () => ({
+    emulator: identity,
+    state: {
+      watchpointId: "mwp:main:-:933:4",
+      address: 0x03A5,
+      length: 4,
+      space: "main",
+      auxBank: null,
+      executionSequence: 1,
+    },
+  })
+  await assert.rejects(
+    core.setMemoryWriteWatchpoint({address: 0x03A4, length: 4, space: "main"}),
+    /did not confirm the requested memory write watchpoint/,
+  )
+  await assert.rejects(core.pause(), /restart this MCP session/)
+
+  const clearCore = new Apple2tsCore("http://unused.invalid", controllerToken, identity)
+  clearCore.request = async () => ({emulator: identity, state: {cleared: "yes"}})
+  await assert.rejects(
+    clearCore.clearMemoryWriteWatchpoint(),
+    /did not confirm memory write watchpoint removal/,
+  )
+})
+
 const executionSnapshot = (sequence, state, overrides = {}) => ({
   executionSequence: sequence,
   state,
   pauseReason: state === "paused" ? "explicit" : null,
   breakpoint: null,
+  memoryWrite: null,
   PC: 0x6000,
   A: 1,
   X: 2,
@@ -1622,6 +1659,8 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
       "set_breakpoint",
       "clear_breakpoint",
       "clear_all_breakpoints",
+      "set_memory_write_watchpoint",
+      "clear_memory_write_watchpoint",
       "set_cpu",
     ],
   )
@@ -1700,6 +1739,19 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.equal(findMemoryTool.outputSchema.properties.value.properties.bytes, undefined)
   assert.equal(findMemoryTool.outputSchema.properties.value.properties.matches.maxItems, 64)
   assert.deepEqual(findMemoryTool.annotations, readMemoryTool.annotations)
+  const writeWatchpointTool = tools.result.tools.find(
+    (tool) => tool.name === "set_memory_write_watchpoint",
+  )
+  assert.equal(writeWatchpointTool.inputSchema.properties.length.maximum, 4096)
+  assert.deepEqual(writeWatchpointTool.inputSchema.properties.space.enum, ["active", "main", "aux"])
+  assert.match(writeWatchpointTool.description, /must already be paused/)
+  assert.match(writeWatchpointTool.description, /wait_for_execution_stop/)
+  assert.equal(writeWatchpointTool.annotations.idempotentHint, true)
+  const clearWriteWatchpointTool = tools.result.tools.find(
+    (tool) => tool.name === "clear_memory_write_watchpoint",
+  )
+  assert.equal(clearWriteWatchpointTool.annotations.destructiveHint, true)
+  assert.equal(clearWriteWatchpointTool.annotations.idempotentHint, true)
   const keyboardTool = tools.result.tools.find((tool) => tool.name === "set_keyboard_key")
   assert.deepEqual(keyboardTool.inputSchema.properties.key.type, ["string", "null"])
   assert.equal(keyboardTool.inputSchema.properties.key.minLength, 1)
@@ -2279,6 +2331,114 @@ test("stdio exposes coherent execution state and waits for worker-confirmed stop
   assert.deepEqual((await call("execution-stop-again", "stop_session")).result.structuredContent, { stopped: false })
 })
 
+test("stdio arms a bounded write watchpoint and reports its coherent stop", async (t) => {
+  const processState = await launchMcp({
+    APPLE2TS_FAKE_CHROMIUM_MODE: "memory-write-stop",
+    APPLE2TS_FAKE_EXECUTION_STOP_DELAY_MS: "25",
+  })
+  t.after(processState.cleanup)
+  await processState.waitForStderr((line) => line.includes("MCP ready for session requests"))
+  await initializeMcp(processState)
+  const started = await startMcpSession(processState)
+  assert.equal(started.result.isError, undefined, JSON.stringify(started))
+
+  const call = (id, name, args = {}) => sendMcpRequest(processState, id, "tools/call", {
+    name,
+    arguments: args,
+  })
+  const armedResponse = await call("watchpoint-arm", "set_memory_write_watchpoint", {
+    address: 0x03A4,
+    length: 4,
+    space: "main",
+  })
+  assert.equal(armedResponse.result.isError, undefined, JSON.stringify(armedResponse))
+  const armed = armedResponse.result.structuredContent
+  assert.deepEqual(armed.value, {
+    watchpointId: "mwp:main:-:932:4",
+    address: 0x03A4,
+    length: 4,
+    space: "main",
+    auxBank: null,
+    executionSequence: 1,
+  })
+
+  await call("watchpoint-resume", "resume")
+  const waitedResponse = await call("watchpoint-wait", "wait_for_execution_stop", {
+    timeoutMs: 1000,
+    afterSequence: armed.value.executionSequence,
+  })
+  assert.equal(waitedResponse.result.isError, undefined, JSON.stringify(waitedResponse))
+  const waited = waitedResponse.result.structuredContent
+  assert.equal(waited.outcome, "stopped")
+  assert.equal(waited.state.state, "paused")
+  assert.equal(waited.state.pauseReason, "watchpoint")
+  assert.deepEqual(waited.state.memoryWrite, {
+    watchpointId: armed.value.watchpointId,
+    writerPC: 0x6002,
+    address: 0x03A5,
+    value: 0x5A,
+    watchpointSpace: "main",
+    watchpointAuxBank: null,
+    effectiveSpace: "main",
+    effectiveAuxBank: null,
+    mapping: {
+      RAMRD: false,
+      RAMWRT: false,
+      ALTZP: false,
+      "80STORE": false,
+      PAGE2: false,
+      HIRES: false,
+    },
+  })
+
+  const cleared = await call("watchpoint-clear", "clear_memory_write_watchpoint")
+  assert.deepEqual(cleared.result.structuredContent, {
+    emulator: armed.emulator,
+    value: {cleared: true},
+  })
+  const clearedAgain = await call("watchpoint-clear-again", "clear_memory_write_watchpoint")
+  assert.deepEqual(clearedAgain.result.structuredContent.value, {cleared: false})
+
+  await call("watchpoint-resume-reject", "resume")
+  const rejected = await call("watchpoint-running-reject", "set_memory_write_watchpoint", {
+    address: 0x03A4,
+    length: 1,
+  })
+  assert.equal(rejected.result.isError, true)
+  assert.match(rejected.result.content[0].text, /only while the emulator is paused/)
+  const paused = await call("watchpoint-pause-after-reject", "pause")
+  assert.equal(paused.result.isError, undefined, JSON.stringify(paused))
+
+  processState.child.stdin.end()
+  const processExit = await processState.waitForExit()
+  assert.equal(processExit.error, null)
+  assert.equal(processExit.code, 0, processState.getStderr())
+})
+
+test("a timed-out write watchpoint leaves later mutations blocked", async (t) => {
+  const processState = await launchMcp({
+    APPLE2TS_FAKE_CHROMIUM_MODE: "stall-write-watchpoint",
+    COMMAND_TIMEOUT_MS: "25",
+  })
+  t.after(processState.cleanup)
+  await processState.waitForStderr((line) => line.includes("MCP ready for session requests"))
+  await initializeMcp(processState)
+  assert.equal((await startMcpSession(processState)).result.isError, undefined)
+
+  const timedOut = await sendMcpRequest(processState, "watchpoint-timeout", "tools/call", {
+    name: "set_memory_write_watchpoint",
+    arguments: {address: 0x03A4, length: 1},
+  })
+  assert.equal(timedOut.result.isError, true)
+  assert.match(timedOut.result.content[0].text, /Timed out waiting for command/)
+  const blocked = await sendMcpRequest(processState, "watchpoint-blocked", "tools/call", {
+    name: "pause",
+    arguments: {},
+  })
+  assert.equal(blocked.result.isError, true)
+  assert.match(blocked.result.content[0].text, /restart this MCP session/)
+})
+
 test("stdio cancellation aborts an execution wait without poisoning the session", async (t) => {
   const processState = await launchMcp()
   t.after(processState.cleanup)
@@ -2328,7 +2488,7 @@ test("stdio cancellation aborts an execution wait without poisoning the session"
   assert.equal((await startMcpSession(processState, "cancel-restart")).result.isError, undefined)
 })
 
-test("real renderer searches memory and reports the finite program stop atomically", {
+test("real renderer searches memory and reports coherent breakpoint and write-watchpoint stops", {
   skip: !process.env.APPLE2TS_REAL_CHROMIUM_EXECUTABLE || !process.env.APPLE2TS_REAL_DIST_DIR,
 }, async (t) => {
   const taskRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-execution-acceptance-"))
@@ -2343,7 +2503,8 @@ test("real renderer searches memory and reports the finite program stop atomical
     0xA9, 0x41,       // LDA #$41
     0xA2, 0x42,       // LDX #$42
     0xA0, 0x43,       // LDY #$43
-    0xEA, 0x00,       // success NOP; failure BRK
+    0x8D, 0xA5, 0x03, // STA $03A5
+    0xEA, 0xEA, 0x00, // resume point; success NOP; failure BRK
   ]))
 
   const processState = await launchMcp({
@@ -2360,6 +2521,7 @@ test("real renderer searches memory and reports the finite program stop atomical
   await initializeMcp(processState)
   const discovered = await sendMcpRequest(processState, "real-tools", "tools/list")
   assert.equal(discovered.result.tools.some((tool) => tool.name === "find_memory"), true)
+  assert.equal(discovered.result.tools.some((tool) => tool.name === "set_memory_write_watchpoint"), true)
   assert.equal((await startMcpSession(processState)).result.isError, undefined)
   const call = (id, name, args = {}) => sendMcpRequest(processState, id, "tools/call", {
     name,
@@ -2381,7 +2543,7 @@ test("real renderer searches memory and reports the finite program stop atomical
   const beforeSearch = await readExecution("real-before-search")
   const mainSearch = (await call("real-find-main", "find_memory", {
     address: 0x6000,
-    length: 11,
+    length: 15,
     space: "main",
     bytes: [0xA2, 0xF0],
   })).result.structuredContent
@@ -2392,7 +2554,7 @@ test("real renderer searches memory and reports the finite program stop atomical
 
   const auxSearch = (await call("real-find-aux", "find_memory", {
     address: 0x6000,
-    length: 11,
+    length: 15,
     space: "aux",
     bytes: [0xA2, 0xF0],
   })).result.structuredContent
@@ -2400,14 +2562,14 @@ test("real renderer searches memory and reports the finite program stop atomical
 
   const activeSearch = (await call("real-find-active", "find_memory", {
     address: 0x6000,
-    length: 11,
+    length: 15,
     bytes: [0xA2, 0xF0],
   })).result.structuredContent
   assert.deepEqual(activeSearch.value.matches, [0x6000])
 
   const truncatedSearch = (await call("real-find-truncated", "find_memory", {
     address: 0x6000,
-    length: 11,
+    length: 15,
     space: "main",
     bytes: [0xA2],
     maxMatches: 1,
@@ -2434,21 +2596,57 @@ test("real renderer searches memory and reports the finite program stop atomical
   assert.equal(afterCpuPatch.state.executionSequence, beforeCpuPatch.state.executionSequence)
   assert.equal(afterCpuPatch.state.PC, 0x6000)
   assert.equal(afterCpuPatch.state.PStatus, 0x24)
-  await call("real-success", "set_breakpoint", { address: 0x6009 })
-  await call("real-failure", "set_breakpoint", { address: 0x600A })
+  await call("real-watch", "set_memory_write_watchpoint", {
+    address: 0x03A4,
+    length: 4,
+    space: "main",
+  })
+  const beforeWrite = await readExecution("real-before-write")
+  await call("real-resume-write", "resume")
+  const writeStopped = (await call("real-wait-write", "wait_for_execution_stop", {
+    timeoutMs: 2000,
+    afterSequence: beforeWrite.state.executionSequence,
+  })).result.structuredContent
+  assert.equal(writeStopped.outcome, "stopped")
+  assert.equal(writeStopped.state.breakpoint, null)
+  assert.deepEqual(writeStopped.state.memoryWrite, {
+    watchpointId: "mwp:main:-:932:4",
+    writerPC: 0x6009,
+    address: 0x03A5,
+    value: 0x41,
+    watchpointSpace: "main",
+    watchpointAuxBank: null,
+    effectiveSpace: "main",
+    effectiveAuxBank: null,
+    mapping: {
+      RAMRD: false,
+      RAMWRT: false,
+      ALTZP: false,
+      "80STORE": false,
+      PAGE2: false,
+      HIRES: false,
+    },
+  })
+  assert.deepEqual(await readExecution("real-after-write"), {
+    emulator: writeStopped.emulator,
+    state: writeStopped.state,
+  })
+  await call("real-clear-watch", "clear_memory_write_watchpoint")
+  await call("real-success", "set_breakpoint", { address: 0x600D })
+  await call("real-failure", "set_breakpoint", { address: 0x600E })
   const before = await readExecution("real-before")
   await call("real-resume", "resume")
   const stopped = (await call("real-wait", "wait_for_execution_stop", {
     timeoutMs: 2000,
     afterSequence: before.state.executionSequence,
-    expectedBreakpointAddress: 0x6009,
+    expectedBreakpointAddress: 0x600D,
   })).result.structuredContent
 
   assert.equal(stopped.outcome, "stopped")
   assert.equal(stopped.expectationMatched, true)
   assert.ok(stopped.state.executionSequence > before.state.executionSequence)
   assert.equal(stopped.state.pauseReason, "breakpoint")
-  assert.deepEqual(stopped.state.breakpoint, { breakpointId: "bp:24585", address: 0x6009 })
+  assert.deepEqual(stopped.state.breakpoint, { breakpointId: "bp:24589", address: 0x600D })
   assert.deepEqual(
     { A: stopped.state.A, X: stopped.state.X, Y: stopped.state.Y, S: stopped.state.S },
     { A: 0x41, X: 0x42, Y: 0x43, S: 0xF0 },

@@ -220,6 +220,40 @@ const machineResultSchema = fromJsonSchema({
   additionalProperties: false,
 })
 
+const memoryMappingSchema = {
+  type: "object",
+  properties: {
+    RAMRD: { type: "boolean" },
+    RAMWRT: { type: "boolean" },
+    ALTZP: { type: "boolean" },
+    "80STORE": { type: "boolean" },
+    PAGE2: { type: "boolean" },
+    HIRES: { type: "boolean" },
+  },
+  required: ["RAMRD", "RAMWRT", "ALTZP", "80STORE", "PAGE2", "HIRES"],
+  additionalProperties: false,
+}
+
+const memoryWriteEventSchema = {
+  type: "object",
+  properties: {
+    watchpointId: { type: "string", pattern: "^mwp:(active|main|aux):(-|[0-9]+):[0-9]+:[0-9]+$" },
+    writerPC: { type: "integer", minimum: 0, maximum: 65535 },
+    address: { type: "integer", minimum: 0, maximum: 65535 },
+    value: { type: "integer", minimum: 0, maximum: 255 },
+    watchpointSpace: { type: "string", enum: ["active", "main", "aux"] },
+    watchpointAuxBank: { type: ["integer", "null"], minimum: 0, maximum: 127 },
+    effectiveSpace: { type: "string", enum: ["main", "aux", "system"] },
+    effectiveAuxBank: { type: ["integer", "null"], minimum: 0, maximum: 127 },
+    mapping: memoryMappingSchema,
+  },
+  required: [
+    "watchpointId", "writerPC", "address", "value", "watchpointSpace",
+    "watchpointAuxBank", "effectiveSpace", "effectiveAuxBank", "mapping",
+  ],
+  additionalProperties: false,
+}
+
 const executionSnapshotSchema = {
   type: "object",
   properties: {
@@ -243,6 +277,7 @@ const executionSnapshotSchema = {
         },
       ],
     },
+    memoryWrite: { oneOf: [{ type: "null" }, memoryWriteEventSchema] },
     PC: { type: "integer", minimum: 0, maximum: 65535 },
     A: { type: "integer", minimum: 0, maximum: 255 },
     X: { type: "integer", minimum: 0, maximum: 255 },
@@ -261,7 +296,7 @@ const executionSnapshotSchema = {
     },
   },
   required: [
-    "executionSequence", "state", "pauseReason", "breakpoint",
+    "executionSequence", "state", "pauseReason", "breakpoint", "memoryWrite",
     "PC", "A", "X", "Y", "S", "PStatus", "machineName", "memoryConfiguration",
   ],
   additionalProperties: false,
@@ -360,19 +395,53 @@ const memoryWriteOutputSchema = fromJsonSchema({
   additionalProperties: false,
 })
 
-const memoryMappingSchema = {
+const memoryWriteWatchpointInputSchema = fromJsonSchema({
   type: "object",
   properties: {
-    RAMRD: { type: "boolean" },
-    RAMWRT: { type: "boolean" },
-    ALTZP: { type: "boolean" },
-    "80STORE": { type: "boolean" },
-    PAGE2: { type: "boolean" },
-    HIRES: { type: "boolean" },
+    address: { type: "integer", minimum: 0, maximum: 65535 },
+    length: { type: "integer", minimum: 1, maximum: 4096 },
+    space: { type: "string", enum: ["active", "main", "aux"], default: "active" },
+    auxBank: { type: "integer", minimum: 0, maximum: 127 },
   },
-  required: ["RAMRD", "RAMWRT", "ALTZP", "80STORE", "PAGE2", "HIRES"],
+  required: ["address", "length"],
+  additionalProperties: false,
+})
+
+const memoryWriteWatchpointValueSchema = {
+  type: "object",
+  properties: {
+    watchpointId: { type: "string", pattern: "^mwp:(active|main|aux):(-|[0-9]+):[0-9]+:[0-9]+$" },
+    address: { type: "integer", minimum: 0, maximum: 65535 },
+    length: { type: "integer", minimum: 1, maximum: 4096 },
+    space: { type: "string", enum: ["active", "main", "aux"] },
+    auxBank: { type: ["integer", "null"], minimum: 0, maximum: 127 },
+    executionSequence: { type: "integer", minimum: 0 },
+  },
+  required: ["watchpointId", "address", "length", "space", "auxBank", "executionSequence"],
   additionalProperties: false,
 }
+
+const memoryWriteWatchpointOutputSchema = fromJsonSchema({
+  type: "object",
+  properties: {emulator: emulatorIdentitySchema, value: memoryWriteWatchpointValueSchema},
+  required: ["emulator", "value"],
+  additionalProperties: false,
+})
+
+const memoryWriteWatchpointClearOutputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    emulator: emulatorIdentitySchema,
+    value: {
+      type: "object",
+      properties: {cleared: { type: "boolean" }},
+      required: ["cleared"],
+      additionalProperties: false,
+    },
+  },
+  required: ["emulator", "value"],
+  additionalProperties: false,
+})
 
 const memorySegmentSchema = (maximumLength) => ({
   type: "object",
@@ -673,6 +742,7 @@ const fetchEnvelope = async (baseUrl, pathname, controllerToken, signal, options
     const detail = payload?.error?.message || payload?.error?.code || payload?.error || `HTTP ${response.status}`
     const error = new Error(`Apple2TS bridge request ${pathname} failed: ${detail}`)
     error.bridgeStatus = response.status
+    error.bridgeCode = payload?.error?.code
     throw error
   }
   return payload.data
@@ -731,6 +801,24 @@ const validateMemoryRequest = ({ address, length, space, auxBank }, maximumLengt
   if (space !== "active" && address + length > 0xC000) {
     throw new Error("Physical memory reads must fit within RAM at $0000-$BFFF")
   }
+}
+
+const confirmMemoryWriteWatchpoint = (result, request) => {
+  const state = result?.state
+  const auxBank = request.space === "aux" ? (request.auxBank ?? state?.auxBank) : null
+  const watchpointId = `mwp:${request.space}:${auxBank ?? "-"}:${request.address}:${request.length}`
+  if (
+    (request.space === "aux" && (!Number.isInteger(auxBank) || auxBank < 0 || auxBank > 127))
+    || state?.watchpointId !== watchpointId
+    || state.address !== request.address
+    || state.length !== request.length
+    || state.space !== request.space
+    || state.auxBank !== auxBank
+    || !Number.isInteger(state.executionSequence)
+  ) {
+    throw new Error("Apple2TS did not confirm the requested memory write watchpoint")
+  }
+  return {emulator: result.emulator, value: state}
 }
 
 export class Apple2tsCore {
@@ -1249,6 +1337,40 @@ export class Apple2tsCore {
     }
   }
 
+  setMemoryWriteWatchpoint({ address, length, space = "active", auxBank }, signal) {
+    const request = {address, length, space, ...(auxBank === undefined ? {} : {auxBank})}
+    validateMemoryRequest(request, 4096)
+    return this.serializeMutation(async () => {
+      let result
+      try {
+        result = await this.request("/api/private/memory/write-watchpoint", {
+          method: "PUT",
+          body: request,
+        })
+      } catch (error) {
+        if (error?.bridgeCode === "COMMAND_REJECTED") throw new ConfirmedMutationRejection(error)
+        throw error
+      }
+      return confirmMemoryWriteWatchpoint(result, request)
+    }, signal)
+  }
+
+  clearMemoryWriteWatchpoint(signal) {
+    return this.serializeMutation(async () => {
+      let result
+      try {
+        result = await this.request("/api/private/memory/write-watchpoint", {method: "DELETE"})
+      } catch (error) {
+        if (error?.bridgeCode === "COMMAND_REJECTED") throw new ConfirmedMutationRejection(error)
+        throw error
+      }
+      if (typeof result?.state?.cleared !== "boolean") {
+        throw new Error("Apple2TS did not confirm memory write watchpoint removal")
+      }
+      return {emulator: result.emulator, value: result.state}
+    }, signal)
+  }
+
   loadBinaryBytes({ address }, bytes, signal) {
     return this.serializeMutation(
       (startMutation) => this.applyBinaryBytes(address, bytes, startMutation),
@@ -1414,6 +1536,26 @@ const mutationTools = [
     destructiveHint: true,
     idempotentHint: true,
     execute: (core, _input, signal) => core.clearAllBreakpoints(signal),
+  },
+  {
+    name: "set_memory_write_watchpoint",
+    title: "Set memory write watchpoint",
+    description: "Watch one bounded active, main, or auxiliary memory range for CPU writes. The emulator must already be paused. The tool arms the watchpoint without resuming; use wait_for_execution_stop with a bounded timeout after resuming.",
+    inputSchema: memoryWriteWatchpointInputSchema,
+    outputSchema: memoryWriteWatchpointOutputSchema,
+    destructiveHint: false,
+    idempotentHint: true,
+    execute: (core, input, signal) => core.setMemoryWriteWatchpoint(input, signal),
+  },
+  {
+    name: "clear_memory_write_watchpoint",
+    title: "Clear memory write watchpoint",
+    description: "Clear the session's memory write watchpoint while the emulator is paused.",
+    inputSchema: noInputSchema,
+    outputSchema: memoryWriteWatchpointClearOutputSchema,
+    destructiveHint: true,
+    idempotentHint: true,
+    execute: (core, _input, signal) => core.clearMemoryWriteWatchpoint(signal),
   },
   {
     name: "set_cpu",

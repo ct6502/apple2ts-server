@@ -10,6 +10,7 @@ export const statusFixture = {
       state: "paused",
       pauseReason: "explicit",
       breakpoint: null,
+      memoryWrite: null,
       PC: 768,
       A: 65,
       X: 1,

@@ -1027,7 +1027,9 @@ const server = createServer(async (req, res) => {
       pendingCommands.delete(body.commandId)
 
       if (body.ok === false) {
-        pending.reject(new Error(body.error || "Command failed"))
+        const error = new Error(body.error || "Command failed")
+        error.commandRejected = true
+        pending.reject(error)
       } else {
         pending.resolve({
           clientId: body.clientId,
@@ -1406,6 +1408,72 @@ const server = createServer(async (req, res) => {
           res,
           400,
           "BAD_REQUEST",
+          error instanceof Error ? error.message : String(error),
+        )
+      }
+      return
+    }
+
+    if (
+      (req.method === "PUT" || req.method === "DELETE")
+      && url.pathname === "/api/private/memory/write-watchpoint"
+    ) {
+      if (!privateRenderer) {
+        writeErrorEnvelope(res, 404, "NOT_FOUND", "Memory write watchpoints require a private emulator session.")
+        return
+      }
+      const client = getConnectedClient()
+      if (!client) {
+        writeNoConnectedClientError(res)
+        return
+      }
+      let commandPayload = {}
+      if (req.method === "PUT") {
+        try {
+          const body = await readJsonBody(req)
+          const {address, length, auxBank} = body
+          const space = body.space || "active"
+          validateMemoryBounds(address, length)
+          if (length > 4096) throw new Error("length must be an integer between 1 and 4096")
+          if (!["active", "main", "aux"].includes(space)) {
+            throw new Error("space must be 'active', 'main', or 'aux'")
+          }
+          if (auxBank !== undefined && (!Number.isInteger(auxBank) || auxBank < 0 || auxBank > 127)) {
+            throw new Error("auxBank must be an integer between 0 and 127")
+          }
+          if (auxBank !== undefined && space !== "aux") {
+            throw new Error("auxBank is valid only when space is 'aux'")
+          }
+          if (space !== "active" && address + length > 0xC000) {
+            throw new Error("Physical memory ranges must fit within RAM at $0000-$BFFF")
+          }
+          commandPayload = {address, length, space, ...(auxBank === undefined ? {} : {auxBank})}
+        } catch (error) {
+          writeErrorEnvelope(
+            res,
+            400,
+            "BAD_REQUEST",
+            error instanceof Error ? error.message : String(error),
+          )
+          return
+        }
+      }
+      try {
+        if (req.method === "DELETE") {
+          const reply = await dispatchCommand(client, "clearMemoryWriteWatchpoint", {}, true)
+          client.lastSeenAt = Date.now()
+          writeEnvelope(res, 200, reply.result)
+          return
+        }
+        const reply = await dispatchCommand(client, "setMemoryWriteWatchpoint", commandPayload, true)
+        client.lastSeenAt = Date.now()
+        writeEnvelope(res, 200, reply.result)
+      } catch (error) {
+        const rejected = error?.commandRejected === true
+        writeErrorEnvelope(
+          res,
+          rejected ? 400 : 504,
+          rejected ? "COMMAND_REJECTED" : "COMMAND_FAILED",
           error instanceof Error ? error.message : String(error),
         )
       }

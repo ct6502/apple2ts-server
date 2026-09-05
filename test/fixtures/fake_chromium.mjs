@@ -79,6 +79,7 @@ const auxMemory = new Array(65536).fill(0)
 mainMemory[0x03A4] = 0x11
 auxMemory[0x03A4] = 0x22
 let breakpoints = []
+let memoryWriteWatchpoint = null
 let buffer = ""
 let stopping = false
 let statusReplies = 0
@@ -173,6 +174,7 @@ while (!stopping) {
       status.machine.execution.state = status.machine.runMode === -2 ? "paused" : "running"
       status.machine.execution.pauseReason = status.machine.runMode === -2 ? "explicit" : null
       status.machine.execution.breakpoint = null
+      status.machine.execution.memoryWrite = null
       if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "stall-run-mode") {
         await updateReceipt({ stalledRunMode: true })
         continue
@@ -197,6 +199,48 @@ while (!stopping) {
               address: breakpoint.address,
             },
             PC: breakpoint.address,
+          }
+          void postJson("/api/client/state", {
+            clientId,
+            remoteControlToken,
+            rendererId,
+            state: snapshotStatus(),
+          })
+        }, Number(process.env.APPLE2TS_FAKE_EXECUTION_STOP_DELAY_MS || 5))
+      }
+      if (
+        process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "memory-write-stop"
+        && status.machine.runMode === -1
+        && memoryWriteWatchpoint
+      ) {
+        const watchpoint = structuredClone(memoryWriteWatchpoint)
+        setTimeout(() => {
+          status.machine.runMode = -2
+          status.machine.execution = {
+            ...status.machine.execution,
+            executionSequence: status.machine.execution.executionSequence + 1,
+            state: "paused",
+            pauseReason: "watchpoint",
+            breakpoint: null,
+            memoryWrite: {
+              watchpointId: watchpoint.watchpointId,
+              writerPC: 0x6002,
+              address: watchpoint.address + 1,
+              value: 0x5A,
+              watchpointSpace: watchpoint.space,
+              watchpointAuxBank: watchpoint.auxBank,
+              effectiveSpace: watchpoint.space === "active" ? "main" : watchpoint.space,
+              effectiveAuxBank: watchpoint.space === "aux" ? watchpoint.auxBank : null,
+              mapping: {
+                RAMRD: false,
+                RAMWRT: false,
+                ALTZP: false,
+                "80STORE": false,
+                PAGE2: false,
+                HIRES: false,
+              },
+            },
+            PC: 0x6005,
           }
           void postJson("/api/client/state", {
             clientId,
@@ -302,6 +346,47 @@ while (!stopping) {
         result.totalMatchCount = 1
         result.truncated = false
       }
+    } else if (command.action === "setMemoryWriteWatchpoint") {
+      if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "stall-write-watchpoint") continue
+      if (status.machine.runMode !== -2) {
+        const reply = await postJson("/api/client/reply", {
+          clientId,
+          remoteControlToken,
+          rendererId,
+          commandId: command.commandId,
+          ok: false,
+          error: "Memory write watchpoints can be changed only while the emulator is paused",
+        })
+        if (!reply.ok) process.exit(68)
+        continue
+      }
+      const {address, length, space, auxBank} = command.payload
+      memoryWriteWatchpoint = {
+        watchpointId: `mwp:${space}:${space === "aux" ? auxBank ?? 0 : "-"}:${address}:${length}`,
+        address,
+        length,
+        space,
+        auxBank: space === "aux" ? auxBank ?? 0 : null,
+      }
+      result = {
+        ...memoryWriteWatchpoint,
+        executionSequence: status.machine.execution.executionSequence,
+      }
+    } else if (command.action === "clearMemoryWriteWatchpoint") {
+      if (status.machine.runMode !== -2) {
+        const reply = await postJson("/api/client/reply", {
+          clientId,
+          remoteControlToken,
+          rendererId,
+          commandId: command.commandId,
+          ok: false,
+          error: "Memory write watchpoints can be changed only while the emulator is paused",
+        })
+        if (!reply.ok) process.exit(68)
+        continue
+      }
+      result = {cleared: memoryWriteWatchpoint !== null}
+      memoryWriteWatchpoint = null
     } else if (command.action === "captureScreen") {
       result = {
         mimeType: "image/png",
