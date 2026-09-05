@@ -250,6 +250,58 @@ while (!stopping) {
         },
         bytes: source.slice(address, address + length),
       }
+    } else if (command.action === "findMemory") {
+      if (status.machine.runMode !== -2) {
+        const reply = await postJson("/api/client/reply", {
+          clientId,
+          remoteControlToken,
+          rendererId,
+          commandId: command.commandId,
+          ok: false,
+          error: "Memory is available only while the emulator is paused",
+        })
+        if (!reply.ok) process.exit(68)
+        continue
+      }
+      const {address, length, space, auxBank, bytes, maxMatches} = command.payload
+      const source = space === "aux" ? auxMemory : mainMemory
+      const matches = []
+      let totalMatchCount = 0
+      for (let offset = 0; offset + bytes.length <= length; offset++) {
+        if (bytes.every((byte, index) => source[address + offset + index] === byte)) {
+          totalMatchCount++
+          if (matches.length < maxMatches) matches.push(address + offset)
+        }
+      }
+      result = {
+        address,
+        length,
+        requestedSpace: space,
+        requestedAuxBank: auxBank ?? null,
+        effectiveAuxBank: space === "aux" ? auxBank ?? 0 : null,
+        effectiveSegments: [{
+          address,
+          length,
+          space: space === "active" && address >= 0xC000 ? "system" : space === "aux" ? "aux" : "main",
+          ...(space === "aux" ? {auxBank: auxBank ?? 0} : {}),
+        }],
+        mapping: {
+          RAMRD: false,
+          RAMWRT: false,
+          ALTZP: false,
+          "80STORE": false,
+          PAGE2: false,
+          HIRES: false,
+        },
+        matches,
+        totalMatchCount,
+        truncated: totalMatchCount > matches.length,
+      }
+      if (process.env.APPLE2TS_FAKE_CHROMIUM_MODE === "invalid-memory-search") {
+        result.matches = [0xFFFF]
+        result.totalMatchCount = 1
+        result.truncated = false
+      }
     } else if (command.action === "captureScreen") {
       result = {
         mimeType: "image/png",

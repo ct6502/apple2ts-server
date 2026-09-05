@@ -612,6 +612,40 @@ const getMemoryViewFromReply = async (client, request) => {
   return result
 }
 
+const getMemorySearchFromReply = async (client, request) => {
+  const reply = await dispatchCommand(client, "findMemory", request, true)
+  const result = reply.result
+  const lastMatchAddress = request.address + request.length - request.bytes.length
+  const expectedReturnedCount = Math.min(result?.totalMatchCount ?? -1, request.maxMatches)
+  if (
+    !result
+    || Object.hasOwn(result, "bytes")
+    || result.address !== request.address
+    || result.length !== request.length
+    || result.requestedSpace !== request.space
+    || (result.requestedAuxBank ?? null) !== (request.auxBank ?? null)
+    || !Array.isArray(result.matches)
+    || result.matches.length !== expectedReturnedCount
+    || result.matches.some((address, index) => (
+      !Number.isInteger(address)
+      || address < request.address
+      || address > lastMatchAddress
+      || (index > 0 && address <= result.matches[index - 1])
+    ))
+    || !Number.isInteger(result.totalMatchCount)
+    || result.totalMatchCount < result.matches.length
+    || result.totalMatchCount > Math.max(0, request.length - request.bytes.length + 1)
+    || result.truncated !== (result.totalMatchCount > result.matches.length)
+    || !Array.isArray(result.effectiveSegments)
+    || !result.mapping
+    || typeof result.mapping !== "object"
+  ) {
+    throw new Error("Memory search was not available from the browser client.")
+  }
+  client.lastSeenAt = Date.now()
+  return result
+}
+
 const MAX_SCREEN_CAPTURE_BASE64_LENGTH = 64 * 1024 * 1024
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
 
@@ -1322,6 +1356,57 @@ const server = createServer(async (req, res) => {
           space === "active" && detail === "Memory is available only while the emulator is paused"
             ? "Memory dump unavailable for the requested range. Pause the emulator first."
             : detail,
+        )
+      }
+      return
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/private/memory/find") {
+      if (!privateRenderer) {
+        writeErrorEnvelope(res, 404, "NOT_FOUND", "Memory search requires a private emulator session.")
+        return
+      }
+      const client = getConnectedClient()
+      if (!client) {
+        writeNoConnectedClientError(res)
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        const {address, length, bytes, auxBank} = body
+        const space = body.space || "active"
+        const maxMatches = body.maxMatches ?? 32
+        validateMemoryBounds(address, length)
+        if (!["active", "main", "aux"].includes(space)) {
+          throw new Error("space must be 'active', 'main', or 'aux'")
+        }
+        if (auxBank !== undefined && (!Number.isInteger(auxBank) || auxBank < 0 || auxBank > 127)) {
+          throw new Error("auxBank must be an integer between 0 and 127")
+        }
+        if (auxBank !== undefined && space !== "aux") {
+          throw new Error("auxBank is valid only when space is 'aux'")
+        }
+        if (!Array.isArray(bytes) || bytes.length < 1 || bytes.length > 32
+          || bytes.some((byte) => !Number.isInteger(byte) || byte < 0 || byte > 255)) {
+          throw new Error("bytes must contain 1 to 32 integers between 0 and 255")
+        }
+        if (!Number.isInteger(maxMatches) || maxMatches < 1 || maxMatches > 64) {
+          throw new Error("maxMatches must be an integer between 1 and 64")
+        }
+        writeEnvelope(res, 200, await getMemorySearchFromReply(client, {
+          address,
+          length,
+          space,
+          ...(auxBank === undefined ? {} : {auxBank}),
+          bytes,
+          maxMatches,
+        }))
+      } catch (error) {
+        writeErrorEnvelope(
+          res,
+          400,
+          "BAD_REQUEST",
+          error instanceof Error ? error.message : String(error),
         )
       }
       return
