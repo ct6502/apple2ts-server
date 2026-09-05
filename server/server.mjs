@@ -15,6 +15,7 @@ let port = Number(process.env.PORT || 6502)
 let commandTimeoutMs = Number(process.env.COMMAND_TIMEOUT_MS || 10000)
 let serverInstanceId = randomUUID()
 let privateRenderer = null
+let privateUploadHandler = null
 let logger = console
 let clientStateObserver = null
 
@@ -863,6 +864,8 @@ const server = createServer(async (req, res) => {
   }
 
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`)
+
+  if (privateUploadHandler && await privateUploadHandler(req, res, url)) return
 
   if (isPrivateControllerPath(url.pathname) && !controllerRequestMatches(req)) {
     writePrivateControllerError(res)
@@ -1990,6 +1993,7 @@ export const startApple2tsServer = async (options = {}) => {
         onDisconnect: options.privateRenderer.onDisconnect,
       }
     : null
+  privateUploadHandler = options.privateUploadHandler || null
 
   await new Promise((resolve, reject) => {
     const onError = (error) => {
@@ -2032,6 +2036,7 @@ export const stopApple2tsServer = async () => {
   clients.clear()
   privateRenderer = null
   clientStateObserver = null
+  privateUploadHandler = null
 
   if (!server.listening) return
   await new Promise((resolve, reject) => {

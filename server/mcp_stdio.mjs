@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { createHash, randomBytes, randomUUID } from "node:crypto"
+import { randomBytes, randomUUID } from "node:crypto"
 import { spawn } from "node:child_process"
 import { constants as fsConstants } from "node:fs"
 import { access, link, lstat, mkdtemp, open, realpath, rename, rm, stat, writeFile } from "node:fs/promises"
@@ -18,6 +18,7 @@ import {
   startApple2tsServer,
   stopApple2tsServer,
 } from "./server.mjs"
+import { UploadTickets } from "./upload_tickets.mjs"
 
 const SERVER_NAME = "apple2ts"
 const SERVER_VERSION = "0.1.0"
@@ -33,8 +34,6 @@ const MUTATION_TIMEOUT_MS = COMMAND_TIMEOUT_MS + MUTATION_RESPONSE_MARGIN_MS
 // media was mounted, so retain one shared budget for all three requests.
 const MOUNT_TIMEOUT_MS = COMMAND_TIMEOUT_MS * 3 + MUTATION_RESPONSE_MARGIN_MS
 const MAX_BINARY_BYTES = 0xC000
-const MAX_FLOPPY_IMAGE_BYTES = 2 * 1024 * 1024
-const MAX_HARD_DRIVE_IMAGE_BYTES = 32 * 1024 * 1024
 const STANDARD_FLOPPY_IMAGE_BYTES = 143360
 const DRIVE_IDS = ["hd1", "hd2", "fd1", "fd2"]
 const CPU_PATCH_MAXIMUMS = Object.freeze({
@@ -142,18 +141,19 @@ const diskMountInputSchema = fromJsonSchema({
   type: "object",
   properties: {
     driveId: { type: "string", enum: DRIVE_IDS },
-    path: { type: "string", minLength: 1 },
+    path: { type: "string", minLength: 1, description: "Absolute source file path read by apple2ts-upload." },
+    expectedSha256: { type: "string", pattern: "^[0-9A-Fa-f]{64}$" },
   },
   required: ["driveId", "path"],
   additionalProperties: false,
 })
 
-const fileStageInputSchema = fromJsonSchema({
+const uploadTicketResultSchema = fromJsonSchema({
   type: "object",
   properties: {
-    path: { type: "string", minLength: 1 },
+    ticket: { type: "string", minLength: 1 },
   },
-  required: ["path"],
+  required: ["ticket"],
   additionalProperties: false,
 })
 
@@ -199,17 +199,6 @@ const driveResultSchema = fromJsonSchema({
     state: driveReceiptSchema,
   },
   required: ["emulator", "state"],
-  additionalProperties: false,
-})
-
-const fileStageResultSchema = fromJsonSchema({
-  type: "object",
-  properties: {
-    path: { type: "string", minLength: 1 },
-    byteCount: { type: "integer", minimum: 1, maximum: MAX_HARD_DRIVE_IMAGE_BYTES },
-    sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
-  },
-  required: ["path", "byteCount", "sha256"],
   additionalProperties: false,
 })
 
@@ -439,22 +428,11 @@ const keyboardKeyOutputSchema = fromJsonSchema({
 const binaryLoadInputSchema = fromJsonSchema({
   type: "object",
   properties: {
-    path: { type: "string", minLength: 1 },
+    path: { type: "string", minLength: 1, description: "Absolute source file path read by apple2ts-upload." },
     address: { type: "integer", minimum: 0, maximum: 49151 },
+    expectedSha256: { type: "string", pattern: "^[0-9A-Fa-f]{64}$" },
   },
   required: ["path", "address"],
-  additionalProperties: false,
-})
-
-const binaryLoadOutputSchema = fromJsonSchema({
-  type: "object",
-  properties: {
-    emulator: emulatorIdentitySchema,
-    address: { type: "integer", minimum: 0, maximum: 49151 },
-    bytesWritten: { type: "integer", minimum: 1, maximum: MAX_BINARY_BYTES },
-    sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
-  },
-  required: ["emulator", "address", "bytesWritten", "sha256"],
   additionalProperties: false,
 })
 
@@ -606,150 +584,6 @@ const fetchEnvelope = async (baseUrl, pathname, controllerToken, signal, options
   return payload.data
 }
 
-const resolveBinaryRoot = async (configuredRoot, settingName = "APPLE2TS_BINARY_ROOT") => {
-  if (!configuredRoot) return null
-  try {
-    const root = await realpath(path.resolve(configuredRoot))
-    if (!(await stat(root)).isDirectory()) throw new Error()
-    await access(root, fsConstants.R_OK | fsConstants.X_OK)
-    return root
-  } catch {
-    throw new Error(`${settingName} must name a readable directory`)
-  }
-}
-
-const readAtMost = async (handle, limit) => {
-  const buffer = Buffer.allocUnsafe(limit)
-  let length = 0
-  while (length < limit) {
-    const { bytesRead } = await handle.read(buffer, length, limit - length)
-    if (bytesRead === 0) break
-    length += bytesRead
-  }
-  return buffer.subarray(0, length)
-}
-
-const readTrustedFile = async (root, filePath, noun, maxBytes, rootName = "APPLE2TS_BINARY_ROOT") => {
-  if (typeof filePath !== "string" || filePath.length === 0 || path.isAbsolute(filePath)) {
-    throw new Error(`path must be a non-empty path relative to ${rootName}`)
-  }
-
-  const candidate = path.resolve(root, filePath)
-  const relative = path.relative(root, candidate)
-  if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-    throw new Error(`path must stay within ${rootName}`)
-  }
-
-  let pathInfo
-  try {
-    pathInfo = await lstat(candidate)
-  } catch {
-    throw new Error(`${noun} file is unavailable or unreadable`)
-  }
-  if (pathInfo.isSymbolicLink()) throw new Error("symbolic links are not allowed")
-  if (!pathInfo.isFile()) throw new Error("path must name a regular file")
-
-  let resolvedFile
-  try {
-    resolvedFile = await realpath(candidate)
-  } catch {
-    throw new Error(`${noun} file is unavailable or unreadable`)
-  }
-  if (resolvedFile !== candidate) throw new Error("symbolic links are not allowed")
-
-  let handle
-  try {
-    try {
-      handle = await open(
-        candidate,
-        fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
-      )
-    } catch {
-      throw new Error(`${noun} file is unavailable or unreadable`)
-    }
-    const fileInfo = await handle.stat()
-    if (!fileInfo.isFile()) throw new Error("path must name a regular file")
-    if (fileInfo.size === 0) throw new Error(`${noun} file must not be empty`)
-    if (fileInfo.size > maxBytes) throw new Error(`${noun} file cannot exceed ${maxBytes} bytes`)
-
-    const bytes = await readAtMost(handle, maxBytes + 1)
-    if (bytes.length === 0) throw new Error(`${noun} file must not be empty`)
-    if (bytes.length > maxBytes) throw new Error(`${noun} file cannot exceed ${maxBytes} bytes`)
-    return bytes
-  } finally {
-    await handle?.close()
-  }
-}
-
-export class FileStager {
-  constructor(sourceRoot, binaryRoot) {
-    this.sourceRoot = sourceRoot
-    this.binaryRoot = binaryRoot
-    this.stageDirectory = null
-    this.stages = Promise.resolve()
-    this.closing = false
-  }
-
-  stage(filePath) {
-    if (this.closing) return Promise.reject(new Error("File staging is closing"))
-    const stage = this.stages.then(() => this.stageOne(filePath))
-    this.stages = stage.catch(() => {})
-    return stage
-  }
-
-  async stageOne(filePath) {
-    const bytes = await readTrustedFile(
-      this.sourceRoot,
-      filePath,
-      "file",
-      MAX_HARD_DRIVE_IMAGE_BYTES,
-      "APPLE2TS_FILE_SOURCE_ROOT",
-    )
-    const sha256 = createHash("sha256").update(bytes).digest("hex")
-    const stageDirectory = await this.getStageDirectory()
-    const stagedPath = path.join(stageDirectory, `${sha256}${path.extname(filePath).toLowerCase()}`)
-    const temporaryPath = path.join(stageDirectory, `.${randomUUID()}.tmp`)
-    try {
-      await writeFile(temporaryPath, bytes, { flag: "wx" })
-      await rename(temporaryPath, stagedPath)
-    } catch (error) {
-      await rm(temporaryPath, { force: true })
-      throw error
-    }
-    return {
-      path: path.relative(this.binaryRoot, stagedPath),
-      byteCount: bytes.length,
-      sha256,
-    }
-  }
-
-  async getStageDirectory() {
-    if (!this.stageDirectory) {
-      this.stageDirectory = await mkdtemp(path.join(this.binaryRoot, ".apple2ts-mcp-stage-"))
-    }
-    return this.stageDirectory
-  }
-
-  async cleanup() {
-    this.closing = true
-    await this.stages
-    if (!this.stageDirectory) return
-    const stageDirectory = this.stageDirectory
-    await rm(stageDirectory, { recursive: true, force: true })
-    this.stageDirectory = null
-  }
-
-  read(filePath, noun, maxBytes) {
-    if (!this.stageDirectory) throw new Error("path must name a file staged by this MCP session")
-    const candidate = path.resolve(this.binaryRoot, filePath)
-    const relative = path.relative(this.stageDirectory, candidate)
-    if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-      throw new Error("path must name a file staged by this MCP session")
-    }
-    return readTrustedFile(this.binaryRoot, filePath, noun, maxBytes, "APPLE2TS_FILE_STAGING_ROOT")
-  }
-}
-
 const classifyDiskImage = (filePath, byteLength) => {
   switch (path.extname(path.basename(filePath)).toLowerCase()) {
     case ".hdv":
@@ -787,15 +621,11 @@ export class Apple2tsCore {
     controllerToken,
     identity,
     signal = new AbortController().signal,
-    binaryRoot = null,
-    fileStager = null,
   ) {
     this.baseUrl = baseUrl
     this.controllerToken = controllerToken
     this.identity = identity
     this.signal = signal
-    this.binaryRoot = binaryRoot
-    this.fileStager = fileStager
     this.mutations = Promise.resolve()
     this.mutationFailure = null
     this.heldKey = null
@@ -1102,59 +932,45 @@ export class Apple2tsCore {
     await this.releaseHeldKeyboard()
   }
 
-  stageFile({ path: filePath }) {
-    if (!this.fileStager) throw new Error("File staging is not configured")
-    return this.fileStager.stage(filePath)
+  mountDiskBytes({ driveId, path: filePath }, bytes, signal) {
+    return this.serializeMutation(
+      (startMutation) => this.applyDiskBytes({ driveId, path: filePath }, bytes, startMutation),
+      signal,
+      { prepare: true },
+    )
   }
 
-  cleanupStagedFiles() {
-    return this.fileStager?.cleanup()
-  }
-
-  readInputFile(filePath, noun, maxBytes) {
-    return this.fileStager
-      ? this.fileStager.read(filePath, noun, maxBytes)
-      : readTrustedFile(this.binaryRoot, filePath, noun, maxBytes)
-  }
-
-  mountDisk({ driveId, path: filePath }, signal) {
-    return this.serializeMutation(async (startMutation) => {
-      const hardDrive = driveId === "hd1" || driveId === "hd2"
-      const bytes = await this.readInputFile(
-        filePath,
-        hardDrive ? "hard-drive image" : "floppy image",
-        hardDrive ? MAX_HARD_DRIVE_IMAGE_BYTES : MAX_FLOPPY_IMAGE_BYTES,
-      )
-      const mediaKind = classifyDiskImage(filePath, bytes.length)
-      if (mediaKind && mediaKind !== (hardDrive ? "hard-drive" : "floppy")) {
-        throw new Error(`${driveId} cannot mount a ${mediaKind} image`)
-      }
-      startMutation()
-      const mountDeadline = Date.now() + MOUNT_TIMEOUT_MS
-      const mountRequest = (pathname, options) => this.request(
-        pathname,
-        options,
-        this.signal,
-        Math.max(1, mountDeadline - Date.now()),
-      )
-      let result
-      try {
-        result = await mountRequest(`/api/drives/${driveId}/mount`, {
-          method: "POST",
-          body: {
-            sourceType: "base64",
-            filename: path.basename(filePath),
-            dataBase64: bytes.toString("base64"),
-          },
-        })
-      } catch (error) {
-        if (error?.bridgeStatus !== 400) throw error
-        const current = await mountRequest(`/api/drives/${driveId}`)
-        if (!isConfirmedDriveState(current, driveId, false)) throw error
-        throw new ConfirmedMutationRejection(error)
-      }
-      return confirmDriveState(result, driveId, true, "disk mount")
-    }, signal, { prepare: true })
+  async applyDiskBytes({ driveId, path: filePath }, bytes, startMutation) {
+    const hardDrive = driveId === "hd1" || driveId === "hd2"
+    const mediaKind = classifyDiskImage(filePath, bytes.length)
+    if (mediaKind && mediaKind !== (hardDrive ? "hard-drive" : "floppy")) {
+      throw new Error(`${driveId} cannot mount a ${mediaKind} image`)
+    }
+    startMutation()
+    const mountDeadline = Date.now() + MOUNT_TIMEOUT_MS
+    const mountRequest = (pathname, options) => this.request(
+      pathname,
+      options,
+      this.signal,
+      Math.max(1, mountDeadline - Date.now()),
+    )
+    let result
+    try {
+      result = await mountRequest(`/api/drives/${driveId}/mount`, {
+        method: "POST",
+        body: {
+          sourceType: "base64",
+          filename: path.basename(filePath),
+          dataBase64: bytes.toString("base64"),
+        },
+      })
+    } catch (error) {
+      if (error?.bridgeStatus !== 400) throw error
+      const current = await mountRequest(`/api/drives/${driveId}`)
+      if (!isConfirmedDriveState(current, driveId, false)) throw error
+      throw new ConfirmedMutationRejection(error)
+    }
+    return confirmDriveState(result, driveId, true, "disk mount")
   }
 
   ejectDisk(driveId, signal) {
@@ -1297,37 +1113,51 @@ export class Apple2tsCore {
     }
   }
 
-  loadBinary({ path: filePath, address }, signal) {
-    return this.serializeMutation(async (startMutation) => {
-      const bytes = await this.readInputFile(filePath, "binary", MAX_BINARY_BYTES)
-      if (!Number.isInteger(address) || address < 0 || address >= MAX_BINARY_BYTES) {
-        throw new Error("address must be an integer between 0 and 49151")
-      }
-      if (address + bytes.length > MAX_BINARY_BYTES) {
-        throw new Error("binary block must fit within main RAM at $0000-$BFFF")
-      }
-      startMutation()
-      const query = new URLSearchParams({ address: String(address) })
-      const receipt = await this.request(
-        `/api/debug/binary?${query}`,
-        { method: "PUT", body: bytes, contentType: "application/octet-stream" },
-      )
-      return { emulator: receipt.emulator, ...receipt.state }
-    }, signal, { prepare: true })
+  loadBinaryBytes({ address }, bytes, signal) {
+    return this.serializeMutation(
+      (startMutation) => this.applyBinaryBytes(address, bytes, startMutation),
+      signal,
+      { prepare: true },
+    )
+  }
+
+  async applyBinaryBytes(address, bytes, startMutation) {
+    if (!Number.isInteger(address) || address < 0 || address >= MAX_BINARY_BYTES) {
+      throw new Error("address must be an integer between 0 and 49151")
+    }
+    if (address + bytes.length > MAX_BINARY_BYTES) {
+      throw new Error("binary block must fit within main RAM at $0000-$BFFF")
+    }
+    startMutation()
+    const query = new URLSearchParams({ address: String(address) })
+    const receipt = await this.request(
+      `/api/debug/binary?${query}`,
+      { method: "PUT", body: bytes, contentType: "application/octet-stream" },
+    )
+    return { emulator: receipt.emulator, ...receipt.state }
   }
 }
 
 const mutationTools = [
   {
-    name: "stage_file",
-    title: "Stage a local file",
-    description: "Copy one file from the configured source directory into this MCP session's trusted input area.",
-    inputSchema: fileStageInputSchema,
-    outputSchema: fileStageResultSchema,
+    name: "prepare_mount_disk",
+    title: "Prepare a disk mount",
+    description: "Prepare a short-lived upload ticket bound to one local path and drive. Write the returned ticket to apple2ts-upload stdin to complete the mount. Floppy images may be up to 2 MiB; hard-drive images may be up to 32 MiB.",
+    inputSchema: diskMountInputSchema,
+    outputSchema: uploadTicketResultSchema,
     destructiveHint: false,
-    idempotentHint: true,
-    enabled: (session) => session.fileStagingConfigured,
-    execute: (core, input) => core.stageFile(input),
+    idempotentHint: false,
+    execute: (_core, input, _signal, session) => session.prepareMount(input),
+  },
+  {
+    name: "prepare_load_binary",
+    title: "Prepare a binary load",
+    description: "Prepare a short-lived upload ticket bound to one local path and address. Write the returned ticket to apple2ts-upload stdin to complete the load.",
+    inputSchema: binaryLoadInputSchema,
+    outputSchema: uploadTicketResultSchema,
+    destructiveHint: false,
+    idempotentHint: false,
+    execute: (_core, input, _signal, session) => session.prepareLoad(input),
   },
   {
     name: "set_keyboard_key",
@@ -1338,17 +1168,6 @@ const mutationTools = [
     destructiveHint: false,
     idempotentHint: false,
     execute: (core, input, signal) => core.setKeyboardKey(input.key, input.repeat, signal),
-  },
-  {
-    name: "mount_disk",
-    title: "Mount a local disk image",
-    description: "Mount one file staged by this MCP session in hd1, hd2, fd1, or fd2. Use stage_file first. Floppy images may be up to 2 MiB; hard-drive images may be up to 32 MiB.",
-    inputSchema: diskMountInputSchema,
-    outputSchema: driveResultSchema,
-    destructiveHint: true,
-    idempotentHint: false,
-    enabled: (session) => session.fileStagingConfigured,
-    execute: (core, input, signal) => core.mountDisk(input, signal),
   },
   {
     name: "eject_disk",
@@ -1545,16 +1364,6 @@ export const createMcpServer = (session) => {
     },
   ]
 
-  if (session.fileStagingConfigured) {
-    resources.push({
-      name: "task-input-root",
-      uri: "apple2ts://session/input-root",
-      title: "Apple2TS task input folder",
-      description: "Folder where this MCP session accepts files for stage_file.",
-      read: () => ({ path: session.fileSourceRoot }),
-    })
-  }
-
   for (const resource of resources) {
     server.registerResource(
       resource.name,
@@ -1717,34 +1526,6 @@ export const createMcpServer = (session) => {
     },
   )
 
-  if (session.fileStagingConfigured) {
-    server.registerTool(
-      "load_binary",
-      {
-        title: "Load an Apple II binary",
-        description: "Load one file staged by this MCP session into main RAM. Use stage_file first.",
-        inputSchema: binaryLoadInputSchema,
-        outputSchema: binaryLoadOutputSchema,
-        annotations: {
-          readOnlyHint: false,
-          destructiveHint: true,
-          idempotentHint: true,
-          openWorldHint: false,
-        },
-      },
-      async (input, context) => {
-        try {
-          return toolResult(await core().loadBinary(input, context.mcpReq.signal))
-        } catch (error) {
-          return {
-            isError: true,
-            content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
-          }
-        }
-      },
-    )
-  }
-
   for (const tool of mutationTools) {
     if (tool.enabled && !tool.enabled(session)) continue
     server.registerTool(
@@ -1761,7 +1542,9 @@ export const createMcpServer = (session) => {
           openWorldHint: false,
         },
       },
-      async (input, context) => toolResult(await tool.execute(core(), input, context.mcpReq.signal)),
+      async (input, context) => toolResult(
+        await tool.execute(core(), input, context.mcpReq.signal, session),
+      ),
     )
   }
 
@@ -1923,8 +1706,6 @@ export const runStdio = async (options = {}) => {
   }
 
   const session = {
-    fileStagingConfigured: Boolean(options.fileStagingRoot && options.fileSourceRoot),
-    fileSourceRoot: options.fileSourceRoot,
     setLifecycleNotifier(notifier) {
       lifecycleNotifier = notifier
     },
@@ -1953,6 +1734,14 @@ export const runStdio = async (options = {}) => {
     requireCore() {
       if (!activeSession) throw new Error("No active Apple2TS session. Call start_session first.")
       return activeSession.core
+    },
+    prepareMount(input) {
+      if (!activeSession) throw new Error("No active Apple2TS session. Call start_session first.")
+      return activeSession.uploadTickets.prepareMount(input)
+    },
+    prepareLoad(input) {
+      if (!activeSession) throw new Error("No active Apple2TS session. Call start_session first.")
+      return activeSession.uploadTickets.prepareLoad(input)
     },
     async start({ visibility } = {}) {
       const chromiumMode = visibility ?? options.chromiumMode ?? "headless"
@@ -1987,25 +1776,7 @@ export const runStdio = async (options = {}) => {
       startingSession = (async () => {
         throwIfShuttingDown()
         if (!options.chromiumExecutable) throw new Error("APPLE2TS_CHROMIUM_EXECUTABLE is required")
-        const binaryRoot = await resolveBinaryRoot(options.fileStagingRoot, "APPLE2TS_FILE_STAGING_ROOT")
-        const fileSourceRoot = await resolveBinaryRoot(options.fileSourceRoot, "APPLE2TS_FILE_SOURCE_ROOT")
         throwIfShuttingDown()
-        if (binaryRoot && fileSourceRoot) {
-          const stagingRelativeToSource = path.relative(fileSourceRoot, binaryRoot)
-          if (
-            stagingRelativeToSource === ""
-            || (!stagingRelativeToSource.startsWith(`..${path.sep}`)
-              && stagingRelativeToSource !== ".."
-              && !path.isAbsolute(stagingRelativeToSource))
-          ) {
-            throw new Error("APPLE2TS_FILE_STAGING_ROOT must not be inside APPLE2TS_FILE_SOURCE_ROOT")
-          }
-          try {
-            await access(binaryRoot, fsConstants.W_OK | fsConstants.X_OK)
-          } catch {
-            throw new Error("APPLE2TS_FILE_STAGING_ROOT must be writable when file staging is configured")
-          }
-        }
         const sessionEventFile = await resolveSessionEventFile(options.sessionEventFile)
         const distDir = resolveBrowserBuildDir(options.distDir)
         const browserBuildAvailable = options.hasBrowserBuild || hasBrowserBuild
@@ -2023,6 +1794,7 @@ export const runStdio = async (options = {}) => {
         let core = null
         let created = null
         let terminationEvent = null
+        let uploadTickets = null
         try {
           listener = await startApple2tsServer({
             host: "127.0.0.1",
@@ -2051,6 +1823,7 @@ export const runStdio = async (options = {}) => {
               },
             },
             onClientState: (state) => core?.observeExecution(state),
+            privateUploadHandler: (req, res, url) => uploadTickets?.handle(req, res, url) || false,
             logger: { log: (message) => process.stderr.write(`${message}\n`) },
           })
           throwIfShuttingDown()
@@ -2063,9 +1836,10 @@ export const runStdio = async (options = {}) => {
               targetId: `${listener.serverInstanceId}:${rendererId}`,
             },
             sessionController.signal,
-            binaryRoot,
-            binaryRoot && fileSourceRoot ? new FileStager(fileSourceRoot, binaryRoot) : null,
           )
+          uploadTickets = new UploadTickets(listener.url, core, {
+            ttlMs: Number(options.uploadTicketTtlMs ?? 30_000),
+          })
           renderer = await launchChromium({
             executable: options.chromiumExecutable,
             bridgeUrl: listener.url,
@@ -2091,6 +1865,7 @@ export const runStdio = async (options = {}) => {
             renderer,
             controller: sessionController,
             sessionEventFile,
+            uploadTickets,
             visibility: chromiumMode,
           }
           activeSession = created
@@ -2125,10 +1900,8 @@ export const runStdio = async (options = {}) => {
         } catch (error) {
           const cleanupFailures = []
           sessionController.abort(error)
+          uploadTickets?.close()
           await core?.neutralizeKeyboard().catch((failure) => cleanupFailures.push(failure))
-          if (core) {
-            await Promise.resolve(core.cleanupStagedFiles()).catch((failure) => cleanupFailures.push(failure))
-          }
           await renderer?.stop().catch((failure) => cleanupFailures.push(failure))
           await stopApple2tsServer().catch((failure) => cleanupFailures.push(failure))
           if (terminationEvent && core) {
@@ -2170,8 +1943,8 @@ export const runStdio = async (options = {}) => {
         const failures = []
         current.core.closeExecution()
         current.controller.abort(new Error(reason))
+        current.uploadTickets.close()
         await current.core.neutralizeKeyboard().catch((error) => failures.push(error))
-        await Promise.resolve(current.core.cleanupStagedFiles()).catch((error) => failures.push(error))
         await current.renderer.stop().catch((error) => failures.push(error))
         await stopApple2tsServer().catch((error) => failures.push(error))
         if (activeSession === current) activeSession = null
@@ -2254,8 +2027,6 @@ if (isMain) {
     startupTimeoutMs: process.env.APPLE2TS_STARTUP_TIMEOUT_MS,
     chromiumExecutable: process.env.APPLE2TS_CHROMIUM_EXECUTABLE,
     chromiumMode: process.env.APPLE2TS_CHROMIUM_MODE,
-    fileSourceRoot: process.env.APPLE2TS_FILE_SOURCE_ROOT,
-    fileStagingRoot: process.env.APPLE2TS_FILE_STAGING_ROOT,
     sessionEventFile: process.env.APPLE2TS_SESSION_EVENT_FILE,
     distDir: process.env.APPLE2TS_DIST_DIR,
   })

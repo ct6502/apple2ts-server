@@ -82,9 +82,7 @@ private emulator is no longer needed. A host whose configuration uses an
       "args": ["--prefix", "/path/to/apple2ts-server", "run", "mcp:stdio"],
       "env": {
         "APPLE2TS_CHROMIUM_EXECUTABLE": "/path/to/chrome",
-        "APPLE2TS_DIST_DIR": "/path/to/apple2ts/dist",
-        "APPLE2TS_FILE_SOURCE_ROOT": "/path/to/project-test-artifacts",
-        "APPLE2TS_FILE_STAGING_ROOT": "/path/to/private-mcp-staging"
+        "APPLE2TS_DIST_DIR": "/path/to/apple2ts/dist"
       }
     }
   }
@@ -112,15 +110,27 @@ After session cleanup, the server atomically publishes a versioned
 receipt, which remains until the launcher consumes it and removes its task
 directory. File ingress does not need to be configured for lifecycle receipts.
 
-To enable `stage_file`, `load_binary`, and `mount_disk`, set both
-`APPLE2TS_FILE_SOURCE_ROOT` and `APPLE2TS_FILE_STAGING_ROOT` before startup.
-The source root is one allowed project or test-artifact directory. The staging
-root is writable private storage for this MCP process. First call `stage_file`
-with a path relative to the source root, then use its returned path with
-`mount_disk` or `load_binary`. The server removes staged files when the MCP
-session ends. A binary can be up to 49,152 bytes and must fit in main RAM at
-`$0000-$BFFF`. A floppy image can be up to 2 MiB; a hard-drive image can be up
-to 32 MiB.
+The `prepare_mount_disk` and `prepare_load_binary` tools bind an absolute local
+source path and destination to a short-lived upload ticket without
+reading or changing the source file. A caller may also supply the file's
+expected SHA-256 digest. Write the returned ticket as one line to the installed
+`apple2ts-upload` command. From a repository checkout, run:
+
+```bash
+npm --prefix /path/to/apple2ts-server run --silent upload
+```
+
+The helper opens the bound path and sends its bytes to the private loopback
+server. The MCP call does not change the emulator; the helper prints the final
+confirmed mount or load receipt. A binary can be up to 49,152 bytes and must
+fit in main RAM at `$0000-$BFFF`. A floppy image can be up to 2 MiB; a
+hard-drive image can be up to 32 MiB.
+
+Tickets expire after 30 seconds. One helper may claim a pending ticket; the
+ticket then retains its confirmed result or failure until expiry so a retry can
+recover a response lost after the emulator operation. A ticket is a temporary
+bearer URL; its holder can retrieve the bound source path until upload begins.
+Passing it on standard input keeps it out of the helper's process arguments.
 
 Read `apple2ts://session/execution` for one worker-confirmed execution snapshot,
 including the stop reason, breakpoint, CPU registers, machine model, and memory
