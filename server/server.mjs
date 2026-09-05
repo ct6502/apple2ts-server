@@ -1370,9 +1370,11 @@ const server = createServer(async (req, res) => {
       }
 
       const body = await readJsonBody(req)
+      let start
+      let bytes
       try {
-        const start = parseInteger(body.start)
-        const bytes = Array.isArray(body.data) ? body.data.map((value) => Number(value)) : null
+        start = parseInteger(body.start)
+        bytes = Array.isArray(body.data) ? body.data.map((value) => Number(value)) : null
         if (start === null || !bytes) {
           throw new Error("start and data are required")
         }
@@ -1384,28 +1386,31 @@ const server = createServer(async (req, res) => {
         }
 
         validateMemoryBounds(start, bytes.length)
-
-        for (const [offset, value] of bytes.entries()) {
-          const status = await getStatusFromReply(client, "setMemory", {
-            address: start + offset,
-            value,
-          })
-          client.latestState = status
-          client.lastSeenAt = Date.now()
-        }
-
-        const memoryDump = await getMemoryDumpFromReply(client)
-        if (memoryDump.byteLength < start + bytes.length) {
-          throw new Error("Memory dump unavailable after write. Pause the emulator first.")
-        }
-
-        writeEnvelope(res, 200, getMemoryRangeResource(memoryDump.data, start, bytes.length, "bytes"))
       } catch (error) {
         writeErrorEnvelope(
           res,
           400,
           "BAD_REQUEST",
           error instanceof Error ? error.message : String(error),
+        )
+        return
+      }
+
+      try {
+        const status = await getStatusFromReply(client, "writeMemory", {
+          address: start,
+          data: bytes,
+        })
+        client.latestState = status
+        client.lastSeenAt = Date.now()
+
+        writeEnvelope(res, 200, { address: start, bytesProcessed: bytes.length })
+      } catch (error) {
+        writeErrorEnvelope(
+          res,
+          500,
+          "MEMORY_WRITE_FAILED",
+          `Memory write may have partially taken effect. ${error instanceof Error ? error.message : String(error)}`,
         )
       }
       return
