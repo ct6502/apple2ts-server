@@ -1,15 +1,14 @@
 import assert from "node:assert/strict"
-import { execFile, spawn } from "node:child_process"
+import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 import { access, chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, truncate, writeFile } from "node:fs/promises"
 import { createServer } from "node:http"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { promisify } from "node:util"
 import test from "node:test"
 
-import { Apple2tsCore, FileStager } from "../server/mcp_stdio.mjs"
+import { Apple2tsCore } from "../server/mcp_stdio.mjs"
 import {
   resolveBrowserBuildDir,
   startApple2tsServer,
@@ -22,13 +21,27 @@ const repoRoot = path.resolve(__dirname, "..")
 const fakeChromium = path.join(__dirname, "fixtures", "fake_chromium.mjs")
 const mcpTestRunner = path.join(__dirname, "fixtures", "mcp_stdio_runner.mjs")
 const wedgedRunner = path.join(__dirname, "fixtures", "wedged_runner.mjs")
+const uploadHelper = path.join(repoRoot, "cli", "apple2ts-upload.mjs")
 const token = "test-private-token"
 const controllerToken = "test-controller-token"
 const rendererId = "test-renderer"
 const cleanupGraceTimeoutMs = 5000
 const cleanupKillTimeoutMs = 1000
-const execFileAsync = promisify(execFile)
 let timeoutModuleSequence = 0
+
+const runUpload = (ticket) => new Promise((resolve, reject) => {
+  const child = spawn(process.execPath, [uploadHelper], { stdio: ["pipe", "pipe", "pipe"] })
+  let stdout = ""
+  let stderr = ""
+  child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk })
+  child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk })
+  child.once("error", reject)
+  child.once("close", (code) => {
+    if (code === 0) resolve({ stdout, stderr })
+    else reject(new Error(stderr.trim() || `apple2ts-upload exited with status ${code}`))
+  })
+  child.stdin.end(`${ticket}\n`)
+})
 
 const importCoreWithCommandTimeout = async (commandTimeoutMs) => {
   const previousCommandTimeout = process.env.COMMAND_TIMEOUT_MS
@@ -204,7 +217,6 @@ const launchMcp = async (overrides = {}, runner = mcpTestRunner) => {
       APPLE2TS_STARTUP_TIMEOUT_MS: "3000",
       APPLE2TS_CHROMIUM_EXECUTABLE: fakeChromium,
       APPLE2TS_CHROMIUM_MODE: "headless",
-      APPLE2TS_BINARY_ROOT: "",
       APPLE2TS_FAKE_CHROMIUM_RECEIPT: receiptPath,
       ...overrides,
     },
@@ -879,18 +891,8 @@ test("an aborted mutation releases the held key after completing", async () => {
   await assert.rejects(core.resume(), /restart this MCP session/)
 })
 
-test("configured binary loading validates and serializes one local file", async (t) => {
-  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-binary-root-"))
-  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
-  await writeFile(path.join(binaryRoot, "valid.bin"), Buffer.from([0xA9, 0x42, 0x60]))
-  await writeFile(path.join(binaryRoot, "empty.bin"), Buffer.alloc(0))
-  await writeFile(path.join(binaryRoot, "large.bin"), Buffer.alloc(0xC001))
-  await mkdir(path.join(binaryRoot, "directory"))
-  await symlink(path.join(binaryRoot, "valid.bin"), path.join(binaryRoot, "link.bin"))
-  if (process.platform !== "win32") {
-    await execFileAsync("mkfifo", [path.join(binaryRoot, "pipe.bin")])
-  }
-
+test("binary loading validates and serializes one byte block", async (t) => {
+  const bytes = Buffer.from([0xA9, 0x42, 0x60])
   const requestPaths = []
   const bridge = createServer(async (req, res) => {
     requestPaths.push(req.url)
@@ -927,11 +929,10 @@ test("configured binary loading validates and serializes one local file", async 
     controllerToken,
     identity,
     new AbortController().signal,
-    await realpath(binaryRoot),
   )
 
   const [loaded, resumed] = await Promise.all([
-    core.loadBinary({ path: "valid.bin", address: 0x6000 }),
+    core.loadBinaryBytes({ address: 0x6000 }, bytes),
     core.resume(),
   ])
   assert.deepEqual(loaded, {
@@ -942,27 +943,13 @@ test("configured binary loading validates and serializes one local file", async 
   })
   assert.equal(resumed.state.runMode, "running")
   assert.deepEqual(requestPaths, ["/api/debug/binary?address=24576", "/api/machine/resume"])
-  const invalidInputs = [
-    { path: "", address: 0 },
-    { path: path.join(binaryRoot, "valid.bin"), address: 0 },
-    { path: "../valid.bin", address: 0 },
-    { path: "link.bin", address: 0 },
-    { path: "directory", address: 0 },
-    { path: "empty.bin", address: 0 },
-    { path: "large.bin", address: 0 },
-    { path: "valid.bin", address: 0xBFFE },
-    { path: "missing.bin", address: 0 },
-  ]
-  if (process.platform !== "win32") invalidInputs.push({ path: "pipe.bin", address: 0 })
-  for (const input of invalidInputs) {
-    await assert.rejects(core.loadBinary(input))
+  for (const address of [-1, 0xC000, 0xBFFE]) {
+    await assert.rejects(core.loadBinaryBytes({ address }, bytes))
   }
   assert.equal(requestPaths.length, 2)
 })
 
-test("configured disk mounting reads a file added after root selection and serializes eject", async (t) => {
-  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-root-"))
-  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
+test("disk mounting serializes one byte block and eject", async () => {
   const bytes = Buffer.from("WOZ2\u00ff\n\r\n")
 
   const requests = []
@@ -972,7 +959,6 @@ test("configured disk mounting reads a file added after root selection and seria
     controllerToken,
     identity,
     new AbortController().signal,
-    await realpath(binaryRoot),
   )
   core.request = async (pathname, options) => {
     requests.push({ pathname, options })
@@ -994,9 +980,7 @@ test("configured disk mounting reads a file added after root selection and seria
     }
   }
 
-  await assert.rejects(core.mountDisk({ driveId: "fd1", path: "fixture.woz" }))
-  await writeFile(path.join(binaryRoot, "fixture.woz"), bytes)
-  const mounted = await core.mountDisk({ driveId: "fd1", path: "fixture.woz" })
+  const mounted = await core.mountDiskBytes({ driveId: "fd1", path: "fixture.woz" }, bytes)
   const ejected = await core.ejectDisk("fd1")
 
   assert.deepEqual(mounted.state, { driveId: "fd1", mounted: true })
@@ -1017,59 +1001,19 @@ test("configured disk mounting reads a file added after root selection and seria
   ])
 })
 
-test("disk mounting applies separate floppy and hard-drive size limits", async (t) => {
-  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-limits-"))
-  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
-  const mediumImage = Buffer.alloc(2 * 1024 * 1024 + 1)
-  await writeFile(path.join(binaryRoot, "medium.po"), mediumImage)
-  await writeFile(path.join(binaryRoot, "oversized.po"), "")
-  await truncate(path.join(binaryRoot, "oversized.po"), 32 * 1024 * 1024 + 1)
-
-  const identity = { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" }
-  const requests = []
-  const core = new Apple2tsCore(
-    "http://unused.test",
-    controllerToken,
-    identity,
-    new AbortController().signal,
-    await realpath(binaryRoot),
-  )
-  core.request = async (pathname, options) => {
-    requests.push({ pathname, options })
-    return { emulator: identity, state: { driveId: "hd1", mounted: true } }
-  }
-
-  await assert.rejects(
-    core.mountDisk({ driveId: "fd1", path: "medium.po" }),
-    /floppy image file cannot exceed 2097152 bytes/,
-  )
-  const mounted = await core.mountDisk({ driveId: "hd1", path: "medium.po" })
-  assert.deepEqual(mounted.state, { driveId: "hd1", mounted: true })
-  assert.equal(requests.length, 1)
-  assert.equal(requests[0].pathname, "/api/drives/hd1/mount")
-  assert.equal(Buffer.from(requests[0].options.body.dataBase64, "base64").length, mediumImage.length)
-  await assert.rejects(
-    core.mountDisk({ driveId: "hd1", path: "oversized.po" }),
-    /hard-drive image file cannot exceed 33554432 bytes/,
-  )
-  assert.equal(requests.length, 1)
-})
-
-test("disk mounting preflights known media compatibility without poisoning the session", async (t) => {
-  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-media-"))
-  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
+test("disk mounting preflights known media compatibility without poisoning the session", async () => {
   const standardPo = Buffer.alloc(143360)
   const boundaryOverPo = Buffer.alloc(143361)
   const hardDrivePo = Buffer.alloc(800 * 1024)
-  await Promise.all([
-    writeFile(path.join(binaryRoot, "standard.po"), standardPo),
-    writeFile(path.join(binaryRoot, "boundary-over.po"), boundaryOverPo),
-    writeFile(path.join(binaryRoot, "hard-drive.po"), hardDrivePo),
-    writeFile(path.join(binaryRoot, "disk.woz"), Buffer.from("WOZ2")),
-    writeFile(path.join(binaryRoot, "disk.dsk"), Buffer.from("DSK")),
-    writeFile(path.join(binaryRoot, "disk.do"), Buffer.from("DO")),
-    writeFile(path.join(binaryRoot, "unknown.img"), Buffer.from("IMG")),
-  ])
+  const media = {
+    "standard.po": standardPo,
+    "boundary-over.po": boundaryOverPo,
+    "hard-drive.po": hardDrivePo,
+    "disk.woz": Buffer.from("WOZ2"),
+    "disk.dsk": Buffer.from("DSK"),
+    "disk.do": Buffer.from("DO"),
+    "unknown.img": Buffer.from("IMG"),
+  }
 
   const identity = { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" }
   const requests = []
@@ -1078,25 +1022,28 @@ test("disk mounting preflights known media compatibility without poisoning the s
     controllerToken,
     identity,
     new AbortController().signal,
-    await realpath(binaryRoot),
   )
   core.request = async (pathname, options) => {
     requests.push({ pathname, options })
     return { emulator: identity, state: { driveId: pathname.split("/")[3], mounted: true } }
   }
 
-  await assert.rejects(core.mountDisk({ driveId: "fd1", path: "hard-drive.po" }), /fd1 cannot mount a hard-drive image/)
+  const mount = (driveId, filePath) => core.mountDiskBytes(
+    { driveId, path: filePath },
+    media[filePath],
+  )
+  await assert.rejects(mount("fd1", "hard-drive.po"), /fd1 cannot mount a hard-drive image/)
   assert.equal(requests.length, 0)
-  await assert.rejects(core.mountDisk({ driveId: "hd1", path: "standard.po" }), /hd1 cannot mount a floppy image/)
-  await assert.rejects(core.mountDisk({ driveId: "fd1", path: "boundary-over.po" }), /fd1 cannot mount a hard-drive image/)
-  await assert.rejects(core.mountDisk({ driveId: "hd1", path: "disk.woz" }), /hd1 cannot mount a floppy image/)
-  await assert.rejects(core.mountDisk({ driveId: "hd1", path: "disk.dsk" }), /hd1 cannot mount a floppy image/)
-  await assert.rejects(core.mountDisk({ driveId: "hd1", path: "disk.do" }), /hd1 cannot mount a floppy image/)
+  await assert.rejects(mount("hd1", "standard.po"), /hd1 cannot mount a floppy image/)
+  await assert.rejects(mount("fd1", "boundary-over.po"), /fd1 cannot mount a hard-drive image/)
+  await assert.rejects(mount("hd1", "disk.woz"), /hd1 cannot mount a floppy image/)
+  await assert.rejects(mount("hd1", "disk.dsk"), /hd1 cannot mount a floppy image/)
+  await assert.rejects(mount("hd1", "disk.do"), /hd1 cannot mount a floppy image/)
   assert.equal(requests.length, 0)
 
-  const floppyPo = await core.mountDisk({ driveId: "fd1", path: "standard.po" })
-  const hardDrive = await core.mountDisk({ driveId: "hd1", path: "hard-drive.po" })
-  const unclassified = await core.mountDisk({ driveId: "fd2", path: "unknown.img" })
+  const floppyPo = await mount("fd1", "standard.po")
+  const hardDrive = await mount("hd1", "hard-drive.po")
+  const unclassified = await mount("fd2", "unknown.img")
   assert.deepEqual(floppyPo.state, { driveId: "fd1", mounted: true })
   assert.deepEqual(hardDrive.state, { driveId: "hd1", mounted: true })
   assert.deepEqual(unclassified.state, { driveId: "fd2", mounted: true })
@@ -1107,11 +1054,8 @@ test("disk mounting preflights known media compatibility without poisoning the s
   ])
 })
 
-test("disk mutations reject drive state that does not confirm the requested result", async (t) => {
-  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-confirmation-"))
-  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
-  await writeFile(path.join(binaryRoot, "fixture.woz"), Buffer.from("WOZ2\u00ff\n\r\n"))
-  const resolvedRoot = await realpath(binaryRoot)
+test("disk mutations reject drive state that does not confirm the requested result", async () => {
+  const bytes = Buffer.from("WOZ2\u00ff\n\r\n")
   const identity = { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" }
   const driveState = {
     driveId: "fd1",
@@ -1131,7 +1075,6 @@ test("disk mutations reject drive state that does not confirm the requested resu
       controllerToken,
       identity,
       new AbortController().signal,
-      resolvedRoot,
     )
     core.request = async () => ({ emulator: identity, state })
     return core
@@ -1143,7 +1086,7 @@ test("disk mutations reject drive state that does not confirm the requested resu
   ]
   for (const state of invalidMountStates) {
     await assert.rejects(
-      createCore(state).mountDisk({ driveId: "fd1", path: "fixture.woz" }),
+      createCore(state).mountDiskBytes({ driveId: "fd1", path: "fixture.woz" }, bytes),
       /did not confirm disk mount for fd1/,
     )
   }
@@ -1153,10 +1096,8 @@ test("disk mutations reject drive state that does not confirm the requested resu
   )
 })
 
-test("confirmed invalid disk rejection leaves later eject usable", async (t) => {
-  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-rejection-"))
-  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
-  await writeFile(path.join(binaryRoot, "invalid.woz"), Buffer.from("not a disk"))
+test("confirmed invalid disk rejection leaves later eject usable", async () => {
+  const bytes = Buffer.from("not a disk")
   const identity = { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" }
   const emptyDrive = {
     driveId: "fd2",
@@ -1177,7 +1118,6 @@ test("confirmed invalid disk rejection leaves later eject usable", async (t) => 
     controllerToken,
     identity,
     new AbortController().signal,
-    await realpath(binaryRoot),
   )
   core.request = async (pathname, options = {}, _signal, timeoutMs) => {
     requestPaths.push(pathname)
@@ -1192,7 +1132,7 @@ test("confirmed invalid disk rejection leaves later eject usable", async (t) => 
   }
 
   await assert.rejects(
-    core.mountDisk({ driveId: "fd2", path: "invalid.woz" }),
+    core.mountDiskBytes({ driveId: "fd2", path: "invalid.woz" }, bytes),
     /rejected invalid disk media/,
   )
   const ejected = await core.ejectDisk("fd2")
@@ -1209,9 +1149,7 @@ test("confirmed invalid disk rejection leaves later eject usable", async (t) => 
   assert.equal(requestTimeouts[2], undefined)
 })
 
-test("disk preflight failure preserves a held key", async (t) => {
-  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-preflight-"))
-  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
+test("disk preflight failure preserves a held key", async () => {
   const identity = { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" }
   const requests = []
   const core = new Apple2tsCore(
@@ -1219,7 +1157,6 @@ test("disk preflight failure preserves a held key", async (t) => {
     controllerToken,
     identity,
     new AbortController().signal,
-    await realpath(binaryRoot),
   )
   core.request = async (pathname, options = {}) => {
     requests.push({ pathname, body: options.body })
@@ -1228,8 +1165,8 @@ test("disk preflight failure preserves a held key", async (t) => {
 
   await core.setKeyboardKey("j")
   await assert.rejects(
-    core.mountDisk({ driveId: "fd1", path: "missing.woz" }),
-    /unavailable or unreadable/,
+    core.mountDiskBytes({ driveId: "fd1", path: "hard-drive.po" }, Buffer.alloc(143361)),
+    /fd1 cannot mount a hard-drive image/,
   )
 
   assert.equal(core.heldKey, "j")
@@ -1239,10 +1176,8 @@ test("disk preflight failure preserves a held key", async (t) => {
   }])
 })
 
-test("aborted confirmed disk rejection releases a held key", async (t) => {
-  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-abort-"))
-  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
-  await writeFile(path.join(binaryRoot, "invalid.woz"), Buffer.from("not a disk"))
+test("aborted confirmed disk rejection releases a held key", async () => {
+  const bytes = Buffer.from("not a disk")
   const identity = { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" }
   const emptyDrive = { driveId: "fd1", mounted: false }
   let finishMount
@@ -1255,7 +1190,6 @@ test("aborted confirmed disk rejection releases a held key", async (t) => {
     controllerToken,
     identity,
     new AbortController().signal,
-    await realpath(binaryRoot),
   )
   core.request = async (pathname, options = {}) => {
     requests.push({ pathname, body: options.body })
@@ -1272,7 +1206,11 @@ test("aborted confirmed disk rejection releases a held key", async (t) => {
 
   await core.setKeyboardKey("j")
   const cancellation = new AbortController()
-  const mount = core.mountDisk({ driveId: "fd1", path: "invalid.woz" }, cancellation.signal)
+  const mount = core.mountDiskBytes(
+    { driveId: "fd1", path: "invalid.woz" },
+    bytes,
+    cancellation.signal,
+  )
   await started
   cancellation.abort()
   finishMount()
@@ -1284,16 +1222,12 @@ test("aborted confirmed disk rejection releases a held key", async (t) => {
   await assert.rejects(core.ejectDisk("fd1"), /restart this MCP session/)
 })
 
-test("unconfirmed mount rejection still poisons later mutations", async (t) => {
-  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-uncertain-"))
-  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
-  await writeFile(path.join(binaryRoot, "invalid.woz"), Buffer.from("not a disk"))
+test("unconfirmed mount rejection still poisons later mutations", async () => {
   const core = new Apple2tsCore(
     "http://unused.test",
     controllerToken,
     { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
     new AbortController().signal,
-    await realpath(binaryRoot),
   )
   let requests = 0
   core.request = async () => {
@@ -1307,23 +1241,19 @@ test("unconfirmed mount rejection still poisons later mutations", async (t) => {
   }
 
   await assert.rejects(
-    core.mountDisk({ driveId: "fd2", path: "invalid.woz" }),
+    core.mountDiskBytes({ driveId: "fd2", path: "invalid.woz" }, Buffer.from("not a disk")),
     /drive readback unavailable/,
   )
   await assert.rejects(core.ejectDisk("fd2"), /restart this MCP session/)
   assert.equal(requests, 2)
 })
 
-test("mount transport failure remains an uncertain mutation", async (t) => {
-  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-transport-"))
-  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
-  await writeFile(path.join(binaryRoot, "fixture.woz"), Buffer.from("WOZ2\u00ff\n\r\n"))
+test("mount transport failure remains an uncertain mutation", async () => {
   const core = new Apple2tsCore(
     "http://unused.test",
     controllerToken,
     { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
     new AbortController().signal,
-    await realpath(binaryRoot),
   )
   let requests = 0
   core.request = async () => {
@@ -1332,7 +1262,10 @@ test("mount transport failure remains an uncertain mutation", async (t) => {
   }
 
   await assert.rejects(
-    core.mountDisk({ driveId: "fd1", path: "fixture.woz" }),
+    core.mountDiskBytes(
+      { driveId: "fd1", path: "fixture.woz" },
+      Buffer.from("WOZ2\u00ff\n\r\n"),
+    ),
     /transport timed out/,
   )
   await assert.rejects(core.ejectDisk("fd1"), /restart this MCP session/)
@@ -1340,10 +1273,6 @@ test("mount transport failure remains an uncertain mutation", async (t) => {
 })
 
 test("mount timeout covers delayed drive lookup and mount confirmation", async (t) => {
-  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-delayed-mount-"))
-  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
-  await writeFile(path.join(binaryRoot, "fixture.woz"), Buffer.from("WOZ2\u00ff\n\r\n"))
-
   const commandTimeoutMs = 2000
   const DelayedMountCore = await importCoreWithCommandTimeout(commandTimeoutMs)
 
@@ -1379,10 +1308,12 @@ test("mount timeout covers delayed drive lookup and mount confirmation", async (
     controllerToken,
     { serverInstanceId: listener.serverInstanceId, rendererId, targetId: `${listener.serverInstanceId}:${rendererId}` },
     new AbortController().signal,
-    await realpath(binaryRoot),
   )
 
-  const mountOutcome = core.mountDisk({ driveId: "fd1", path: "fixture.woz" })
+  const mountOutcome = core.mountDiskBytes(
+    { driveId: "fd1", path: "fixture.woz" },
+    Buffer.from("WOZ2\u00ff\n\r\n"),
+  )
     .then((value) => ({ value }), (error) => ({ error }))
   const statusCommand = await renderer.nextCommand()
   assert.equal(statusCommand.action, "getStatus")
@@ -1407,10 +1338,6 @@ test("mount timeout covers delayed drive lookup and mount confirmation", async (
 })
 
 test("mount timeout still poisons later mutations when its full budget is exceeded", async (t) => {
-  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-stalled-mount-"))
-  t.after(() => rm(binaryRoot, { recursive: true, force: true }))
-  await writeFile(path.join(binaryRoot, "fixture.woz"), Buffer.from("WOZ2\u00ff\n\r\n"))
-
   const StalledMountCore = await importCoreWithCommandTimeout(100)
 
   let requests = 0
@@ -1428,11 +1355,13 @@ test("mount timeout still poisons later mutations when its full budget is exceed
     controllerToken,
     { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
     new AbortController().signal,
-    await realpath(binaryRoot),
   )
 
   await assert.rejects(
-    core.mountDisk({ driveId: "fd1", path: "fixture.woz" }),
+    core.mountDiskBytes(
+      { driveId: "fd1", path: "fixture.woz" },
+      Buffer.from("WOZ2\u00ff\n\r\n"),
+    ),
     /aborted due to timeout/,
   )
   await assert.rejects(core.ejectDisk("fd1"), /restart this MCP session/)
@@ -1643,6 +1572,8 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
       "read_memory",
       "wait_for_execution_stop",
       "capture_screen",
+      "prepare_mount_disk",
+      "prepare_load_binary",
       "set_keyboard_key",
       "eject_disk",
       "boot",
@@ -2242,11 +2173,9 @@ test("real renderer reports the finite program stop atomically", {
 }, async (t) => {
   const taskRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-execution-acceptance-"))
   const sourceRoot = path.join(taskRoot, "source")
-  const stagingRoot = path.join(taskRoot, "staging")
   const chromiumTempRoot = path.join(taskRoot, "chromium")
   await Promise.all([
     mkdir(sourceRoot),
-    mkdir(stagingRoot),
     mkdir(chromiumTempRoot),
   ])
   await writeFile(path.join(sourceRoot, "finite.bin"), Buffer.from([
@@ -2260,8 +2189,6 @@ test("real renderer reports the finite program stop atomically", {
   const processState = await launchMcp({
     APPLE2TS_CHROMIUM_EXECUTABLE: process.env.APPLE2TS_REAL_CHROMIUM_EXECUTABLE,
     APPLE2TS_DIST_DIR: process.env.APPLE2TS_REAL_DIST_DIR,
-    APPLE2TS_FILE_SOURCE_ROOT: sourceRoot,
-    APPLE2TS_FILE_STAGING_ROOT: stagingRoot,
     APPLE2TS_STARTUP_TIMEOUT_MS: "10000",
     TMPDIR: chromiumTempRoot,
   })
@@ -2283,8 +2210,11 @@ test("real renderer reports the finite program stop atomically", {
     return JSON.parse(response.result.contents[0].text)
   }
 
-  const staged = (await call("real-stage", "stage_file", { path: "finite.bin" })).result.structuredContent
-  await call("real-load", "load_binary", { path: staged.path, address: 0x6000 })
+  const prepared = (await call("real-prepare", "prepare_load_binary", {
+    path: path.join(sourceRoot, "finite.bin"),
+    address: 0x6000,
+  })).result.structuredContent
+  await runUpload(prepared.ticket)
   const beforeCpuPatch = await readExecution("real-before-cpu")
   await call("real-cpu", "set_cpu", { PC: 0x6000, PStatus: 0x24 })
   const afterCpuPatch = await readExecution("real-after-cpu")
@@ -2317,7 +2247,6 @@ test("real renderer reports the finite program stop atomically", {
 
   processState.child.stdin.end()
   assert.deepEqual(await processState.waitForExit(), { code: 0, signal: null, error: null })
-  assert.deepEqual(await readdir(stagingRoot), [])
   assert.deepEqual(await readdir(chromiumTempRoot), [])
 })
 
@@ -2427,120 +2356,11 @@ test("stdio test cleanup escalates when its child ignores EOF", async (t) => {
   await wedged.cleanup()
 })
 
-test("file staging copies only safe source files into a session-private trusted path", async (t) => {
-  const sourceRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-source-"))
-  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-root-"))
-  t.after(() => Promise.all([
-    rm(sourceRoot, { recursive: true, force: true }),
-    rm(binaryRoot, { recursive: true, force: true }),
-  ]))
-  const disk = Buffer.from("ProDOS test disk")
-  await writeFile(path.join(sourceRoot, "eamon.po"), disk)
-  await writeFile(path.join(sourceRoot, "companion.hdv"), Buffer.from("companion disk"))
-  await writeFile(path.join(sourceRoot, "fixture.bin"), disk)
-  await writeFile(path.join(sourceRoot, "large.hdv"), "")
-  await truncate(path.join(sourceRoot, "large.hdv"), 32 * 1024 * 1024 + 1)
-  await symlink(path.join(sourceRoot, "eamon.po"), path.join(sourceRoot, "link.po"))
-
-  const stager = new FileStager(await realpath(sourceRoot), await realpath(binaryRoot))
-  t.after(() => stager.cleanup())
-  const staged = await stager.stage("eamon.po")
-
-  assert.match(staged.path, /^\.apple2ts-mcp-stage-[^/]+\/[0-9a-f]{64}\.po$/)
-  assert.equal(path.isAbsolute(staged.path), false)
-  assert.equal(staged.byteCount, disk.length)
-  assert.equal(staged.sha256, createHash("sha256").update(disk).digest("hex"))
-  assert.deepEqual(await readFile(path.join(binaryRoot, staged.path)), disk)
-  await assert.rejects(stager.stage("../eamon.po"), /stay within APPLE2TS_FILE_SOURCE_ROOT/)
-  await assert.rejects(stager.stage(path.join(sourceRoot, "eamon.po")), /relative to APPLE2TS_FILE_SOURCE_ROOT/)
-  assert.equal((await stager.stage("fixture.bin")).byteCount, disk.length)
-  await assert.rejects(stager.stage("link.po"), /symbolic links are not allowed/)
-  await assert.rejects(stager.stage("large.hdv"), /cannot exceed 33554432 bytes/)
-
-  await stager.cleanup()
-  await assert.rejects(access(path.join(binaryRoot, staged.path)))
-})
-
-test("file staging removes a failed temporary copy and mounts a staged hard drive", async (t) => {
-  const sourceRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-stage-source-"))
-  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-stage-root-"))
-  t.after(() => Promise.all([
-    rm(sourceRoot, { recursive: true, force: true }),
-    rm(binaryRoot, { recursive: true, force: true }),
-  ]))
-  const disk = Buffer.from("ProDOS test disk")
-  await writeFile(path.join(sourceRoot, "eamon.hdv"), disk)
-  const stager = new FileStager(await realpath(sourceRoot), await realpath(binaryRoot))
-  t.after(() => stager.cleanup())
-  const stagedName = `${createHash("sha256").update(disk).digest("hex")}.hdv`
-  const stageDirectory = await stager.getStageDirectory()
-  await mkdir(path.join(stageDirectory, stagedName))
-
-  await assert.rejects(stager.stage("eamon.hdv"))
-  assert.deepEqual(await readdir(stageDirectory), [stagedName])
-
-  await rm(path.join(stageDirectory, stagedName), { recursive: true })
-  const identity = { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" }
-  const core = new Apple2tsCore(
-    "http://unused.test",
-    controllerToken,
-    identity,
-    new AbortController().signal,
-    await realpath(binaryRoot),
-    stager,
-  )
-  const mountedPaths = []
-  core.request = async (pathname, options = {}) => {
-    mountedPaths.push({ pathname, options })
-    return { emulator: identity, state: { driveId: "hd1", mounted: true } }
-  }
-  await assert.rejects(
-    core.mountDisk({ driveId: "hd1", path: "eamon.hdv" }),
-    /file staged by this MCP session/,
-  )
-  const staged = await core.stageFile({ path: "eamon.hdv" })
-  const mounted = await core.mountDisk({ driveId: "hd1", path: staged.path })
-
-  assert.deepEqual(mounted.state, { driveId: "hd1", mounted: true })
-  assert.equal(mountedPaths[0].pathname, "/api/drives/hd1/mount")
-  assert.equal(mountedPaths[0].options.body.filename, path.basename(staged.path))
-})
-
-test("file staging serializes concurrent copies and waits for them before cleanup", async (t) => {
-  const sourceRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-concurrent-source-"))
-  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-disk-concurrent-root-"))
-  t.after(() => Promise.all([
-    rm(sourceRoot, { recursive: true, force: true }),
-    rm(binaryRoot, { recursive: true, force: true }),
-  ]))
-  await writeFile(path.join(sourceRoot, "first.po"), Buffer.from("first disk"))
-  await writeFile(path.join(sourceRoot, "second.hdv"), Buffer.from("second disk"))
-  const stager = new FileStager(await realpath(sourceRoot), await realpath(binaryRoot))
-
-  const first = stager.stage("first.po")
-  const second = stager.stage("second.hdv")
-  const cleanup = stager.cleanup()
-  const [firstResult, secondResult] = await Promise.all([first, second])
-  await cleanup
-
-  assert.equal(path.dirname(firstResult.path), path.dirname(secondResult.path))
-  await assert.rejects(access(path.join(binaryRoot, firstResult.path)))
-  await assert.rejects(access(path.join(binaryRoot, secondResult.path)))
-  await assert.rejects(stager.stage("first.po"), /File staging is closing/)
-})
-
-test("configured stdio advertises and loads a local binary", async (t) => {
-  const binaryRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-mcp-binaries-"))
+test("stdio advertises upload-ticket file tools and completes uploads", async (t) => {
   const sourceRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-mcp-disk-source-"))
-  await writeFile(path.join(binaryRoot, "fixture.bin"), Buffer.from([0xA9, 0x42, 0x60]))
-  await writeFile(path.join(binaryRoot, "fixture.woz"), Buffer.from("WOZ2\u00ff\n\r\n"))
-  await writeFile(path.join(binaryRoot, "fixture.po"), "")
-  await truncate(path.join(binaryRoot, "fixture.po"), 32 * 1024 * 1024)
   await writeFile(path.join(sourceRoot, "fixture.bin"), Buffer.from([0xA9, 0x42, 0x60]))
   await writeFile(path.join(sourceRoot, "eamon.hdv"), Buffer.from("ProDOS test disk"))
   const processState = await launchMcp({
-    APPLE2TS_FILE_STAGING_ROOT: binaryRoot,
-    APPLE2TS_FILE_SOURCE_ROOT: sourceRoot,
     APPLE2TS_FAKE_CHROMIUM_HARD_DRIVE: "1",
   })
   t.after(processState.cleanup)
@@ -2551,50 +2371,86 @@ test("configured stdio advertises and loads a local binary", async (t) => {
     assert.equal(started.result.isError, undefined, JSON.stringify(started))
     processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" })}\n`)
     const tools = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 2))
-    assert.ok(tools.result.tools.some((tool) => tool.name === "load_binary"))
-    const mountTool = tools.result.tools.find((tool) => tool.name === "mount_disk")
+    const loadTool = tools.result.tools.find((tool) => tool.name === "prepare_load_binary")
+    assert.deepEqual(loadTool.inputSchema.properties.expectedSha256, {
+      type: "string",
+      pattern: "^[0-9A-Fa-f]{64}$",
+    })
+    assert.equal(
+      loadTool.inputSchema.properties.path.description,
+      "Absolute source file path read by apple2ts-upload.",
+    )
+    const mountTool = tools.result.tools.find((tool) => tool.name === "prepare_mount_disk")
     assert.deepEqual(mountTool.inputSchema, {
       type: "object",
       properties: {
         driveId: { type: "string", enum: ["hd1", "hd2", "fd1", "fd2"] },
-        path: { type: "string", minLength: 1 },
+        path: {
+          type: "string",
+          minLength: 1,
+          description: "Absolute source file path read by apple2ts-upload.",
+        },
+        expectedSha256: { type: "string", pattern: "^[0-9A-Fa-f]{64}$" },
       },
       required: ["driveId", "path"],
       additionalProperties: false,
     })
-    assert.equal(mountTool.annotations.destructiveHint, true)
+    assert.equal(mountTool.annotations.destructiveHint, false)
     assert.equal(mountTool.annotations.idempotentHint, false)
     assert.match(mountTool.description, /Floppy images may be up to 2 MiB/)
     assert.match(mountTool.description, /hard-drive images may be up to 32 MiB/)
-    assert.deepEqual(mountTool.outputSchema.properties.state, {
+    assert.deepEqual(mountTool.outputSchema, {
       type: "object",
       properties: {
-        driveId: { type: "string", enum: ["hd1", "hd2", "fd1", "fd2"] },
-        mounted: { type: "boolean" },
+        ticket: { type: "string", minLength: 1 },
       },
-      required: ["driveId", "mounted"],
+      required: ["ticket"],
       additionalProperties: false,
     })
-    const stageTool = tools.result.tools.find((tool) => tool.name === "stage_file")
-    assert.deepEqual(stageTool.inputSchema, {
-      type: "object",
-      properties: { path: { type: "string", minLength: 1 } },
-      required: ["path"],
-      additionalProperties: false,
-    })
-    assert.equal(stageTool.annotations.idempotentHint, true)
 
-    processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 50, method: "resources/list" })}\n`)
-    const resources = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 50))
-    assert.ok(resources.result.resources.some((resource) => resource.uri === "apple2ts://session/input-root"))
-    processState.child.stdin.write(`${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 51,
-      method: "resources/read",
-      params: { uri: "apple2ts://session/input-root" },
-    })}\n`)
-    const inputRoot = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 51))
-    assert.deepEqual(JSON.parse(inputRoot.result.contents[0].text), { path: sourceRoot })
+    const fixtureSha256 = createHash("sha256").update(Buffer.from([0xA9, 0x42, 0x60])).digest("hex")
+    const prepareLoad = await sendMcpRequest(processState, "prepare-load", "tools/call", {
+      name: "prepare_load_binary",
+      arguments: {
+        path: path.join(sourceRoot, "fixture.bin"),
+        address: 0x6000,
+        expectedSha256: fixtureSha256.toUpperCase(),
+      },
+    })
+    assert.equal(prepareLoad.result.isError, undefined)
+    const uploadedLoad = await runUpload(prepareLoad.result.structuredContent.ticket)
+    assert.deepEqual(
+      {
+        address: JSON.parse(uploadedLoad.stdout).address,
+        bytesWritten: JSON.parse(uploadedLoad.stdout).bytesWritten,
+      },
+      { address: 0x6000, bytesWritten: 3 },
+    )
+
+    const invalidDigest = await sendMcpRequest(processState, "invalid-digest", "tools/call", {
+      name: "prepare_load_binary",
+      arguments: {
+        path: path.join(sourceRoot, "fixture.bin"),
+        address: 0x6000,
+        expectedSha256: "not-a-digest",
+      },
+    })
+    assert.equal(invalidDigest.result.isError, true)
+
+    const relativePath = await sendMcpRequest(processState, "relative-path", "tools/call", {
+      name: "prepare_load_binary",
+      arguments: { path: "fixture.bin", address: 0x6000 },
+    })
+    assert.equal(relativePath.result.isError, true)
+    assert.match(relativePath.result.content[0].text, /absolute source file path/)
+
+    const prepareMount = await sendMcpRequest(processState, "prepare-mount", "tools/call", {
+      name: "prepare_mount_disk",
+      arguments: { path: path.join(sourceRoot, "eamon.hdv"), driveId: "hd1" },
+    })
+    assert.equal(prepareMount.result.isError, undefined)
+    const uploadedMount = await runUpload(prepareMount.result.structuredContent.ticket)
+    assert.deepEqual(JSON.parse(uploadedMount.stdout).state, { driveId: "hd1", mounted: true })
 
     const ejectTool = tools.result.tools.find((tool) => tool.name === "eject_disk")
     assert.deepEqual(ejectTool.inputSchema, {
@@ -2605,58 +2461,7 @@ test("configured stdio advertises and loads a local binary", async (t) => {
       required: ["driveId"],
       additionalProperties: false,
     })
-    assert.deepEqual(ejectTool.outputSchema.properties.state, mountTool.outputSchema.properties.state)
-
-    processState.child.stdin.write(`${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 3,
-      method: "tools/call",
-      params: { name: "stage_file", arguments: { path: "fixture.bin" } },
-    })}\n`)
-    const stagedBinary = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 3))
-    assert.equal(stagedBinary.result.isError, undefined)
-
-    processState.child.stdin.write(`${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 4,
-      method: "tools/call",
-      params: {
-        name: "load_binary",
-        arguments: { path: stagedBinary.result.structuredContent.path, address: 0x6000 },
-      },
-    })}\n`)
-    const loaded = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 4))
-    assert.equal(loaded.result.isError, undefined)
-    assert.equal(loaded.result.structuredContent.emulator.rendererId, rendererId)
-    assert.equal(loaded.result.structuredContent.address, 0x6000)
-    assert.equal(loaded.result.structuredContent.bytesWritten, 3)
-    assert.equal(loaded.result.structuredContent.sha256.length, 64)
-
-    processState.child.stdin.write(`${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 5,
-      method: "tools/call",
-      params: { name: "stage_file", arguments: { path: "eamon.hdv" } },
-    })}\n`)
-    const staged = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 5))
-    assert.equal(staged.result.isError, undefined)
-    assert.match(staged.result.structuredContent.path, /^\.apple2ts-mcp-stage-[^/]+\/[0-9a-f]{64}\.hdv$/)
-
-    processState.child.stdin.write(`${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 6,
-      method: "tools/call",
-      params: {
-        name: "mount_disk",
-        arguments: { driveId: "hd1", path: staged.result.structuredContent.path },
-      },
-    })}\n`)
-    const mounted = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 6))
-    assert.equal(mounted.result.isError, undefined)
-    assert.deepEqual(mounted.result.structuredContent.state, {
-      driveId: "hd1",
-      mounted: true,
-    })
+    assert.equal(ejectTool.outputSchema.properties.state.type, "object")
 
     processState.child.stdin.write(`${JSON.stringify({
       jsonrpc: "2.0",
@@ -2674,13 +2479,11 @@ test("configured stdio advertises and loads a local binary", async (t) => {
     processState.child.stdin.end()
     const outcome = await processState.waitForExit()
     assert.equal(outcome.code, 0, processState.getStderr())
-    await assert.rejects(access(path.join(binaryRoot, staged.result.structuredContent.path)))
   } finally {
     if (processState.child.exitCode === null) processState.child.kill("SIGTERM")
     await processState.waitForExit()
     await Promise.all([
       processState.cleanup(),
-      rm(binaryRoot, { recursive: true, force: true }),
       rm(sourceRoot, { recursive: true, force: true }),
     ])
   }
@@ -2772,7 +2575,6 @@ test("start_session rejects conflicting visibility while a session starts", asyn
 
 test("closing an owned visible renderer preserves its launcher receipt until exit", async (t) => {
   const eventRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-visible-close-event-"))
-  const stagingRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-visible-close-stage-"))
   const sourceRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-visible-close-source-"))
   const eventFile = path.join(eventRoot, "launcher-event.json")
   await writeFile(path.join(sourceRoot, "fixture.bin"), Buffer.from([0xA9, 0x42, 0x60]))
@@ -2780,13 +2582,10 @@ test("closing an owned visible renderer preserves its launcher receipt until exi
     APPLE2TS_CHROMIUM_MODE: "visible",
     APPLE2TS_FAKE_CHROMIUM_MODE: "disconnect-after-load",
     APPLE2TS_TEST_RENDERER_DISCONNECT_GRACE_MS: "50",
-    APPLE2TS_FILE_STAGING_ROOT: stagingRoot,
-    APPLE2TS_FILE_SOURCE_ROOT: sourceRoot,
     APPLE2TS_TEST_SESSION_EVENT_FILE: eventFile,
   })
   t.after(visible.cleanup)
   t.after(() => rm(eventRoot, { recursive: true, force: true }))
-  t.after(() => rm(stagingRoot, { recursive: true, force: true }))
   t.after(() => rm(sourceRoot, { recursive: true, force: true }))
 
   await visible.waitForStderr((line) => line.includes("MCP ready"))
@@ -2803,18 +2602,12 @@ test("closing an owned visible renderer preserves its launcher receipt until exi
   const receipt = await visible.readReceipt()
   assert.equal(receipt.headless, false)
 
-  const staged = await sendMcpRequest(visible, "visible-close-stage", "tools/call", {
-    name: "stage_file",
-    arguments: { path: "fixture.bin" },
+  const prepared = await sendMcpRequest(visible, "visible-close-prepare", "tools/call", {
+    name: "prepare_load_binary",
+    arguments: { path: path.join(sourceRoot, "fixture.bin"), address: 0x6000 },
   })
-  assert.equal(staged.result.isError, undefined, JSON.stringify(staged))
-  const stagedPath = path.join(stagingRoot, staged.result.structuredContent.path)
-  await access(stagedPath)
-  const loaded = await sendMcpRequest(visible, "visible-close-load", "tools/call", {
-    name: "load_binary",
-    arguments: { path: staged.result.structuredContent.path, address: 0x6000 },
-  })
-  assert.equal(loaded.result.isError, undefined, JSON.stringify(loaded))
+  assert.equal(prepared.result.isError, undefined, JSON.stringify(prepared))
+  await runUpload(prepared.result.structuredContent.ticket)
 
   await visible.waitForStderr((line) => line.includes("renderer disconnected; stopping owned session"))
     .catch((error) => {
@@ -2829,7 +2622,6 @@ test("closing an owned visible renderer preserves its launcher receipt until exi
   }))
   assert.deepEqual(lifecycleNotification.params, { uri: "apple2ts://session/lifecycle" })
   await waitForAbsent(receipt.profilePath)
-  await waitForAbsent(stagedPath)
   await assertClosed(bridgeUrl)
   assert.throws(() => process.kill(receipt.pid, 0), { code: "ESRCH" })
 
@@ -2981,66 +2773,6 @@ test("stdio launches from a selected Apple2TS build directory", async (t) => {
   processState.child.stdin.end()
   assert.equal((await processState.waitForExit()).code, 0, processState.getStderr())
   await assert.rejects(access(receipt.profilePath))
-})
-
-test("invalid binary root fails session start before private resources start", async (t) => {
-  const missingRoot = path.join(os.tmpdir(), `apple2ts-missing-binary-root-${process.pid}`)
-  const sourceRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-valid-source-root-"))
-  const invalid = await launchMcp({
-    APPLE2TS_FILE_STAGING_ROOT: missingRoot,
-    APPLE2TS_FILE_SOURCE_ROOT: sourceRoot,
-  })
-  t.after(invalid.cleanup)
-  t.after(() => rm(sourceRoot, { recursive: true, force: true }))
-  await invalid.waitForStderr((line) => line.includes("MCP ready"))
-  await initializeMcp(invalid, "invalid-root-initialize")
-  const response = await startMcpSession(invalid, "invalid-root-start")
-  assert.equal(response.result.isError, true)
-  assert.match(response.result.content[0].text, /APPLE2TS_FILE_STAGING_ROOT must name a readable directory/)
-  assert.doesNotMatch(invalid.getStderr(), /private bridge listening/)
-  invalid.child.stdin.end()
-  assert.equal((await invalid.waitForExit()).code, 0)
-  await invalid.cleanup()
-})
-
-test("matching source and staging roots fail session start before private resources start", async (t) => {
-  const sharedRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-shared-file-root-"))
-  const invalid = await launchMcp({
-    APPLE2TS_FILE_STAGING_ROOT: sharedRoot,
-    APPLE2TS_FILE_SOURCE_ROOT: sharedRoot,
-  })
-  t.after(invalid.cleanup)
-  t.after(() => rm(sharedRoot, { recursive: true, force: true }))
-  await invalid.waitForStderr((line) => line.includes("MCP ready"))
-  await initializeMcp(invalid, "matching-roots-initialize")
-  const response = await startMcpSession(invalid, "matching-roots-start")
-  assert.equal(response.result.isError, true)
-  assert.match(response.result.content[0].text, /must not be inside/)
-  assert.doesNotMatch(invalid.getStderr(), /private bridge listening/)
-  invalid.child.stdin.end()
-  assert.equal((await invalid.waitForExit()).code, 0)
-  await invalid.cleanup()
-})
-
-test("staging inside the source root fails session start before private resources start", async (t) => {
-  const sourceRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-nested-file-root-"))
-  const stagingRoot = path.join(sourceRoot, "staging")
-  await mkdir(stagingRoot)
-  const invalid = await launchMcp({
-    APPLE2TS_FILE_STAGING_ROOT: stagingRoot,
-    APPLE2TS_FILE_SOURCE_ROOT: sourceRoot,
-  })
-  t.after(invalid.cleanup)
-  t.after(() => rm(sourceRoot, { recursive: true, force: true }))
-  await invalid.waitForStderr((line) => line.includes("MCP ready"))
-  await initializeMcp(invalid, "nested-roots-initialize")
-  const response = await startMcpSession(invalid, "nested-roots-start")
-  assert.equal(response.result.isError, true)
-  assert.match(response.result.content[0].text, /must not be inside/)
-  assert.doesNotMatch(invalid.getStderr(), /private bridge listening/)
-  invalid.child.stdin.end()
-  assert.equal((await invalid.waitForExit()).code, 0)
-  await invalid.cleanup()
 })
 
 test("unexpected renderer exit publishes its receipt without file ingress", async (t) => {

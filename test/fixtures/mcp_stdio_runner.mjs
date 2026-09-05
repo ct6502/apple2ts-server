@@ -12,8 +12,6 @@ void runStdio({
   rendererDisconnectGraceMs: process.env.APPLE2TS_TEST_RENDERER_DISCONNECT_GRACE_MS,
   chromiumExecutable: process.env.APPLE2TS_CHROMIUM_EXECUTABLE,
   chromiumMode: process.env.APPLE2TS_CHROMIUM_MODE,
-  fileSourceRoot: process.env.APPLE2TS_FILE_SOURCE_ROOT,
-  fileStagingRoot: process.env.APPLE2TS_FILE_STAGING_ROOT,
   sessionEventFile: process.env.APPLE2TS_TEST_SESSION_EVENT_FILE,
   distDir: process.env.APPLE2TS_DIST_DIR,
   requireBrowserBuild,
