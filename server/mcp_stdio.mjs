@@ -402,6 +402,7 @@ const memorySearchInputSchema = fromJsonSchema({
     auxBank: { type: "integer", minimum: 0, maximum: 127 },
     bytes: {
       type: "array",
+      description: "Ordered byte sequence to search for.",
       items: { type: "integer", minimum: 0, maximum: 255 },
       minItems: 1,
       maxItems: 32,

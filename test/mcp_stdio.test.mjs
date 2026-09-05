@@ -1641,6 +1641,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   const findMemoryTool = tools.result.tools.find((tool) => tool.name === "find_memory")
   assert.deepEqual(findMemoryTool.inputSchema.properties.bytes, {
     type: "array",
+    description: "Ordered byte sequence to search for.",
     items: { type: "integer", minimum: 0, maximum: 255 },
     minItems: 1,
     maxItems: 32,
