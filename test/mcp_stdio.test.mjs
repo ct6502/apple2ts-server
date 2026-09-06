@@ -391,6 +391,68 @@ test("private bridge binds one renderer and rejects forged replies", async (t) =
     assert.equal(response.status, 400)
     assert.match((await response.json()).error.message, /code from 1 through 255/)
   }
+
+  const sequenceRequest = fetch(new URL("/api/private/input/key-sequence", listener.url), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${controllerToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ keys: "AZ\r", timeoutMs: 5000 }),
+  })
+  const sequenceCommand = await renderer.nextCommand()
+  assert.equal(sequenceCommand.action, "sendKeys")
+  assert.deepEqual(sequenceCommand.payload, { keys: "AZ\r", timeoutMs: 5000 })
+  await renderer.reply(sequenceCommand, {
+    result: {
+      outcome: "completed",
+      keysDelivered: 3,
+      keyMayHaveBeenObserved: false,
+      status: statusFixture,
+    },
+  })
+  assert.deepEqual((await sequenceRequest.then((response) => response.json())).data, {
+    outcome: "completed",
+    keysDelivered: 3,
+    keyMayHaveBeenObserved: false,
+  })
+
+  for (const body of [
+    { keys: "", timeoutMs: 5000 },
+    { keys: "😀", timeoutMs: 5000 },
+    { keys: "A", timeoutMs: 0 },
+    { keys: "A", timeoutMs: "5000" },
+    { keys: "A", timeoutMs: true },
+  ]) {
+    const response = await fetch(new URL("/api/private/input/key-sequence", listener.url), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${controllerToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    })
+    assert.equal(response.status, 400)
+  }
+
+  const invalidResultRequest = fetch(new URL("/api/private/input/key-sequence", listener.url), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${controllerToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ keys: "A", timeoutMs: 5000 }),
+  })
+  const invalidResultCommand = await renderer.nextCommand()
+  await renderer.reply(invalidResultCommand, {
+    result: {
+      outcome: "timeout",
+      keysDelivered: 0,
+      keyMayHaveBeenObserved: false,
+      status: statusFixture,
+    },
+  })
+  assert.equal((await invalidResultRequest).status, 400)
 })
 
 test("private renderer reconnect cancels definitive disconnect", async (t) => {
@@ -715,6 +777,12 @@ test("non-private server routes preserve legacy access", async (t) => {
     body: Buffer.from([0x60]),
   })
   assert.equal(binary.status, 404)
+  const keySequence = await fetch(new URL("/api/private/input/key-sequence", listener.url), {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({keys: "A", timeoutMs: 5000}),
+  })
+  assert.equal(keySequence.status, 404)
 })
 
 test("server serves a selected Apple2TS build directory", async (t) => {
@@ -851,6 +919,87 @@ test("keyboard cleanup retries an uncertain old-key release", async () => {
     { type: "keyState", key: "j", isDown: false, repeat: false },
     { type: "keyState", key: "j", isDown: false, repeat: false },
   ])
+})
+
+test("key sequences release held input and preserve the worker receipt", async () => {
+  const requests = []
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  core.request = async (pathname, { body }, _signal, timeoutMs) => {
+    requests.push({ pathname, body, timeoutMs })
+    if (pathname === "/api/private/input/key-sequence") {
+      return {
+        emulator: core.identity,
+        state: {outcome: "completed", keysDelivered: 3, keyMayHaveBeenObserved: false},
+      }
+    }
+    return { emulator: core.identity, state: {} }
+  }
+
+  await core.setKeyboardKey("j")
+  const result = await core.sendKeys("AZ\r", 5000)
+
+  assert.deepEqual(result, {
+    emulator: core.identity,
+    value: {outcome: "completed", keysDelivered: 3, keyMayHaveBeenObserved: false},
+  })
+  assert.deepEqual(requests, [
+    {
+      pathname: "/api/input/keys",
+      body: { type: "keyState", key: "j", isDown: true, repeat: false },
+      timeoutMs: undefined,
+    },
+    {
+      pathname: "/api/input/keys",
+      body: { type: "keyState", key: "j", isDown: false, repeat: false },
+      timeoutMs: undefined,
+    },
+    {
+      pathname: "/api/private/input/key-sequence",
+      body: { keys: "AZ\r", timeoutMs: 5000 },
+      timeoutMs: 6000,
+    },
+  ])
+})
+
+test("a failed key sequence neutralizes its current key", async () => {
+  const requests = []
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  core.request = async (pathname, { body }) => {
+    requests.push(body)
+    if (pathname === "/api/private/input/key-sequence") throw new Error("sequence response lost")
+    return { emulator: core.identity, state: {} }
+  }
+
+  await assert.rejects(core.sendKeys("AZ", 5000), /sequence response lost/)
+  assert.deepEqual(requests, [
+    { keys: "AZ", timeoutMs: 5000 },
+    { type: "keyState", key: "A", isDown: false, repeat: false },
+  ])
+})
+
+test("an invalid key-sequence receipt poisons later mutations", async () => {
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  core.request = async (pathname) => pathname === "/api/private/input/key-sequence"
+    ? {
+        emulator: core.identity,
+        state: {outcome: "not_running", keysDelivered: 1, keyMayHaveBeenObserved: false},
+      }
+    : {emulator: core.identity, state: {}}
+
+  await assert.rejects(core.sendKeys("A", 5000), /Invalid key-sequence result/)
+  await assert.rejects(core.setSpeed(0), /previous mutation did not complete cleanly/)
 })
 
 test("a later mutation failure releases the held key", async () => {
@@ -1613,6 +1762,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
       "prepare_mount_disk",
       "prepare_load_binary",
       "set_keyboard_key",
+      "send_keys",
       "eject_disk",
       "boot",
       "reset",
@@ -1707,6 +1857,14 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.equal(keyboardTool.inputSchema.properties.key.pattern, "^[\\u0001-\\u00FF]$")
   assert.equal(keyboardTool.annotations.idempotentHint, false)
   assert.match(keyboardTool.description, /null to release/)
+  const sendKeysTool = tools.result.tools.find((tool) => tool.name === "send_keys")
+  assert.equal(sendKeysTool.inputSchema.properties.keys.minLength, 1)
+  assert.equal(sendKeysTool.inputSchema.properties.keys.maxLength, 32)
+  assert.equal(sendKeysTool.inputSchema.properties.timeoutMs.maximum, 120000)
+  assert.equal(sendKeysTool.outputSchema.properties.value.properties.keysDelivered.maximum, 32)
+  assert.match(sendKeysTool.description, /emulated software clears/)
+  assert.match(sendKeysTool.description, /without controlling key duration/)
+  assert.equal(sendKeysTool.annotations.idempotentHint, false)
   const clearBreakpointTool = tools.result.tools.find((tool) => tool.name === "clear_breakpoint")
   assert.deepEqual(clearBreakpointTool.inputSchema, {
     type: "object",
@@ -2129,6 +2287,12 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.equal(reset.state.runMode, "running")
   assert.equal(reset.state.speedMode, 4)
 
+  const sentKeys = await callTool("send-keys", "send_keys", {keys: "AZ\r", timeoutMs: 5000})
+  assert.deepEqual(sentKeys, {
+    emulator: payload.emulator,
+    value: {outcome: "completed", keysDelivered: 3, keyMayHaveBeenObserved: false},
+  })
+
   assert.equal((await callTool(24, "set_keyboard_key", { key: "j" })).value.heldKey, "j")
   assert.equal((await callTool(25, "set_keyboard_key", { key: "j", repeat: true })).value.heldKey, "j")
   assert.equal((await callTool(26, "set_keyboard_key", { key: "l" })).value.heldKey, "l")
@@ -2328,7 +2492,7 @@ test("stdio cancellation aborts an execution wait without poisoning the session"
   assert.equal((await startMcpSession(processState, "cancel-restart")).result.isError, undefined)
 })
 
-test("real renderer searches memory and reports the finite program stop atomically", {
+test("real renderer searches memory, reports execution stops, and consumes key sequences", {
   skip: !process.env.APPLE2TS_REAL_CHROMIUM_EXECUTABLE || !process.env.APPLE2TS_REAL_DIST_DIR,
 }, async (t) => {
   const taskRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-execution-acceptance-"))
@@ -2457,6 +2621,37 @@ test("real renderer searches memory and reports the finite program stop atomical
     emulator: stopped.emulator,
     state: stopped.state,
   })
+
+  await call("real-clear-breakpoints", "clear_all_breakpoints")
+  await call("real-key-program", "write_memory", {
+    address: 0x6000,
+    bytes: [
+      0xAD, 0x00, 0xC0,       // loop: LDA $C000
+      0x10, 0xFB,             // BPL loop
+      0x9D, 0x00, 0x02,       // STA $0200,X
+      0xAD, 0x10, 0xC0,       // LDA $C010
+      0xE8,                   // INX
+      0xE0, 0x03,             // CPX #3
+      0xD0, 0xF0,             // BNE loop
+      0x4C, 0x10, 0x60,       // done: JMP done
+    ],
+  })
+  await call("real-key-cpu", "set_cpu", {PC: 0x6000, X: 0})
+  await call("real-key-speed", "set_speed", {speed: 4})
+  await call("real-key-resume", "resume")
+  const sent = await call("real-send-keys", "send_keys", {keys: "AZ\r", timeoutMs: 2000})
+  assert.deepEqual(sent.result.structuredContent.value, {
+    outcome: "completed",
+    keysDelivered: 3,
+    keyMayHaveBeenObserved: false,
+  })
+  await call("real-key-pause", "pause")
+  const received = await call("real-key-memory", "read_memory", {
+    address: 0x0200,
+    length: 3,
+    space: "main",
+  })
+  assert.deepEqual(received.result.structuredContent.value.bytes, [0xC1, 0xDA, 0x8D])
 
   processState.child.stdin.end()
   assert.deepEqual(await processState.waitForExit(), { code: 0, signal: null, error: null })

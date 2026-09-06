@@ -359,6 +359,13 @@ while (!stopping) {
       keyboardStates.push(command.payload)
       await updateReceipt({ keyboardStates })
       result = snapshotStatus()
+    } else if (command.action === "sendKeys") {
+      result = {
+        outcome: "completed",
+        keysDelivered: command.payload.keys.length,
+        keyMayHaveBeenObserved: false,
+        status: snapshotStatus(),
+      }
     }
     const reply = await postJson("/api/client/reply", {
       clientId,

@@ -13,6 +13,7 @@ const serverDir = __dirname
 let host = "127.0.0.1"
 let port = Number(process.env.PORT || 6502)
 let commandTimeoutMs = Number(process.env.COMMAND_TIMEOUT_MS || 10000)
+const commandResponseMarginMs = 1000
 let serverInstanceId = randomUUID()
 let privateRenderer = null
 let privateUploadHandler = null
@@ -729,6 +730,43 @@ const dispatchAcceptedInput = async (client, action, payload) => {
   }
 }
 
+const validateKeySequenceResult = (result, keyCount) => {
+  const outcomes = new Set(["completed", "timeout", "interrupted", "not_running", "input_busy"])
+  const semanticsValid = result?.outcome === "completed"
+    ? result.keysDelivered === keyCount && result.keyMayHaveBeenObserved === false
+    : result?.outcome === "timeout" || result?.outcome === "interrupted"
+      ? result.keyMayHaveBeenObserved === true
+      : result?.keysDelivered === 0 && result?.keyMayHaveBeenObserved === false
+  if (
+    !outcomes.has(result?.outcome)
+    || !Number.isInteger(result?.keysDelivered)
+    || result.keysDelivered < 0
+    || result.keysDelivered > keyCount
+    || typeof result?.keyMayHaveBeenObserved !== "boolean"
+    || !semanticsValid
+  ) {
+    throw new Error("Invalid key-sequence result from browser client")
+  }
+  return result
+}
+
+const dispatchKeySequence = async (client, keys, timeoutMs) => {
+  const reply = await dispatchCommand(
+    client,
+    "sendKeys",
+    { keys, timeoutMs },
+    true,
+    timeoutMs + commandResponseMarginMs,
+  )
+  const result = validateKeySequenceResult(reply.result, Array.from(keys).length)
+  updateClientStatusFromCommandResult(client, result)
+  return {
+    outcome: result.outcome,
+    keysDelivered: result.keysDelivered,
+    keyMayHaveBeenObserved: result.keyMayHaveBeenObserved,
+  }
+}
+
 const parseInteger = (value) => {
   if (value === null || value === "") return null
   const parsed = Number(value)
@@ -1203,6 +1241,35 @@ const server = createServer(async (req, res) => {
           "BAD_REQUEST",
           error instanceof Error ? error.message : String(error),
         )
+      }
+      return
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/private/input/key-sequence") {
+      if (!privateRenderer) {
+        writeErrorEnvelope(res, 404, "NOT_FOUND", "Key sequences require a private emulator session.")
+        return
+      }
+      const client = getConnectedClient()
+      if (!client) {
+        writeNoConnectedClientError(res)
+        return
+      }
+      const body = await readJsonBody(req)
+      try {
+        if (typeof body.keys !== "string" || body.keys.length < 1 || body.keys.length > 32) {
+          throw new Error("keys must contain between 1 and 32 characters")
+        }
+        if (Array.from(body.keys).some((key) => !/^[\u0001-\u00FF]$/.test(key))) {
+          throw new Error("keys must contain only character codes from 1 through 255")
+        }
+        const timeoutMs = body.timeoutMs
+        if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120000) {
+          throw new Error("timeoutMs must be an integer between 1 and 120000")
+        }
+        writeEnvelope(res, 200, await dispatchKeySequence(client, body.keys, timeoutMs))
+      } catch (error) {
+        writeErrorEnvelope(res, 400, "BAD_REQUEST", error instanceof Error ? error.message : String(error))
       }
       return
     }

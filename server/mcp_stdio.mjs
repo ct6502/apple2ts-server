@@ -128,6 +128,27 @@ const keyboardKeyInputSchema = fromJsonSchema({
   additionalProperties: false,
 })
 
+const keySequenceInputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    keys: {
+      type: "string",
+      minLength: 1,
+      maxLength: 32,
+      pattern: "^[\\u0001-\\u00FF]+$",
+      description: "One to 32 discrete Apple II keys; use \\r for Return.",
+    },
+    timeoutMs: {
+      type: "integer",
+      minimum: 1,
+      maximum: 120000,
+      description: "Failure deadline only; it does not control key duration.",
+    },
+  },
+  required: ["keys", "timeoutMs"],
+  additionalProperties: false,
+})
+
 const driveInputSchema = fromJsonSchema({
   type: "object",
   properties: {
@@ -518,6 +539,48 @@ const keyboardKeyOutputSchema = fromJsonSchema({
   required: ["emulator", "value"],
   additionalProperties: false,
 })
+
+const keySequenceOutputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    emulator: emulatorIdentitySchema,
+    value: {
+      type: "object",
+      properties: {
+        outcome: {
+          type: "string",
+          enum: ["completed", "timeout", "interrupted", "not_running", "input_busy"],
+        },
+        keysDelivered: { type: "integer", minimum: 0, maximum: 32 },
+        keyMayHaveBeenObserved: { type: "boolean" },
+      },
+      required: ["outcome", "keysDelivered", "keyMayHaveBeenObserved"],
+      additionalProperties: false,
+    },
+  },
+  required: ["emulator", "value"],
+  additionalProperties: false,
+})
+
+const validateKeySequenceResult = (result, keyCount) => {
+  const outcomes = new Set(["completed", "timeout", "interrupted", "not_running", "input_busy"])
+  const semanticsValid = result?.outcome === "completed"
+    ? result.keysDelivered === keyCount && result.keyMayHaveBeenObserved === false
+    : result?.outcome === "timeout" || result?.outcome === "interrupted"
+      ? result.keyMayHaveBeenObserved === true
+      : result?.keysDelivered === 0 && result?.keyMayHaveBeenObserved === false
+  if (
+    !outcomes.has(result?.outcome)
+    || !Number.isInteger(result?.keysDelivered)
+    || result.keysDelivered < 0
+    || result.keysDelivered > keyCount
+    || typeof result?.keyMayHaveBeenObserved !== "boolean"
+    || !semanticsValid
+  ) {
+    throw new Error("Invalid key-sequence result from browser client")
+  }
+  return result
+}
 
 const binaryLoadInputSchema = fromJsonSchema({
   type: "object",
@@ -1020,7 +1083,7 @@ export class Apple2tsCore {
         return { emulator: this.identity, value: { heldKey: this.heldKey } }
       }
       if (this.heldKey !== null) {
-        await this.sendKeyboardState(this.heldKey, false)
+        await this.sendKeyboardState(this.heldKey, false, false, signal)
         this.heldKey = null
       }
       if (key !== null) {
@@ -1035,6 +1098,35 @@ export class Apple2tsCore {
     return this.request("/api/input/keys", {
       method: "POST",
       body: { type: "keyState", key, isDown, repeat },
+    }, signal)
+  }
+
+  sendKeys(keys, timeoutMs, signal) {
+    return this.serializeMutation(async () => {
+      if (this.heldKey !== null) {
+        await this.sendKeyboardState(this.heldKey, false)
+        this.heldKey = null
+      }
+      try {
+        const result = await this.request(
+          "/api/private/input/key-sequence",
+          { method: "POST", body: { keys, timeoutMs } },
+          signal,
+          timeoutMs + MUTATION_RESPONSE_MARGIN_MS,
+        )
+        const state = validateKeySequenceResult(result.state, Array.from(keys).length)
+        return {
+          emulator: result.emulator,
+          value: {
+            outcome: state.outcome,
+            keysDelivered: state.keysDelivered,
+            keyMayHaveBeenObserved: state.keyMayHaveBeenObserved,
+          },
+        }
+      } catch (error) {
+        await this.sendKeyboardState(keys[0], false, false, null).catch(() => {})
+        throw error
+      }
     }, signal)
   }
 
@@ -1324,6 +1416,16 @@ const mutationTools = [
     destructiveHint: false,
     idempotentHint: false,
     execute: (core, input, signal) => core.setKeyboardKey(input.key, input.repeat, signal),
+  },
+  {
+    name: "send_keys",
+    title: "Send discrete keyboard keys",
+    description: "Deliver one to 32 discrete keys to a running emulator. The worker advances only after emulated software clears each preceding keyboard strobe. This never starts execution implicitly; timeoutMs bounds the wait without controlling key duration.",
+    inputSchema: keySequenceInputSchema,
+    outputSchema: keySequenceOutputSchema,
+    destructiveHint: false,
+    idempotentHint: false,
+    execute: (core, input, signal) => core.sendKeys(input.keys, input.timeoutMs, signal),
   },
   {
     name: "eject_disk",
