@@ -807,7 +807,7 @@ test("a failed mutation prevents later mutations in the same session", async (t)
   )
 
   await assert.rejects(core.pause(), /uncertain mutation/)
-  await assert.rejects(core.resume(), /restart this MCP session/)
+  await assert.rejects(core.resume(), /call stop_session, then start_session/)
   assert.equal(requests, 1)
 })
 
@@ -924,7 +924,7 @@ test("an aborted mutation releases the held key after completing", async () => {
       body: { type: "keyState", key: "j", isDown: false, repeat: false },
     },
   ])
-  await assert.rejects(core.resume(), /restart this MCP session/)
+  await assert.rejects(core.resume(), /call stop_session, then start_session/)
 })
 
 test("binary loading validates and serializes one byte block", async (t) => {
@@ -1255,7 +1255,7 @@ test("aborted confirmed disk rejection releases a held key", async () => {
   assert.equal(core.heldKey, null)
   assert.equal(requests.at(-1).pathname, "/api/input/keys")
   assert.equal(requests.at(-1).body.isDown, false)
-  await assert.rejects(core.ejectDisk("fd1"), /restart this MCP session/)
+  await assert.rejects(core.ejectDisk("fd1"), /call stop_session, then start_session/)
 })
 
 test("unconfirmed mount rejection still poisons later mutations", async () => {
@@ -1280,7 +1280,7 @@ test("unconfirmed mount rejection still poisons later mutations", async () => {
     core.mountDiskBytes({ driveId: "fd2", path: "invalid.woz" }, Buffer.from("not a disk")),
     /drive readback unavailable/,
   )
-  await assert.rejects(core.ejectDisk("fd2"), /restart this MCP session/)
+  await assert.rejects(core.ejectDisk("fd2"), /call stop_session, then start_session/)
   assert.equal(requests, 2)
 })
 
@@ -1304,7 +1304,7 @@ test("mount transport failure remains an uncertain mutation", async () => {
     ),
     /transport timed out/,
   )
-  await assert.rejects(core.ejectDisk("fd1"), /restart this MCP session/)
+  await assert.rejects(core.ejectDisk("fd1"), /call stop_session, then start_session/)
   assert.equal(requests, 1)
 })
 
@@ -1400,7 +1400,7 @@ test("mount timeout still poisons later mutations when its full budget is exceed
     ),
     /aborted due to timeout/,
   )
-  await assert.rejects(core.ejectDisk("fd1"), /restart this MCP session/)
+  await assert.rejects(core.ejectDisk("fd1"), /call stop_session, then start_session/)
   assert.equal(requests, 1)
 })
 
@@ -1430,7 +1430,7 @@ test("cancelling an active mutation prevents later mutations in the same session
   cancellation.abort()
   release()
   await pause
-  await assert.rejects(core.resume(), /restart this MCP session/)
+  await assert.rejects(core.resume(), /call stop_session, then start_session/)
 })
 
 const executionSnapshot = (sequence, state, overrides = {}) => ({
@@ -2169,6 +2169,52 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.equal(processExit.error, null)
   assert.equal(processExit.code, 0, processState.getStderr())
   for (const line of processState.getStdout().trim().split("\n")) assert.doesNotThrow(() => JSON.parse(line))
+})
+
+test("stop_session recovers from an uncertain mutation without restarting stdio", async (t) => {
+  const processState = await launchMcp({
+    APPLE2TS_FAKE_CHROMIUM_MODE: "stall-run-mode",
+    COMMAND_TIMEOUT_MS: "50",
+  })
+  t.after(processState.cleanup)
+  await processState.waitForStderr((line) => line.includes("MCP ready for session requests"))
+  await initializeMcp(processState)
+
+  const started = await startMcpSession(processState)
+  const firstIdentity = started.result.structuredContent.emulator
+  const failedPause = await sendMcpRequest(processState, "failed-pause", "tools/call", {
+    name: "pause",
+    arguments: {},
+  })
+  assert.equal(failedPause.result.isError, true)
+
+  const refused = await sendMcpRequest(processState, "refused-resume", "tools/call", {
+    name: "resume",
+    arguments: {},
+  })
+  assert.equal(refused.result.isError, true)
+  assert.match(refused.result.content[0].text, /call stop_session, then start_session/)
+
+  const stopped = await sendMcpRequest(processState, "recover-stop", "tools/call", {
+    name: "stop_session",
+    arguments: {},
+  })
+  assert.deepEqual(stopped.result.structuredContent, { stopped: true })
+
+  const restarted = await startMcpSession(processState, "recover-start")
+  assert.notEqual(
+    restarted.result.structuredContent.emulator.targetId,
+    firstIdentity.targetId,
+  )
+  const accelerated = await sendMcpRequest(processState, "recovered-speed", "tools/call", {
+    name: "set_speed",
+    arguments: { speed: 4 },
+  })
+  assert.equal(accelerated.result.isError, undefined, JSON.stringify(accelerated))
+  assert.equal(accelerated.result.structuredContent.state.speedMode, 4)
+
+  processState.child.stdin.end()
+  assert.deepEqual(await processState.waitForExit(), { code: 0, signal: null, error: null })
 })
 
 test("stdio exposes coherent execution state and waits for worker-confirmed stops", async (t) => {

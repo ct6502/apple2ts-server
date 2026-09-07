@@ -956,7 +956,7 @@ export class Apple2tsCore {
         if (!mutationStarted) return
         uncertain = true
         this.mutationFailure ||= new Error(
-          "The previous mutation did not complete cleanly; restart this MCP session",
+          "The previous mutation did not complete cleanly; call stop_session, then start_session to create a fresh emulator session",
         )
       }
       const startMutation = () => {
