@@ -147,6 +147,13 @@ caller-owned debugger entries remain unchanged, and session shutdown removes
 the baseline. Large hard-drive bytes are retained from the current mounted
 media rather than copied into the snapshot.
 
+`run_input_sequence` keeps execution continuous while it waits for up to 16
+ordered memory conditions and sends each phase's discrete keys. A phase may
+omit `when` to send its keys immediately. Conditions compare 1-32 active,
+main, or auxiliary bytes and may supply a same-length mask. A required final
+condition ends the sequence; completion, timeout, cancellation, or another
+execution stop pauses the emulator and returns the final execution state.
+
 ### Server Docs URLs
 
 - OpenAPI: `/openapi.json`
