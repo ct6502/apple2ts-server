@@ -1857,14 +1857,6 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.equal(keyboardTool.inputSchema.properties.key.pattern, "^[\\u0001-\\u00FF]$")
   assert.equal(keyboardTool.annotations.idempotentHint, false)
   assert.match(keyboardTool.description, /null to release/)
-  const sendKeysTool = tools.result.tools.find((tool) => tool.name === "send_keys")
-  assert.equal(sendKeysTool.inputSchema.properties.keys.minLength, 1)
-  assert.equal(sendKeysTool.inputSchema.properties.keys.maxLength, 32)
-  assert.equal(sendKeysTool.inputSchema.properties.timeoutMs.maximum, 120000)
-  assert.equal(sendKeysTool.outputSchema.properties.value.properties.keysDelivered.maximum, 32)
-  assert.match(sendKeysTool.description, /emulated software clears/)
-  assert.match(sendKeysTool.description, /without controlling key duration/)
-  assert.equal(sendKeysTool.annotations.idempotentHint, false)
   const clearBreakpointTool = tools.result.tools.find((tool) => tool.name === "clear_breakpoint")
   assert.deepEqual(clearBreakpointTool.inputSchema, {
     type: "object",
@@ -1875,6 +1867,14 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.equal(clearBreakpointTool.outputSchema.properties.value.properties.cleared.type, "boolean")
   assert.equal(clearBreakpointTool.annotations.destructiveHint, true)
   assert.equal(clearBreakpointTool.annotations.idempotentHint, true)
+  const sendKeysTool = tools.result.tools.find((tool) => tool.name === "send_keys")
+  assert.equal(sendKeysTool.inputSchema.properties.keys.minLength, 1)
+  assert.equal(sendKeysTool.inputSchema.properties.keys.maxLength, 32)
+  assert.equal(sendKeysTool.inputSchema.properties.timeoutMs.maximum, 120000)
+  assert.equal(sendKeysTool.outputSchema.properties.value.properties.keysDelivered.maximum, 32)
+  assert.match(sendKeysTool.description, /emulated software clears/)
+  assert.match(sendKeysTool.description, /without controlling key duration/)
+  assert.equal(sendKeysTool.annotations.idempotentHint, false)
   const setCpuTool = tools.result.tools.find((tool) => tool.name === "set_cpu")
   assert.deepEqual(setCpuTool.inputSchema, {
     type: "object",
@@ -2492,7 +2492,7 @@ test("stdio cancellation aborts an execution wait without poisoning the session"
   assert.equal((await startMcpSession(processState, "cancel-restart")).result.isError, undefined)
 })
 
-test("real renderer searches memory, reports execution stops, and consumes key sequences", {
+test("real renderer searches memory and reports the finite program stop atomically", {
   skip: !process.env.APPLE2TS_REAL_CHROMIUM_EXECUTABLE || !process.env.APPLE2TS_REAL_DIST_DIR,
 }, async (t) => {
   const taskRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-execution-acceptance-"))
