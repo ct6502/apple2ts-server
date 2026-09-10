@@ -811,6 +811,108 @@ test("a failed mutation prevents later mutations in the same session", async (t)
   assert.equal(requests, 1)
 })
 
+test("setBreakpoint creates and confirms pause address semantics", async () => {
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  let created
+  core.request = async (pathname, options = {}) => {
+    if (!options.method) return { emulator: core.identity, state: [] }
+    created = options.body
+    return {
+      emulator: core.identity,
+      state: { breakpointId: "bp:4660", ...created },
+    }
+  }
+
+  assert.deepEqual(await core.setBreakpoint(0x1234), {
+    emulator: core.identity,
+    value: {
+      address: 0x1234,
+      breakpointId: "bp:4660",
+      kind: "address",
+      enabled: true,
+      behavior: "pause",
+    },
+  })
+  assert.equal(created.watchpoint, false)
+  assert.equal(created.instruction, false)
+  assert.equal(created.memset, false)
+  assert.equal(created.expression1.address, 0)
+  assert.equal(created.action1.address, 0)
+})
+
+test("setBreakpoint rejects incompatible occupants without wedging the session", async () => {
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  const address = 0x1234
+  const compatible = {
+    breakpointId: "bp:4660",
+    address,
+    watchpoint: false,
+    instruction: false,
+    disabled: false,
+    hidden: false,
+    once: false,
+    expression1: { register: "", address: 0x300, operator: "==", value: 0x80 },
+    hitcount: 1,
+    memoryBank: "",
+    action1: { action: "", register: "A", address: 0x300, value: 0 },
+    action2: { action: "", register: "A", address: 0x300, value: 0 },
+    basic: false,
+  }
+  let occupant = compatible
+  core.request = async (pathname, options = {}) => {
+    if (pathname === "/api/debug/breakpoints") {
+      return { emulator: core.identity, state: [occupant] }
+    }
+    assert.equal(pathname, "/api/machine")
+    return {
+      emulator: core.identity,
+      state: { runMode: "paused", speedMode: options.body.speedMode },
+    }
+  }
+
+  assert.equal((await core.setBreakpoint(address)).value.behavior, "pause")
+  for (const incompatible of [{ disabled: true }, { watchpoint: true }, { basic: true }]) {
+    occupant = { ...compatible, ...incompatible }
+    await assert.rejects(
+      core.setBreakpoint(address),
+      /occupied by an incompatible debugger entry/,
+    )
+  }
+  assert.equal((await core.setSpeed(4)).state.speedMode, 4)
+})
+
+test("setBreakpoint treats incompatible creation readback as uncertain", async () => {
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  let requests = 0
+  core.request = async (_pathname, options = {}) => {
+    requests += 1
+    if (!options.method) return { emulator: core.identity, state: [] }
+    return {
+      emulator: core.identity,
+      state: { breakpointId: "bp:4660", ...options.body, disabled: true },
+    }
+  }
+
+  await assert.rejects(
+    core.setBreakpoint(0x1234),
+    /did not confirm the requested pause address breakpoint/,
+  )
+  await assert.rejects(core.setSpeed(4), /call stop_session, then start_session/)
+  assert.equal(requests, 2)
+})
+
 test("keyboard cleanup releases a key whose press response failed", async () => {
   const requests = []
   const core = new Apple2tsCore(
@@ -1707,6 +1809,11 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.equal(keyboardTool.inputSchema.properties.key.pattern, "^[\\u0001-\\u00FF]$")
   assert.equal(keyboardTool.annotations.idempotentHint, false)
   assert.match(keyboardTool.description, /null to release/)
+  const setBreakpointTool = tools.result.tools.find((tool) => tool.name === "set_breakpoint")
+  assert.match(setBreakpointTool.description, /enabled address breakpoint that pauses execution/)
+  assert.deepEqual(setBreakpointTool.outputSchema.properties.value.properties.kind.enum, ["address"])
+  assert.deepEqual(setBreakpointTool.outputSchema.properties.value.properties.behavior.enum, ["pause"])
+  assert.equal(setBreakpointTool.outputSchema.properties.value.properties.enabled.type, "boolean")
   const clearBreakpointTool = tools.result.tools.find((tool) => tool.name === "clear_breakpoint")
   assert.deepEqual(clearBreakpointTool.inputSchema, {
     type: "object",
@@ -2025,7 +2132,13 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   const breakpoint = await callTool(15, "set_breakpoint", { address: 0x6003 })
   assert.deepEqual(breakpoint, {
     emulator: payload.emulator,
-    value: { address: 0x6003, breakpointId: "bp:24579" },
+    value: {
+      address: 0x6003,
+      breakpointId: "bp:24579",
+      kind: "address",
+      enabled: true,
+      behavior: "pause",
+    },
   })
   const occupied = await callTool(16, "set_breakpoint", { address: 0x6003 })
   assert.deepEqual(occupied, breakpoint)

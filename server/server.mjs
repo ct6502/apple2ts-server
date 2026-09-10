@@ -373,6 +373,7 @@ const getBreakpointResource = (breakpoint) => ({
   action1: breakpoint.action1,
   action2: breakpoint.action2,
   halt: Boolean(breakpoint.halt),
+  basic: Boolean(breakpoint.basic),
 })
 
 const getBreakpointListResource = (breakpoints) => breakpoints.map(getBreakpointResource)

@@ -558,6 +558,12 @@ const breakpointResultSchema = (extraProperties = {}, extraRequired = []) => fro
   additionalProperties: false,
 })
 
+const breakpointSetResultSchema = breakpointResultSchema({
+  kind: { type: "string", enum: ["address"] },
+  enabled: { type: "boolean" },
+  behavior: { type: "string", enum: ["pause"] },
+}, ["kind", "enabled", "behavior"])
+
 const breakpointClearAllResultSchema = fromJsonSchema({
   type: "object",
   properties: {
@@ -617,18 +623,44 @@ const executionBreakpoint = (address) => ({
   hidden: false,
   once: false,
   memget: false,
-  memset: true,
-  expression1: { register: "", address: 0x300, operator: "==", value: 0x80 },
-  expression2: { register: "", address: 0x300, operator: "==", value: 0x80 },
+  memset: false,
+  expression1: { register: "", address: 0, operator: "==", value: 0 },
+  expression2: { register: "", address: 0, operator: "==", value: 0 },
   expressionOperator: "",
   hexvalue: -1,
   hitcount: 1,
   nhits: 0,
   memoryBank: "",
-  action1: { action: "", register: "A", address: 0x300, value: 0 },
-  action2: { action: "", register: "A", address: 0x300, value: 0 },
+  action1: { action: "", register: "A", address: 0, value: 0 },
+  action2: { action: "", register: "A", address: 0, value: 0 },
   halt: false,
   basic: false,
+})
+
+const isPauseAddressBreakpoint = (breakpoint, address) => (
+  breakpoint?.address === address
+  && breakpoint.watchpoint === false
+  && breakpoint.instruction === false
+  && breakpoint.disabled === false
+  && breakpoint.hidden === false
+  && breakpoint.once === false
+  && breakpoint.expression1?.register === ""
+  && breakpoint.hitcount === 1
+  && breakpoint.memoryBank === ""
+  && breakpoint.action1?.action === ""
+  && breakpoint.action2?.action === ""
+  && breakpoint.basic === false
+)
+
+const pauseAddressBreakpointReceipt = (emulator, breakpoint, address) => ({
+  emulator,
+  value: {
+    address,
+    breakpointId: breakpoint.breakpointId || `bp:${address}`,
+    kind: "address",
+    enabled: true,
+    behavior: "pause",
+  },
 })
 
 const sleep = (milliseconds, signal) =>
@@ -1099,27 +1131,27 @@ export class Apple2tsCore {
   }
 
   setBreakpoint(address, signal) {
-    return this.serializeMutation(async () => {
+    return this.serializeMutation(async (startMutation) => {
       const before = await this.request("/api/debug/breakpoints")
       const existing = before.state.find((breakpoint) => breakpoint.address === address)
       if (existing) {
-        return {
-          emulator: before.emulator,
-          value: { address, breakpointId: existing.breakpointId || `bp:${address}` },
+        if (!isPauseAddressBreakpoint(existing, address)) {
+          throw new ConfirmedMutationRejection(
+            new Error(`Breakpoint address ${address} is occupied by an incompatible debugger entry`),
+          )
         }
+        return pauseAddressBreakpointReceipt(before.emulator, existing, address)
       }
+      startMutation()
       const result = await this.request("/api/debug/breakpoints", {
         method: "POST",
         body: executionBreakpoint(address),
       })
-      if (result.state?.address !== address) {
-        throw new Error("Apple2TS did not confirm the requested breakpoint")
+      if (!isPauseAddressBreakpoint(result.state, address)) {
+        throw new Error("Apple2TS did not confirm the requested pause address breakpoint")
       }
-      return {
-        emulator: result.emulator,
-        value: { address, breakpointId: result.state.breakpointId },
-      }
-    }, signal)
+      return pauseAddressBreakpointReceipt(result.emulator, result.state, address)
+    }, signal, { prepare: true })
   }
 
   clearBreakpoint(address, signal) {
@@ -1387,10 +1419,10 @@ const mutationTools = [
   },
   {
     name: "set_breakpoint",
-    title: "Set Apple II breakpoint",
-    description: "Set an instruction breakpoint and return its confirmed identity.",
+    title: "Set Apple II address breakpoint",
+    description: "Set an enabled address breakpoint that pauses execution and return its confirmed semantics.",
     inputSchema: breakpointInputSchema,
-    outputSchema: breakpointResultSchema(),
+    outputSchema: breakpointSetResultSchema,
     destructiveHint: false,
     idempotentHint: true,
     execute: (core, input, signal) => core.setBreakpoint(input.address, signal),
@@ -1398,7 +1430,7 @@ const mutationTools = [
   {
     name: "clear_breakpoint",
     title: "Clear Apple II breakpoint",
-    description: "Clear an instruction breakpoint by address and report whether it existed.",
+    description: "Clear the debugger entry at an address and report whether it existed.",
     inputSchema: breakpointInputSchema,
     outputSchema: breakpointResultSchema({ cleared: { type: "boolean" } }, ["cleared"]),
     destructiveHint: true,
