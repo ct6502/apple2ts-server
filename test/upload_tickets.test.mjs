@@ -39,26 +39,32 @@ const startTicketServer = async (core, options = {}) => {
   }
 }
 
-const runUpload = (input, args = []) => new Promise((resolve, reject) => {
+const runUpload = (input, args = [], keepStdinOpen = false) => new Promise((resolve, reject) => {
   const child = spawn(process.execPath, [uploadHelper, ...args], {
     stdio: ["pipe", "pipe", "pipe"],
   })
+  const timeout = setTimeout(() => {
+    child.kill()
+    reject(new Error("apple2ts-upload did not finish after receiving its ticket"))
+  }, 5000)
   let stdout = ""
   let stderr = ""
   child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk })
   child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk })
   child.once("error", reject)
   child.once("close", (code) => {
+    clearTimeout(timeout)
     if (code === 0) resolve({ stdout, stderr })
     else reject(new Error(stderr.trim() || `apple2ts-upload exited with status ${code}`))
   })
-  child.stdin.end(input)
+  if (keepStdinOpen) child.stdin.write(input)
+  else child.stdin.end(input)
 })
 
-test("upload helper requires exactly one loopback ticket", async () => {
+test("upload helper requires one loopback ticket line", async () => {
   assert.equal((await runUpload("", ["--help"])).stdout, "Usage: apple2ts-upload (ticket on stdin)\n")
-  await assert.rejects(runUpload(""), /exactly one upload ticket line/)
-  await assert.rejects(runUpload("one\ntwo\n"), /exactly one upload ticket line/)
+  await assert.rejects(runUpload(""), /one upload ticket line/)
+  await assert.rejects(runUpload("x".repeat(4097), [], true), /too long/)
   await assert.rejects(runUpload("one\n", ["unexpected"]), /Usage: apple2ts-upload \(ticket on stdin\)/)
   await assert.rejects(runUpload("https://example.test/upload\n"), /must use loopback HTTP/)
 })
@@ -85,7 +91,7 @@ test("upload helper uses the ticket-bound path and returns the final mount recei
     driveId: "hd1",
     expectedSha256: expectedSha256.toUpperCase(),
   })
-  const { stdout } = await runUpload(`${prepared.ticket}\n`)
+  const { stdout } = await runUpload(`${prepared.ticket}\n`, [], true)
   const retried = await runUpload(`${prepared.ticket}\n`)
 
   assert.equal(calls.length, 1)
