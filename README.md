@@ -152,7 +152,8 @@ ordered memory conditions and sends each phase's discrete keys. A phase may
 omit `when` to send its keys immediately. Conditions compare 1-32 active,
 main, or auxiliary bytes and may supply a same-length mask. A required final
 condition ends the sequence; completion, timeout, cancellation, or another
-execution stop pauses the emulator and returns the final execution state.
+execution stop pauses the emulator and returns the final execution state. Set
+`startExecution` to arm the sequence before resuming a paused emulator.
 
 ### Server Docs URLs
 

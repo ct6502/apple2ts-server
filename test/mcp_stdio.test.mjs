@@ -457,6 +457,7 @@ test("private bridge binds one renderer and rejects forged replies", async (t) =
     phases: [{keys: "A"}],
     final: {address: 0x09C0, space: "main", bytes: [27]},
     timeoutMs: 5000,
+    startExecution: true,
   }
   const conditionalResponse = fetch(new URL("/api/private/input/conditional-sequence", listener.url), {
     method: "POST",
@@ -468,6 +469,7 @@ test("private bridge binds one renderer and rejects forged replies", async (t) =
   })
   const conditionalCommand = await renderer.nextCommand()
   assert.equal(conditionalCommand.action, "runInputSequence")
+  assert.deepEqual(conditionalCommand.payload, conditionalRequest)
   await renderer.reply(conditionalCommand, {
     result: {
       outcome: "completed",
@@ -492,6 +494,7 @@ test("private bridge binds one renderer and rejects forged replies", async (t) =
     {...conditionalRequest, phases: []},
     {...conditionalRequest, final: {...conditionalRequest.final, address: 65535, bytes: [1, 2]}},
     {...conditionalRequest, final: {...conditionalRequest.final, mask: [255, 255]}},
+    {...conditionalRequest, startExecution: "yes"},
   ]) {
     const response = await fetch(new URL("/api/private/input/conditional-sequence", listener.url), {
       method: "POST",
@@ -2362,7 +2365,8 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.equal(conditionalInputTool.inputSchema.properties.phases.maxItems, 16)
   assert.equal(conditionalInputTool.inputSchema.properties.final.properties.bytes.maxItems, 32)
   assert.equal(conditionalInputTool.outputSchema.properties.value.properties.keyDeliveries.maxItems, 16)
-  assert.match(conditionalInputTool.description, /execution continues/)
+  assert.equal(conditionalInputTool.inputSchema.properties.startExecution.type, "boolean")
+  assert.match(conditionalInputTool.description, /arm the sequence before resuming/)
   const clearBreakpointTool = tools.result.tools.find((tool) => tool.name === "clear_breakpoint")
   assert.deepEqual(clearBreakpointTool.inputSchema, {
     type: "object",
@@ -3403,8 +3407,7 @@ test("real renderer exercises memory, execution, input, and session snapshots", 
     ],
   })
   await call("real-conditional-cpu", "set_cpu", {PC: 0x6100})
-  await call("real-conditional-resume", "resume")
-  const runningExecution = await readExecution("real-conditional-running")
+  const pausedExecution = await readExecution("real-conditional-paused")
   const conditionalRun = await call("real-conditional-input", "run_input_sequence", {
     phases: [
       {when: {address: 0x0200, space: "main", bytes: [1]}, keys: "A"},
@@ -3412,11 +3415,12 @@ test("real renderer exercises memory, execution, input, and session snapshots", 
     ],
     final: {address: 0x0202, space: "main", bytes: [3]},
     timeoutMs: 2000,
+    startExecution: true,
   })
   assert.equal(conditionalRun.result.structuredContent.value.outcome, "completed")
   assert.equal(
     conditionalRun.result.structuredContent.value.execution.executionSequence,
-    runningExecution.state.executionSequence + 1,
+    pausedExecution.state.executionSequence + 2,
   )
   assert.equal(conditionalRun.result.structuredContent.value.execution.pauseReason, "input-sequence")
   const conditionalKeys = await call("real-conditional-memory", "read_memory", {

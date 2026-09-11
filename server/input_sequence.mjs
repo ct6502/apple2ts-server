@@ -47,6 +47,9 @@ const validatePredicate = (predicate) => {
 }
 
 export const validateConditionalInputRequest = (body) => {
+  if (body?.startExecution !== undefined && typeof body.startExecution !== "boolean") {
+    throw new Error("startExecution must be boolean")
+  }
   if (!Array.isArray(body?.phases) || body.phases.length < 1 || body.phases.length > 16) {
     throw new Error("phases must contain 1 to 16 entries")
   }
@@ -67,7 +70,12 @@ export const validateConditionalInputRequest = (body) => {
   if (!Number.isInteger(body.timeoutMs) || body.timeoutMs < 1 || body.timeoutMs > 120000) {
     throw new Error("timeoutMs must be an integer between 1 and 120000")
   }
-  return {phases, final: validatePredicate(body.final), timeoutMs: body.timeoutMs}
+  return {
+    phases,
+    final: validatePredicate(body.final),
+    timeoutMs: body.timeoutMs,
+    ...(body.startExecution === undefined ? {} : {startExecution: body.startExecution}),
+  }
 }
 
 export const validateConditionalInputResult = (result, input) => {

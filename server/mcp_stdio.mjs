@@ -712,6 +712,10 @@ const conditionalInputSequenceInputSchema = fromJsonSchema({
     },
     final: memoryPredicateSchema,
     timeoutMs: { type: "integer", minimum: 1, maximum: 120000 },
+    startExecution: {
+      type: "boolean",
+      description: "When true, a paused emulator arms the sequence before resuming execution.",
+    },
   },
   required: ["phases", "final", "timeoutMs"],
   additionalProperties: false,
@@ -1853,7 +1857,7 @@ const mutationTools = [
   {
     name: "run_input_sequence",
     title: "Run conditional input sequence",
-    description: "While execution continues, wait for ordered bounded memory predicates and deliver consumption-safe key sequences. The emulator pauses only when the sequence completes, times out, is cancelled or interrupted, or encounters another execution stop.",
+    description: "Wait for ordered bounded memory predicates and deliver consumption-safe key sequences. Set startExecution to arm the sequence before resuming a paused emulator. The emulator pauses only when the sequence completes, times out, is cancelled or interrupted, or encounters another execution stop.",
     inputSchema: conditionalInputSequenceInputSchema,
     outputSchema: conditionalInputSequenceOutputSchema,
     destructiveHint: false,
