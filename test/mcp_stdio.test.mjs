@@ -1983,8 +1983,9 @@ test("conditional stop receipts are bound to the requested name and matched byte
     phases: [{keys: "A"}], final: stop.when, timeoutMs: 100, stopConditions: [stop],
   })
   const result = {...conditionalResult(), outcome: "condition_triggered", failurePhase: 1,
-    stopCondition: {name: "danger", matchedBytes: [[17]]}}
+    stopConditionsArmed: 1, stopCondition: {name: "danger", matchedBytes: [[17]]}}
   assert.equal(validateConditionalInputResult(result, input), result)
+  assert.throws(() => validateConditionalInputResult(conditionalResult(), input), /Invalid conditional/)
   for (const stopCondition of [undefined, {name: "unknown", matchedBytes: [[17]]},
     {name: "danger", matchedBytes: [[2]]}]) {
     assert.throws(() => validateConditionalInputResult({...result, stopCondition}, input), /Invalid conditional/)
@@ -3507,6 +3508,7 @@ test("real renderer exercises memory, execution, input, and session snapshots", 
   })).result.structuredContent
   assert.deepEqual(early.emulator, conditionalRun.result.structuredContent.emulator)
   assert.equal(early.value.outcome, "condition_triggered")
+  assert.equal(early.value.stopConditionsArmed, 1)
   assert.equal(early.value.completedPhases, 1)
   assert.deepEqual(early.value.stopCondition, {name: "danger", matchedBytes: [[2]]})
   assert.equal(early.value.execution.state, "paused")

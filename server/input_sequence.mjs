@@ -113,6 +113,7 @@ export const validateConditionalInputResult = (result, input) => {
   const phaseCount = input.phases.length
   const completed = result?.outcome === "completed"
   const terminal = !new Set(["not_running", "input_busy"]).has(result?.outcome)
+  const armedCount = terminal ? input.stopConditions?.length ?? 0 : 0
   const deliveriesValid = Array.isArray(result?.keyDeliveries)
     && result.keyDeliveries.length >= result.completedPhases
     && result.keyDeliveries.length <= result.completedPhases + 1
@@ -143,6 +144,7 @@ export const validateConditionalInputResult = (result, input) => {
     ? Boolean(stop) && validBytes(result.stopCondition.matchedBytes, stop.when, true)
     : result?.stopCondition === undefined
   if (!OUTCOMES.has(result?.outcome)
+    || (armedCount ? result.stopConditionsArmed !== armedCount : result?.stopConditionsArmed !== undefined)
     || !Number.isInteger(result?.completedPhases)
     || result.completedPhases < 0 || result.completedPhases > phaseCount
     || (completed ? result.completedPhases !== phaseCount || result.failurePhase !== null

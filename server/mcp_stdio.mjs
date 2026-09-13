@@ -795,6 +795,7 @@ const conditionalInputSequenceOutputSchema = fromJsonSchema({
           },
           required: ["name", "matchedBytes"], additionalProperties: false,
         },
+        stopConditionsArmed: {type: "integer", minimum: 1, maximum: 8},
         timeout: {
           type: "object",
           properties: {
@@ -1543,6 +1544,7 @@ export class Apple2tsCore {
             cyclesElapsed: state.cyclesElapsed,
             ...(state.timeout ? {timeout: state.timeout} : {}),
             ...(state.stopCondition ? {stopCondition: state.stopCondition} : {}),
+            ...(state.stopConditionsArmed ? {stopConditionsArmed: state.stopConditionsArmed} : {}),
             execution: state.status.machine.execution,
           },
         }
