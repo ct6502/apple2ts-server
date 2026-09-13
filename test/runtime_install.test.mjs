@@ -44,7 +44,7 @@ process.stdin.on("data", () => process.stdout.write(fs.readFileSync(process.env.
     "cli/apple2ts-upload.mjs": 'process.stdout.write("upload help\\n")',
   })
   await source(browser, {"build.mjs": 'import fs from "node:fs"; fs.mkdirSync("dist"); fs.writeFileSync("dist/index.html", "A");'}, {build: "node build.mjs"})
-  const command = (verb, id, extra = []) => invoke([verb, "--root", root, "--id", id, ...extra])
+  const command = (verb, id, extra = []) => invoke([verb, "--install-dir", root, "--id", id, ...extra])
   const assemble = (id) => command("assemble", id, ["--server", server, "--browser", browser])
   const first = await assemble("A")
   assert.equal(first.code, 0, first.stderr)
@@ -112,7 +112,7 @@ test("failed and interrupted assembly leave no candidate or activation", {timeou
   const root = path.join(scratch, "install")
   await source(server, {})
   await source(browser, {"build.mjs": 'console.error("BUILD_WAITING"); setInterval(() => {}, 1000)'}, {build: "node build.mjs"})
-  const args = ["assemble", "--root", root, "--id", "broken", "--server", server, "--browser", browser]
+  const args = ["assemble", "--install-dir", root, "--id", "broken", "--server", server, "--browser", browser]
   const child = spawn(process.execPath, [installer, ...args])
   t.after(() => { if (child.exitCode === null) child.kill("SIGKILL") })
   let errors = ""
@@ -151,7 +151,7 @@ test("platform defaults and Windows refusal before filesystem changes", async (t
   try {
     Object.defineProperty(process, "platform", {value: "win32"})
     for (const command of ["install", "assemble", "verify", "activate"]) {
-      await assert.rejects(main([command, "--root", root, "--id", "A"]), /not supported on Windows.*No changes/)
+      await assert.rejects(main([command, "--install-dir", root, "--id", "A"]), /not supported on Windows.*No changes/)
     }
   } finally { Object.defineProperty(process, "platform", descriptor) }
   await assert.rejects(lstat(root), {code: "ENOENT"})

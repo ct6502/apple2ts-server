@@ -189,8 +189,8 @@ To test a new candidate before activation, keep the steps separate:
 
 ```bash
 npm run --silent runtime -- assemble --server /path/to/apple2ts-server \
-  --browser /path/to/apple2ts --id candidate-1 --root /path/to/install
-npm run --silent runtime -- verify --id candidate-1 --root /path/to/install
+  --browser /path/to/apple2ts --id candidate-1 --install-dir /path/to/install
+npm run --silent runtime -- verify --id candidate-1 --install-dir /path/to/install
 ```
 
 Assembly exports both HEAD commits without changing the source checkouts,
@@ -199,10 +199,10 @@ source: that build script executes with the installer's permissions. The
 result contains its own server dependencies and browser assets, plus a
 `manifest.json` recording both commits and file hashes. Verification detects
 accidental changes; the manifest is not a signature or an authorization boundary.
-The default root is `~/Library/Application Support/Apple2TS` on macOS.
+The default installation directory is `~/Library/Application Support/Apple2TS` on macOS.
 On Linux it is `$XDG_DATA_HOME/apple2ts`, falling back to
 `~/.local/share/apple2ts` when that variable is empty or not absolute.
-Use `--root` to choose another location; use the same root for later commands.
+Use `--install-dir` to choose another location; use the same directory for later commands.
 
 Before activation, test `builds/candidate-1/bin/apple2ts-mcp.mjs` directly with
 your MCP client and Chrome configuration. Verify the tools your workflow needs
@@ -222,7 +222,7 @@ node --test --test-name-pattern='real renderer exercises' test/mcp_stdio.test.mj
 After acceptance:
 
 ```bash
-npm run --silent runtime -- activate --id candidate-1 --root /path/to/install
+npm run --silent runtime -- activate --id candidate-1 --install-dir /path/to/install
 ```
 
 Configure any stdio MCP host once with command `node`, argument

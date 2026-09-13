@@ -7,12 +7,12 @@ import path from "node:path"
 import {fileURLToPath} from "node:url"
 
 const help = `Apple2TS local runtime installation (macOS/Linux, Node 24+, npm, Git)
-  install --server CHECKOUT --browser CHECKOUT --id NAME [--root DIRECTORY]
-  assemble --server CHECKOUT --browser CHECKOUT --id NAME [--root DIRECTORY]
-  verify --id NAME [--root DIRECTORY]
-  activate --id NAME [--root DIRECTORY]
+  install --server CHECKOUT --browser CHECKOUT --id NAME [--install-dir DIRECTORY]
+  assemble --server CHECKOUT --browser CHECKOUT --id NAME [--install-dir DIRECTORY]
+  verify --id NAME [--install-dir DIRECTORY]
+  activate --id NAME [--install-dir DIRECTORY]
 
-Default root: ~/Library/Application Support/Apple2TS on macOS;
+Default installation directory: ~/Library/Application Support/Apple2TS on macOS;
   $XDG_DATA_HOME/apple2ts or ~/.local/share/apple2ts on Linux.
 Install assembles, verifies, and activates a matched source pair in one command.
 Assemble builds committed HEADs, installs locked dependencies, and does not activate.
@@ -180,13 +180,13 @@ export async function main(args) {
   const options = {}
   for (let i = 0; i < rest.length; i += 2) {
     const key = rest[i]
-    if (!["--root", "--id", ...(builds ? ["--server", "--browser"] : [])].includes(key) ||
+    if (!["--install-dir", "--id", ...(builds ? ["--server", "--browser"] : [])].includes(key) ||
         !rest[i + 1] || rest[i + 1].startsWith("--") || key in options) throw new Error("Invalid options; use --help")
     options[key] = rest[i + 1]
   }
   const id = options["--id"]
   if (!id || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/.test(id)) throw new Error("Invalid or missing build ID")
-  const requestedRoot = path.resolve(options["--root"] || defaultInstallRoot())
+  const requestedRoot = path.resolve(options["--install-dir"] || defaultInstallRoot())
   if (builds && (!options["--server"] || !options["--browser"])) throw new Error("Both source checkouts are required")
   if (builds) await mkdir(requestedRoot, {recursive: true})
   const root = await realpath(requestedRoot)
@@ -195,7 +195,7 @@ export async function main(args) {
     : command === "verify" ? await verify(root, id) : await activate(root, id)
   if (command === "install") {
     try { result = await activate(root, id) }
-    catch (error) { throw new Error(`Build ${id} was assembled but not activated: ${error.message}. Retry activate with this ID and root.`) }
+    catch (error) { throw new Error(`Build ${id} was assembled but not activated: ${error.message}. Retry activate with this ID and installation directory.`) }
   }
   process.stdout.write(JSON.stringify({operation: command, ...result}) + "\n")
 }
