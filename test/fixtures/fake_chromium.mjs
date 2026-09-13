@@ -467,6 +467,9 @@ while (!stopping) {
         failurePhase: null,
         keyDeliveries: command.payload.phases.map((phase, index) => ({
           phase: index,
+          predicateMatchCycle: phase.when ? 0 : null,
+          matchedBytes: phase.when ? (phase.when.all ?? [phase.when]).map(p => p.bytes) : [],
+          keyConsumptionCycles: Array.from(phase.keys, () => 1),
           outcome: "completed",
           keysDelivered: phase.keys.length,
           keyMayHaveBeenObserved: false,

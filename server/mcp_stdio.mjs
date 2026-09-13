@@ -687,6 +687,19 @@ const memoryPredicateSchema = {
   additionalProperties: false,
 }
 
+const memoryConditionSchema = {oneOf: [memoryPredicateSchema, {
+  type: "object",
+  properties: {all: {type: "array", minItems: 1, maxItems: 8, items: memoryPredicateSchema}},
+  required: ["all"],
+  additionalProperties: false,
+}]}
+
+const conditionBytesSchema = {
+  type: "array", maxItems: 8,
+  items: {type: "array", minItems: 1, maxItems: 32,
+    items: {type: "integer", minimum: 0, maximum: 255}},
+}
+
 const conditionalInputSequenceInputSchema = fromJsonSchema({
   type: "object",
   properties: {
@@ -697,7 +710,7 @@ const conditionalInputSequenceInputSchema = fromJsonSchema({
       items: {
         type: "object",
         properties: {
-          when: memoryPredicateSchema,
+          when: memoryConditionSchema,
           keys: {
             type: "string",
             minLength: 1,
@@ -710,7 +723,7 @@ const conditionalInputSequenceInputSchema = fromJsonSchema({
         additionalProperties: false,
       },
     },
-    final: memoryPredicateSchema,
+    final: memoryConditionSchema,
     timeoutMs: { type: "integer", minimum: 1, maximum: 120000 },
     startExecution: {
       type: "boolean",
@@ -750,12 +763,25 @@ const conditionalInputSequenceOutputSchema = fromJsonSchema({
               },
               keysDelivered: { type: "integer", minimum: 0, maximum: 32 },
               keyMayHaveBeenObserved: { type: "boolean" },
+              predicateMatchCycle: {type: ["integer", "null"], minimum: 0},
+              matchedBytes: conditionBytesSchema,
+              keyConsumptionCycles: {type: "array", maxItems: 32,
+                items: {type: "integer", minimum: 0}},
             },
-            required: ["phase", "outcome", "keysDelivered", "keyMayHaveBeenObserved"],
+            required: ["phase", "outcome", "keysDelivered", "keyMayHaveBeenObserved",
+              "predicateMatchCycle", "matchedBytes", "keyConsumptionCycles"],
             additionalProperties: false,
           },
         },
         cyclesElapsed: { type: "integer", minimum: 0 },
+        timeout: {
+          type: "object",
+          properties: {
+            waitingFor: {type: "string", enum: ["condition", "key_consumption"]},
+            actualBytes: conditionBytesSchema,
+          },
+          required: ["waitingFor", "actualBytes"], additionalProperties: false,
+        },
         execution: executionSnapshotSchema,
       },
       required: [
@@ -1494,6 +1520,7 @@ export class Apple2tsCore {
             failurePhase: state.failurePhase,
             keyDeliveries: state.keyDeliveries,
             cyclesElapsed: state.cyclesElapsed,
+            ...(state.timeout ? {timeout: state.timeout} : {}),
             execution: state.status.machine.execution,
           },
         }
@@ -1857,7 +1884,7 @@ const mutationTools = [
   {
     name: "run_input_sequence",
     title: "Run conditional input sequence",
-    description: "Wait for ordered bounded memory predicates and deliver consumption-safe key sequences. Set startExecution to arm the sequence before resuming a paused emulator. The emulator pauses only when the sequence completes, times out, is cancelled or interrupted, or encounters another execution stop.",
+    description: "Wait for ordered bounded memory predicates and deliver consumption-safe key sequences. Use all for up to eight non-nested predicates checked together. Set startExecution to arm the sequence before resuming a paused emulator. Key consumption is not action completion: supply an appropriate final condition. Receipts include matched bytes and instruction-boundary match/consumption cycles; timeouts identify the wait stage and actual predicate bytes. The emulator pauses only when the sequence completes, times out, is cancelled or interrupted, or encounters another execution stop.",
     inputSchema: conditionalInputSequenceInputSchema,
     outputSchema: conditionalInputSequenceOutputSchema,
     destructiveHint: false,

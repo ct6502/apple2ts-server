@@ -155,6 +155,15 @@ condition ends the sequence; completion, timeout, cancellation, or another
 execution stop pauses the emulator and returns the final execution state. Set
 `startExecution` to arm the sequence before resuming a paused emulator.
 
+Use `{all: [predicate, ...]}` to require up to eight non-nested predicates at
+the same instruction boundary. Each delivery reports `predicateMatchCycle`
+(`null` for an immediate phase), `matchedBytes` in predicate order, and
+`keyConsumptionCycles` in key order. These are absolute emulated cycles at
+instruction boundaries, not wall-clock times. Timeout receipts distinguish
+`condition` from `key_consumption` and include the pending condition's actual
+bytes. Key consumption does not mean action completion; choose a final
+condition that establishes the intended result.
+
 ### Server Docs URLs
 
 - OpenAPI: `/openapi.json`

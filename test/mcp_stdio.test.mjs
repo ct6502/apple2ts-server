@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url"
 import test from "node:test"
 
 import { Apple2tsCore } from "../server/mcp_stdio.mjs"
+import { validateConditionalInputRequest, validateConditionalInputResult } from "../server/input_sequence.mjs"
 import {
   resolveBrowserBuildDir,
   startApple2tsServer,
@@ -476,7 +477,8 @@ test("private bridge binds one renderer and rejects forged replies", async (t) =
       completedPhases: 1,
       failurePhase: null,
       keyDeliveries: [
-        {phase: 0, outcome: "completed", keysDelivered: 1, keyMayHaveBeenObserved: false},
+        {...{phase: 0, outcome: "completed", keysDelivered: 1, keyMayHaveBeenObserved: false},
+          predicateMatchCycle: null, matchedBytes: [], keyConsumptionCycles: [1]},
       ],
       cyclesElapsed: 100,
       status: {
@@ -1905,7 +1907,8 @@ const conditionalResult = (outcome = "completed") => ({
   completedPhases: outcome === "completed" ? 1 : 0,
   failurePhase: outcome === "completed" ? null : 0,
   keyDeliveries: outcome === "completed"
-    ? [{phase: 0, outcome: "completed", keysDelivered: 1, keyMayHaveBeenObserved: false}]
+    ? [{...{phase: 0, outcome: "completed", keysDelivered: 1, keyMayHaveBeenObserved: false},
+      predicateMatchCycle: null, matchedBytes: [], keyConsumptionCycles: [1]}]
     : [],
   cyclesElapsed: 20,
   status: {
@@ -1938,11 +1941,40 @@ test("conditional input preserves its bounded worker receipt", async () => {
     completedPhases: 1,
     failurePhase: null,
     keyDeliveries: [
-      {phase: 0, outcome: "completed", keysDelivered: 1, keyMayHaveBeenObserved: false},
+      {...{phase: 0, outcome: "completed", keysDelivered: 1, keyMayHaveBeenObserved: false},
+        predicateMatchCycle: null, matchedBytes: [], keyConsumptionCycles: [1]},
     ],
     cyclesElapsed: 20,
     execution: executionSnapshot(2, "paused", {pauseReason: "input-sequence"}),
   })
+})
+
+test("conditional evidence validates compound matches and timeout stages", () => {
+  const predicate = {address: 0x0200, space: "main", bytes: [1], mask: [15]}
+  const input = validateConditionalInputRequest({
+    phases: [{when: {all: [predicate, {...predicate, address: 0x0300}]}, keys: "A"}],
+    final: predicate, timeoutMs: 100,
+  })
+  const result = conditionalResult()
+  Object.assign(result.keyDeliveries[0], {
+    predicateMatchCycle: 10, matchedBytes: [[17], [1]], keyConsumptionCycles: [12],
+  })
+  assert.equal(validateConditionalInputResult(result, input), result)
+  const timedOut = {...conditionalResult("timeout"),
+    timeout: {waitingFor: "condition", actualBytes: [[0], [1]]}}
+  assert.equal(validateConditionalInputResult(timedOut, input), timedOut)
+  assert.throws(() => validateConditionalInputResult({...timedOut,
+    timeout: {...timedOut.timeout, waitingFor: "key_consumption"}}, input), /Invalid conditional/)
+  for (const evidence of [
+    {matchedBytes: [[1]]}, {matchedBytes: [[2], [1]]},
+    {keyConsumptionCycles: [9]}, {keyConsumptionCycles: []},
+  ]) {
+    assert.throws(() => validateConditionalInputResult({...result,
+      keyDeliveries: [{...result.keyDeliveries[0], ...evidence}]}, input), /Invalid conditional/)
+  }
+  for (const all of [[], Array(9).fill(predicate), [{all: [predicate]}]]) {
+    assert.throws(() => validateConditionalInputRequest({...input, final: {all}}), /all|nested/)
+  }
 })
 
 test("conditional input rejects impossible key-delivery receipts", async () => {
@@ -2363,10 +2395,12 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.equal(setBreakpointTool.outputSchema.properties.value.properties.enabled.type, "boolean")
   const conditionalInputTool = tools.result.tools.find((tool) => tool.name === "run_input_sequence")
   assert.equal(conditionalInputTool.inputSchema.properties.phases.maxItems, 16)
-  assert.equal(conditionalInputTool.inputSchema.properties.final.properties.bytes.maxItems, 32)
+  assert.equal(conditionalInputTool.inputSchema.properties.final.oneOf[0].properties.bytes.maxItems, 32)
+  assert.equal(conditionalInputTool.inputSchema.properties.final.oneOf[1].properties.all.maxItems, 8)
   assert.equal(conditionalInputTool.outputSchema.properties.value.properties.keyDeliveries.maxItems, 16)
   assert.equal(conditionalInputTool.inputSchema.properties.startExecution.type, "boolean")
   assert.match(conditionalInputTool.description, /arm the sequence before resuming/)
+  assert.match(conditionalInputTool.description, /Key consumption is not action completion/)
   const clearBreakpointTool = tools.result.tools.find((tool) => tool.name === "clear_breakpoint")
   assert.deepEqual(clearBreakpointTool.inputSchema, {
     type: "object",
@@ -3411,13 +3445,23 @@ test("real renderer exercises memory, execution, input, and session snapshots", 
   const conditionalRun = await call("real-conditional-input", "run_input_sequence", {
     phases: [
       {when: {address: 0x0200, space: "main", bytes: [1]}, keys: "A"},
-      {when: {address: 0x0201, space: "main", bytes: [2]}, keys: "Z"},
+      {when: {all: [
+        {address: 0x0201, space: "main", bytes: [2]},
+        {address: 0x0210, space: "main", bytes: [0xC1]},
+      ]}, keys: "Z"},
     ],
     final: {address: 0x0202, space: "main", bytes: [3]},
     timeoutMs: 2000,
     startExecution: true,
   })
   assert.equal(conditionalRun.result.structuredContent.value.outcome, "completed")
+  const deliveries = conditionalRun.result.structuredContent.value.keyDeliveries
+  assert.deepEqual(deliveries.map(d => d.matchedBytes), [[[1]], [[2], [0xC1]]])
+  for (const delivery of deliveries) {
+    assert.equal(delivery.keyConsumptionCycles.length, 1)
+    assert.ok(delivery.keyConsumptionCycles[0] > delivery.predicateMatchCycle)
+  }
+  assert.ok(deliveries[1].predicateMatchCycle >= deliveries[0].keyConsumptionCycles[0])
   assert.equal(
     conditionalRun.result.structuredContent.value.execution.executionSequence,
     pausedExecution.state.executionSequence + 2,
