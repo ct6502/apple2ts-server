@@ -1292,7 +1292,8 @@ const server = createServer(async (req, res) => {
       return
     }
 
-    if (req.method === "POST" && url.pathname === "/api/private/input/conditional-sequence") {
+    if (req.method === "POST" && (url.pathname === "/api/private/input/conditional-sequence"
+      || url.pathname === "/api/private/input/conditional-sequence/cancel")) {
       if (!privateRenderer) {
         writeErrorEnvelope(res, 404, "NOT_FOUND", "Conditional input requires a private emulator session.")
         return
@@ -1303,28 +1304,14 @@ const server = createServer(async (req, res) => {
         return
       }
       try {
-        const request = validateConditionalInputRequest(await readJsonBody(req))
-        writeEnvelope(res, 200, await dispatchConditionalInput(client, request))
-      } catch (error) {
-        writeErrorEnvelope(res, 400, "BAD_REQUEST", error instanceof Error ? error.message : String(error))
-      }
-      return
-    }
-
-    if (req.method === "POST" && url.pathname === "/api/private/input/conditional-sequence/cancel") {
-      if (!privateRenderer) {
-        writeErrorEnvelope(res, 404, "NOT_FOUND", "Conditional input requires a private emulator session.")
-        return
-      }
-      const client = getConnectedClient()
-      if (!client) {
-        writeNoConnectedClientError(res)
-        return
-      }
-      try {
-        const reply = await dispatchCommand(client, "cancelInputSequence", {}, true)
-        updateClientStatusFromCommandResult(client, reply.result)
-        writeEnvelope(res, 200, reply.result)
+        if (url.pathname === "/api/private/input/conditional-sequence/cancel") {
+          const reply = await dispatchCommand(client, "cancelInputSequence", {}, true)
+          updateClientStatusFromCommandResult(client, reply.result)
+          writeEnvelope(res, 200, reply.result)
+        } else {
+          const request = validateConditionalInputRequest(await readJsonBody(req))
+          writeEnvelope(res, 200, await dispatchConditionalInput(client, request))
+        }
       } catch (error) {
         writeErrorEnvelope(res, 400, "BAD_REQUEST", error instanceof Error ? error.message : String(error))
       }
