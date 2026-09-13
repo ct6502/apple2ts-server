@@ -30,8 +30,8 @@ const cleanupGraceTimeoutMs = 5000
 const cleanupKillTimeoutMs = 1000
 let timeoutModuleSequence = 0
 
-const runUpload = (ticket) => new Promise((resolve, reject) => {
-  const child = spawn(process.execPath, [uploadHelper], { stdio: ["pipe", "pipe", "pipe"] })
+const runUpload = (ticket, helper = uploadHelper) => new Promise((resolve, reject) => {
+  const child = spawn(process.execPath, [helper], { stdio: ["pipe", "pipe", "pipe"] })
   let stdout = ""
   let stderr = ""
   child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk })
@@ -3229,7 +3229,7 @@ test("real renderer exercises memory, execution, input, and session snapshots", 
     APPLE2TS_DIST_DIR: process.env.APPLE2TS_REAL_DIST_DIR,
     APPLE2TS_STARTUP_TIMEOUT_MS: "10000",
     TMPDIR: chromiumTempRoot,
-  })
+  }, process.env.APPLE2TS_REAL_MCP_ENTRY || mcpTestRunner)
   t.after(async () => {
     await processState.cleanup()
     await rm(taskRoot, { recursive: true, force: true })
@@ -3255,7 +3255,7 @@ test("real renderer exercises memory, execution, input, and session snapshots", 
     path: path.join(sourceRoot, "finite.bin"),
     address: 0x6000,
   })).result.structuredContent
-  await runUpload(prepared.ticket)
+  await runUpload(prepared.ticket, process.env.APPLE2TS_REAL_UPLOAD_ENTRY || uploadHelper)
   await call("real-pause-for-search", "pause")
   const beforeSearch = await readExecution("real-before-search")
   const mainSearch = (await call("real-find-main", "find_memory", {

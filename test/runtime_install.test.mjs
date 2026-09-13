@@ -31,7 +31,7 @@ async function source(directory, files, scripts = {}) {
   git(directory, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", "fixture")
 }
 
-test("runtime installation: assembly, verification, activation, pinning and rollback", {timeout: 60_000}, async (t) => {
+test("runtime installation: assembly, verification, activation, pinning and rollback", {timeout: 60_000, skip: process.platform === "win32"}, async (t) => {
   const scratch = await mkdtemp(path.join(os.tmpdir(), "apple2ts-install-test-"))
   t.after(() => rm(scratch, {recursive: true, force: true}))
   const root = path.join(scratch, "installation with spaces")
@@ -100,7 +100,7 @@ process.stdin.on("data", () => process.stdout.write(fs.readFileSync(process.env.
   assert.notEqual((await command("activate", "A")).code, 0, "must preserve unrelated current link")
 })
 
-test("failed and interrupted assembly leave no candidate or activation", {timeout: 30_000}, async (t) => {
+test("failed and interrupted assembly leave no candidate or activation", {timeout: 30_000, skip: process.platform === "win32"}, async (t) => {
   const scratch = await mkdtemp(path.join(os.tmpdir(), "apple2ts-install-failure-"))
   t.after(() => rm(scratch, {recursive: true, force: true}))
   const server = path.join(scratch, "server")

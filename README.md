@@ -191,6 +191,17 @@ Before activation, test `builds/candidate-1/bin/apple2ts-mcp.mjs` directly with
 your MCP client and Chrome configuration. Verify the tools your workflow needs
 and an isolated emulator's normal shutdown. The `verify` command checks file
 integrity, not compatibility between arbitrary server and browser revisions.
+The repository's opt-in synthetic acceptance can exercise the installed entry
+points without private media:
+
+```bash
+APPLE2TS_REAL_CHROMIUM_EXECUTABLE=/path/to/chrome \
+APPLE2TS_REAL_DIST_DIR=/path/to/install/builds/candidate-1/browser \
+APPLE2TS_REAL_MCP_ENTRY=/path/to/install/builds/candidate-1/bin/apple2ts-mcp.mjs \
+APPLE2TS_REAL_UPLOAD_ENTRY=/path/to/install/builds/candidate-1/bin/apple2ts-upload.mjs \
+node --test --test-name-pattern='real renderer exercises' test/mcp_stdio.test.mjs
+```
+
 After acceptance:
 
 ```bash
