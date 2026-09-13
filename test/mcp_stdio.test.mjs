@@ -1977,6 +1977,27 @@ test("conditional evidence validates compound matches and timeout stages", () =>
   }
 })
 
+test("conditional stop receipts are bound to the requested name and matched bytes", async () => {
+  const stop = {name: "danger", when: {address: 0x0200, bytes: [1], mask: [15]}}
+  const input = validateConditionalInputRequest({
+    phases: [{keys: "A"}], final: stop.when, timeoutMs: 100, stopConditions: [stop],
+  })
+  const result = {...conditionalResult(), outcome: "condition_triggered", failurePhase: 1,
+    stopCondition: {name: "danger", matchedBytes: [[17]]}}
+  assert.equal(validateConditionalInputResult(result, input), result)
+  for (const stopCondition of [undefined, {name: "unknown", matchedBytes: [[17]]},
+    {name: "danger", matchedBytes: [[2]]}]) {
+    assert.throws(() => validateConditionalInputResult({...result, stopCondition}, input), /Invalid conditional/)
+  }
+  for (const stopConditions of [[stop, stop], Array(9).fill(stop), [{...stop, name: ""}]]) {
+    assert.throws(() => validateConditionalInputRequest({...input, stopConditions}), /uniquely named/)
+  }
+  const core = new Apple2tsCore("http://unused.invalid", controllerToken,
+    {serverInstanceId: "server", rendererId, targetId: `server:${rendererId}`})
+  core.request = async () => ({emulator: core.identity, state: result})
+  assert.deepEqual((await core.runInputSequence(input)).value.stopCondition, result.stopCondition)
+})
+
 test("conditional input rejects impossible key-delivery receipts", async () => {
   const core = new Apple2tsCore(
     "http://unused.invalid",
@@ -2399,6 +2420,8 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.equal(conditionalInputTool.inputSchema.properties.final.oneOf[1].properties.all.maxItems, 8)
   assert.equal(conditionalInputTool.outputSchema.properties.value.properties.keyDeliveries.maxItems, 16)
   assert.equal(conditionalInputTool.inputSchema.properties.startExecution.type, "boolean")
+  assert.equal(conditionalInputTool.inputSchema.properties.stopConditions.maxItems, 8)
+  assert.ok(conditionalInputTool.outputSchema.properties.value.properties.outcome.enum.includes("condition_triggered"))
   assert.match(conditionalInputTool.description, /arm the sequence before resuming/)
   assert.match(conditionalInputTool.description, /Key consumption is not action completion/)
   const clearBreakpointTool = tools.result.tools.find((tool) => tool.name === "clear_breakpoint")
@@ -3473,6 +3496,24 @@ test("real renderer exercises memory, execution, input, and session snapshots", 
     space: "main",
   })
   assert.deepEqual(conditionalKeys.result.structuredContent.value.bytes, [0xC1, 0xDA])
+
+  await call("real-stop-reset", "write_memory", {address: 0x0200, bytes: [0, 0, 0]})
+  await call("real-stop-clear-keys", "write_memory", {address: 0x0210, bytes: [0, 0]})
+  await call("real-stop-cpu", "set_cpu", {PC: 0x6100})
+  const danger = {address: 0x0201, space: "main", bytes: [2]}
+  const early = (await call("real-stop-input", "run_input_sequence", {
+    phases: [{keys: "A"}, {when: danger, keys: "Z"}], final: danger,
+    stopConditions: [{name: "danger", when: danger}], timeoutMs: 2000, startExecution: true,
+  })).result.structuredContent
+  assert.deepEqual(early.emulator, conditionalRun.result.structuredContent.emulator)
+  assert.equal(early.value.outcome, "condition_triggered")
+  assert.equal(early.value.completedPhases, 1)
+  assert.deepEqual(early.value.stopCondition, {name: "danger", matchedBytes: [[2]]})
+  assert.equal(early.value.execution.state, "paused")
+  assert.equal(early.value.execution.pauseReason, "input-sequence")
+  assert.deepEqual(early.value.keyDeliveries.map(d => d.keysDelivered), [1])
+  const earlyKeys = await call("real-stop-memory", "read_memory", {address: 0x0210, length: 2, space: "main"})
+  assert.deepEqual(earlyKeys.result.structuredContent.value.bytes, [0xC1, 0])
 
   processState.child.stdin.end()
   assert.deepEqual(await processState.waitForExit(), { code: 0, signal: null, error: null })

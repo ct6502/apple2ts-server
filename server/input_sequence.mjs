@@ -1,6 +1,7 @@
 const SPACES = new Set(["active", "main", "aux"])
 const OUTCOMES = new Set([
   "completed", "timeout", "cancelled", "unexpected_stop", "not_running", "input_busy",
+  "condition_triggered",
 ])
 const DELIVERY_OUTCOMES = new Set([
   "completed", "timeout", "interrupted", "not_running", "input_busy",
@@ -92,11 +93,19 @@ export const validateConditionalInputRequest = (body) => {
   if (!Number.isInteger(body.timeoutMs) || body.timeoutMs < 1 || body.timeoutMs > 120000) {
     throw new Error("timeoutMs must be an integer between 1 and 120000")
   }
+  const stops = body.stopConditions === undefined ? [] : body.stopConditions
+  if (!Array.isArray(stops) || stops.length > 8
+    || stops.some(stop => typeof stop?.name !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(stop.name))
+    || new Set(stops.map(stop => stop.name)).size !== stops.length) {
+    throw new Error("stopConditions must contain at most 8 uniquely named conditions (1 to 64 letters, digits, _ or -)")
+  }
+  const stopConditions = stops.map(stop => ({name: stop.name, when: validateCondition(stop.when)}))
   return {
     phases,
     final: validateCondition(body.final),
     timeoutMs: body.timeoutMs,
     ...(body.startExecution === undefined ? {} : {startExecution: body.startExecution}),
+    ...(body.stopConditions === undefined ? {} : {stopConditions}),
   }
 }
 
@@ -129,18 +138,22 @@ export const validateConditionalInputResult = (result, input) => {
     ? result.timeout?.waitingFor === (timedOutDelivery ? "key_consumption" : "condition")
       && validBytes(result.timeout.actualBytes, pendingCondition)
     : result?.timeout === undefined
+  const stop = input.stopConditions?.find(stop => stop.name === result?.stopCondition?.name)
+  const stopValid = result?.outcome === "condition_triggered"
+    ? Boolean(stop) && validBytes(result.stopCondition.matchedBytes, stop.when, true)
+    : result?.stopCondition === undefined
   if (!OUTCOMES.has(result?.outcome)
     || !Number.isInteger(result?.completedPhases)
     || result.completedPhases < 0 || result.completedPhases > phaseCount
     || (completed ? result.completedPhases !== phaseCount || result.failurePhase !== null
       : result.failurePhase !== result.completedPhases)
-    || !deliveriesValid || !timeoutValid || (completed && result.keyDeliveries.length !== phaseCount)
+    || !deliveriesValid || !timeoutValid || !stopValid || (completed && result.keyDeliveries.length !== phaseCount)
     || (["not_running", "input_busy"].includes(result?.outcome)
       && (result.completedPhases !== 0 || result.keyDeliveries.length !== 0))
     || !Number.isSafeInteger(result.cyclesElapsed) || result.cyclesElapsed < 0
     || !result.status?.machine?.execution
     || (terminal && result.status.machine.execution.state !== "paused")
-    || (["completed", "timeout", "cancelled"].includes(result?.outcome)
+    || (["completed", "timeout", "cancelled", "condition_triggered"].includes(result?.outcome)
       && result.status.machine.execution.pauseReason !== "input-sequence")) {
     throw new Error("Invalid conditional input result from browser client")
   }
