@@ -4,6 +4,8 @@ import { promises as fs } from "node:fs"
 import path from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 
+import { validateConditionalInputRequest, validateConditionalInputResult } from "./input_sequence.mjs"
+
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const repoRoot = path.resolve(__dirname, "..")
@@ -768,6 +770,19 @@ const dispatchKeySequence = async (client, keys, timeoutMs) => {
   }
 }
 
+const dispatchConditionalInput = async (client, request) => {
+  const reply = await dispatchCommand(
+    client,
+    "runInputSequence",
+    request,
+    true,
+    request.timeoutMs + commandResponseMarginMs,
+  )
+  const result = validateConditionalInputResult(reply.result, request)
+  updateClientStatusFromCommandResult(client, result)
+  return result
+}
+
 const parseInteger = (value) => {
   if (value === null || value === "") return null
   const parsed = Number(value)
@@ -1271,6 +1286,32 @@ const server = createServer(async (req, res) => {
           throw new Error("timeoutMs must be an integer between 1 and 120000")
         }
         writeEnvelope(res, 200, await dispatchKeySequence(client, body.keys, timeoutMs))
+      } catch (error) {
+        writeErrorEnvelope(res, 400, "BAD_REQUEST", error instanceof Error ? error.message : String(error))
+      }
+      return
+    }
+
+    if (req.method === "POST" && (url.pathname === "/api/private/input/conditional-sequence"
+      || url.pathname === "/api/private/input/conditional-sequence/cancel")) {
+      if (!privateRenderer) {
+        writeErrorEnvelope(res, 404, "NOT_FOUND", "Conditional input requires a private emulator session.")
+        return
+      }
+      const client = getConnectedClient()
+      if (!client) {
+        writeNoConnectedClientError(res)
+        return
+      }
+      try {
+        if (url.pathname === "/api/private/input/conditional-sequence/cancel") {
+          const reply = await dispatchCommand(client, "cancelInputSequence", {}, true)
+          updateClientStatusFromCommandResult(client, reply.result)
+          writeEnvelope(res, 200, reply.result)
+        } else {
+          const request = validateConditionalInputRequest(await readJsonBody(req))
+          writeEnvelope(res, 200, await dispatchConditionalInput(client, request))
+        }
       } catch (error) {
         writeErrorEnvelope(res, 400, "BAD_REQUEST", error instanceof Error ? error.message : String(error))
       }

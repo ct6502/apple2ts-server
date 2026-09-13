@@ -451,6 +451,34 @@ while (!stopping) {
         keyMayHaveBeenObserved: false,
         status: snapshotStatus(),
       }
+    } else if (command.action === "runInputSequence") {
+      status.machine.runMode = -2
+      status.machine.execution = {
+        ...status.machine.execution,
+        executionSequence: status.machine.execution.executionSequence + 1,
+        state: "paused",
+        pauseReason: "input-sequence",
+        breakpoint: null,
+        memoryWrite: null,
+      }
+      result = {
+        outcome: "completed",
+        completedPhases: command.payload.phases.length,
+        failurePhase: null,
+        keyDeliveries: command.payload.phases.map((phase, index) => ({
+          phase: index,
+          predicateMatchCycle: phase.when ? 0 : null,
+          matchedBytes: phase.when ? (phase.when.all ?? [phase.when]).map(p => p.bytes) : [],
+          keyConsumptionCycles: Array.from(phase.keys, () => 1),
+          outcome: "completed",
+          keysDelivered: phase.keys.length,
+          keyMayHaveBeenObserved: false,
+        })),
+        cyclesElapsed: 100,
+        status: snapshotStatus(),
+      }
+    } else if (command.action === "cancelInputSequence") {
+      result = {cancelled: false, status: snapshotStatus()}
     }
     const reply = await postJson("/api/client/reply", {
       clientId,

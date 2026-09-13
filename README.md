@@ -147,6 +147,23 @@ caller-owned debugger entries remain unchanged, and session shutdown removes
 the baseline. Large hard-drive bytes are retained from the current mounted
 media rather than copied into the snapshot.
 
+`run_input_sequence` keeps execution continuous while it waits for up to 16
+ordered memory conditions and sends each phase's discrete keys. A phase may
+omit `when` to send its keys immediately. Conditions compare 1-32 active,
+main, or auxiliary bytes and may supply a same-length mask. A required final
+condition ends the sequence; completion, timeout, cancellation, or another
+execution stop pauses the emulator and returns the final execution state. Set
+`startExecution` to arm the sequence before resuming a paused emulator.
+
+Use `{all: [predicate, ...]}` to require up to eight non-nested predicates at
+the same instruction boundary. Each delivery reports `predicateMatchCycle`
+(`null` for an immediate phase), `matchedBytes` in predicate order, and
+`keyConsumptionCycles` in key order. These are absolute emulated cycles at
+instruction boundaries, not wall-clock times. Timeout receipts distinguish
+`condition` from `key_consumption` and include the pending condition's actual
+bytes. Key consumption does not mean action completion; choose a final
+condition that establishes the intended result.
+
 ### Server Docs URLs
 
 - OpenAPI: `/openapi.json`

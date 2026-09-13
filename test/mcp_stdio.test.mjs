@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url"
 import test from "node:test"
 
 import { Apple2tsCore } from "../server/mcp_stdio.mjs"
+import { validateConditionalInputRequest, validateConditionalInputResult } from "../server/input_sequence.mjs"
 import {
   resolveBrowserBuildDir,
   startApple2tsServer,
@@ -453,6 +454,60 @@ test("private bridge binds one renderer and rejects forged replies", async (t) =
     },
   })
   assert.equal((await invalidResultRequest).status, 400)
+  const conditionalRequest = {
+    phases: [{keys: "A"}],
+    final: {address: 0x09C0, space: "main", bytes: [27]},
+    timeoutMs: 5000,
+    startExecution: true,
+  }
+  const conditionalResponse = fetch(new URL("/api/private/input/conditional-sequence", listener.url), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${controllerToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(conditionalRequest),
+  })
+  const conditionalCommand = await renderer.nextCommand()
+  assert.equal(conditionalCommand.action, "runInputSequence")
+  assert.deepEqual(conditionalCommand.payload, conditionalRequest)
+  await renderer.reply(conditionalCommand, {
+    result: {
+      outcome: "completed",
+      completedPhases: 1,
+      failurePhase: null,
+      keyDeliveries: [
+        {...{phase: 0, outcome: "completed", keysDelivered: 1, keyMayHaveBeenObserved: false},
+          predicateMatchCycle: null, matchedBytes: [], keyConsumptionCycles: [1]},
+      ],
+      cyclesElapsed: 100,
+      status: {
+        ...statusFixture,
+        machine: {
+          ...statusFixture.machine,
+          execution: {...statusFixture.machine.execution, pauseReason: "input-sequence"},
+        },
+      },
+    },
+  })
+  assert.equal((await conditionalResponse).status, 200)
+
+  for (const body of [
+    {...conditionalRequest, phases: []},
+    {...conditionalRequest, final: {...conditionalRequest.final, address: 65535, bytes: [1, 2]}},
+    {...conditionalRequest, final: {...conditionalRequest.final, mask: [255, 255]}},
+    {...conditionalRequest, startExecution: "yes"},
+  ]) {
+    const response = await fetch(new URL("/api/private/input/conditional-sequence", listener.url), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${controllerToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    })
+    assert.equal(response.status, 400)
+  }
 })
 
 test("private renderer reconnect cancels definitive disconnect", async (t) => {
@@ -1847,6 +1902,205 @@ const executionSnapshot = (sequence, state, overrides = {}) => ({
   ...overrides,
 })
 
+const conditionalResult = (outcome = "completed") => ({
+  outcome,
+  completedPhases: outcome === "completed" ? 1 : 0,
+  failurePhase: outcome === "completed" ? null : 0,
+  keyDeliveries: outcome === "completed"
+    ? [{...{phase: 0, outcome: "completed", keysDelivered: 1, keyMayHaveBeenObserved: false},
+      predicateMatchCycle: null, matchedBytes: [], keyConsumptionCycles: [1]}]
+    : [],
+  cyclesElapsed: 20,
+  status: {
+    statusSequence: 2,
+    machine: {execution: executionSnapshot(2, "paused", {pauseReason: "input-sequence"})},
+  },
+})
+
+test("conditional input preserves its bounded worker receipt", async () => {
+  const core = new Apple2tsCore(
+    "http://unused.invalid",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  const input = {
+    phases: [{keys: "A"}],
+    final: {address: 0x0200, space: "main", bytes: [1]},
+    timeoutMs: 5000,
+  }
+  core.request = async (pathname, options, _signal, timeoutMs) => {
+    assert.equal(pathname, "/api/private/input/conditional-sequence")
+    assert.deepEqual(options.body, input)
+    assert.equal(timeoutMs, 6000)
+    return {emulator: core.identity, state: conditionalResult()}
+  }
+
+  const result = await core.runInputSequence(input)
+  assert.deepEqual(result.value, {
+    outcome: "completed",
+    completedPhases: 1,
+    failurePhase: null,
+    keyDeliveries: [
+      {...{phase: 0, outcome: "completed", keysDelivered: 1, keyMayHaveBeenObserved: false},
+        predicateMatchCycle: null, matchedBytes: [], keyConsumptionCycles: [1]},
+    ],
+    cyclesElapsed: 20,
+    execution: executionSnapshot(2, "paused", {pauseReason: "input-sequence"}),
+  })
+})
+
+test("conditional evidence validates compound matches and timeout stages", () => {
+  const predicate = {address: 0x0200, space: "main", bytes: [1], mask: [15]}
+  const input = validateConditionalInputRequest({
+    phases: [{when: {all: [predicate, {...predicate, address: 0x0300}]}, keys: "A"}],
+    final: predicate, timeoutMs: 100,
+  })
+  const result = conditionalResult()
+  Object.assign(result.keyDeliveries[0], {
+    predicateMatchCycle: 10, matchedBytes: [[17], [1]], keyConsumptionCycles: [12],
+  })
+  assert.equal(validateConditionalInputResult(result, input), result)
+  const timedOut = {...conditionalResult("timeout"),
+    timeout: {waitingFor: "condition", actualBytes: [[0], [1]]}}
+  assert.equal(validateConditionalInputResult(timedOut, input), timedOut)
+  assert.throws(() => validateConditionalInputResult({...timedOut,
+    timeout: {...timedOut.timeout, waitingFor: "key_consumption"}}, input), /Invalid conditional/)
+  for (const evidence of [
+    {matchedBytes: [[1]]}, {matchedBytes: [[2], [1]]},
+    {keyConsumptionCycles: [9]}, {keyConsumptionCycles: []},
+  ]) {
+    assert.throws(() => validateConditionalInputResult({...result,
+      keyDeliveries: [{...result.keyDeliveries[0], ...evidence}]}, input), /Invalid conditional/)
+  }
+  for (const all of [[], Array(9).fill(predicate), [{all: [predicate]}]]) {
+    assert.throws(() => validateConditionalInputRequest({...input, final: {all}}), /all|nested/)
+  }
+})
+
+test("conditional input rejects impossible key-delivery receipts", async () => {
+  const core = new Apple2tsCore(
+    "http://unused.invalid",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  const input = {
+    phases: [{keys: "A"}, {keys: "Z"}],
+    final: {address: 0x0200, space: "main", bytes: [1]},
+    timeoutMs: 5000,
+  }
+  core.request = async () => ({
+    emulator: core.identity,
+    state: {
+      ...conditionalResult("timeout"),
+      completedPhases: 1,
+      failurePhase: 1,
+      keyDeliveries: [
+        {phase: 0, outcome: "timeout", keysDelivered: 0, keyMayHaveBeenObserved: false},
+        {phase: 1, outcome: "completed", keysDelivered: 1, keyMayHaveBeenObserved: false},
+      ],
+    },
+  })
+
+  await assert.rejects(core.runInputSequence(input), /Invalid conditional input result/)
+})
+
+test("confirmed conditional-input cancellation leaves later mutations usable", async () => {
+  const core = new Apple2tsCore(
+    "http://unused.invalid",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  const controller = new AbortController()
+  let finishSequence
+  let sequenceStarted
+  const started = new Promise((resolve) => { sequenceStarted = resolve })
+  core.request = async (pathname) => {
+    if (pathname === "/api/private/input/conditional-sequence") {
+      sequenceStarted()
+      return new Promise((resolve) => { finishSequence = resolve })
+    }
+    if (pathname === "/api/private/input/conditional-sequence/cancel") {
+      finishSequence({emulator: core.identity, state: conditionalResult("cancelled")})
+      return {emulator: core.identity, state: {cancelled: true}}
+    }
+    return {emulator: core.identity, state: {runMode: "paused", speedMode: 0}}
+  }
+  const operation = core.runInputSequence({
+    phases: [{keys: "A"}],
+    final: {address: 0x0200, space: "main", bytes: [1]},
+    timeoutMs: 5000,
+  }, controller.signal)
+  await started
+  controller.abort(new Error("test cancellation"))
+
+  await assert.rejects(operation, /test cancellation/)
+  await assert.doesNotReject(core.setSpeed(0))
+})
+
+test("conditional input preserves a held key when the worker reports input contention", async () => {
+  const core = new Apple2tsCore(
+    "http://unused.invalid",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  const requests = []
+  core.heldKey = "J"
+  core.request = async (pathname, options) => {
+    requests.push(pathname)
+    assert.equal(pathname, "/api/private/input/conditional-sequence")
+    assert.deepEqual(options.body.phases, [{keys: "A"}])
+    return {
+      emulator: core.identity,
+      state: {
+        ...conditionalResult("input_busy"),
+        status: {
+          statusSequence: 2,
+          machine: {execution: executionSnapshot(2, "running")},
+        },
+      },
+    }
+  }
+
+  const result = await core.runInputSequence({
+    phases: [{keys: "A"}],
+    final: {address: 0x0200, space: "main", bytes: [1]},
+    timeoutMs: 5000,
+  })
+
+  assert.equal(result.value.outcome, "input_busy")
+  assert.equal(core.heldKey, "J")
+  assert.deepEqual(requests, ["/api/private/input/conditional-sequence"])
+})
+
+test("conditional input contains a cancellation failure during session loss", async () => {
+  const core = new Apple2tsCore(
+    "http://unused.invalid",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  const controller = new AbortController()
+  let failSequence
+  let sequenceStarted
+  const started = new Promise((resolve) => { sequenceStarted = resolve })
+  core.request = async (pathname) => {
+    if (pathname.endsWith("/cancel")) throw new Error("renderer closed during cancellation")
+    sequenceStarted()
+    return new Promise((_resolve, reject) => { failSequence = reject })
+  }
+
+  const operation = core.runInputSequence({
+    phases: [{keys: "A"}],
+    final: {address: 0x0200, space: "main", bytes: [1]},
+    timeoutMs: 5000,
+  }, controller.signal)
+  await started
+  controller.abort(new Error("test cancellation"))
+  await new Promise((resolve) => setImmediate(resolve))
+  failSequence(new Error("renderer session closed"))
+
+  await assert.rejects(operation, /renderer session closed/)
+})
+
 test("execution waiters are bounded, cancellable, nonblocking, and lost-wakeup safe", async () => {
   const core = new Apple2tsCore(
     "http://unused.invalid",
@@ -2014,6 +2268,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
       "prepare_load_binary",
       "set_keyboard_key",
       "send_keys",
+      "run_input_sequence",
       "eject_disk",
       "boot",
       "reset",
@@ -2138,6 +2393,14 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.deepEqual(setBreakpointTool.outputSchema.properties.value.properties.kind.enum, ["address"])
   assert.deepEqual(setBreakpointTool.outputSchema.properties.value.properties.behavior.enum, ["pause"])
   assert.equal(setBreakpointTool.outputSchema.properties.value.properties.enabled.type, "boolean")
+  const conditionalInputTool = tools.result.tools.find((tool) => tool.name === "run_input_sequence")
+  assert.equal(conditionalInputTool.inputSchema.properties.phases.maxItems, 16)
+  assert.equal(conditionalInputTool.inputSchema.properties.final.oneOf[0].properties.bytes.maxItems, 32)
+  assert.equal(conditionalInputTool.inputSchema.properties.final.oneOf[1].properties.all.maxItems, 8)
+  assert.equal(conditionalInputTool.outputSchema.properties.value.properties.keyDeliveries.maxItems, 16)
+  assert.equal(conditionalInputTool.inputSchema.properties.startExecution.type, "boolean")
+  assert.match(conditionalInputTool.description, /arm the sequence before resuming/)
+  assert.match(conditionalInputTool.description, /Key consumption is not action completion/)
   const clearBreakpointTool = tools.result.tools.find((tool) => tool.name === "clear_breakpoint")
   assert.deepEqual(clearBreakpointTool.inputSchema, {
     type: "object",
@@ -2580,6 +2843,14 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     value: {outcome: "completed", keysDelivered: 3, keyMayHaveBeenObserved: false},
   })
 
+  const conditional = await callTool("conditional", "run_input_sequence", {
+    phases: [{keys: "A"}],
+    final: {address: 0x0200, space: "main", bytes: [1]},
+    timeoutMs: 5000,
+  })
+  assert.equal(conditional.value.outcome, "completed")
+  assert.equal(conditional.value.execution.pauseReason, "input-sequence")
+
   assert.equal((await callTool(24, "set_keyboard_key", { key: "j" })).value.heldKey, "j")
   assert.equal((await callTool(25, "set_keyboard_key", { key: "j", repeat: true })).value.heldKey, "j")
   assert.equal((await callTool(26, "set_keyboard_key", { key: "l" })).value.heldKey, "l")
@@ -2954,6 +3225,7 @@ test("real renderer exercises memory, execution, input, and session snapshots", 
 
   const processState = await launchMcp({
     APPLE2TS_CHROMIUM_EXECUTABLE: process.env.APPLE2TS_REAL_CHROMIUM_EXECUTABLE,
+    APPLE2TS_CHROMIUM_MODE: process.env.APPLE2TS_REAL_CHROMIUM_MODE || "headless",
     APPLE2TS_DIST_DIR: process.env.APPLE2TS_REAL_DIST_DIR,
     APPLE2TS_STARTUP_TIMEOUT_MS: "10000",
     TMPDIR: chromiumTempRoot,
@@ -3153,6 +3425,54 @@ test("real renderer exercises memory, execution, input, and session snapshots", 
     space: "main",
   })
   assert.deepEqual(received.result.structuredContent.value.bytes, [0xC1, 0xDA, 0x8D])
+
+  await call("real-conditional-speed", "set_speed", {speed: 0})
+  await call("real-conditional-program", "write_memory", {
+    address: 0x6100,
+    bytes: [
+      0xA9, 0x01, 0x8D, 0x00, 0x02, // LDA #1; STA $0200
+      0xAD, 0x00, 0xC0, 0x10, 0xFB, // wait1: LDA $C000; BPL wait1
+      0x8D, 0x10, 0x02, 0xAD, 0x10, 0xC0, // STA $0210; LDA $C010
+      0xA9, 0x02, 0x8D, 0x01, 0x02, // LDA #2; STA $0201
+      0xAD, 0x00, 0xC0, 0x10, 0xFB, // wait2: LDA $C000; BPL wait2
+      0x8D, 0x11, 0x02, 0xAD, 0x10, 0xC0, // STA $0211; LDA $C010
+      0xA9, 0x03, 0x8D, 0x02, 0x02, // LDA #3; STA $0202
+      0x4C, 0x25, 0x61, // done: JMP done
+    ],
+  })
+  await call("real-conditional-cpu", "set_cpu", {PC: 0x6100})
+  const pausedExecution = await readExecution("real-conditional-paused")
+  const conditionalRun = await call("real-conditional-input", "run_input_sequence", {
+    phases: [
+      {when: {address: 0x0200, space: "main", bytes: [1]}, keys: "A"},
+      {when: {all: [
+        {address: 0x0201, space: "main", bytes: [2]},
+        {address: 0x0210, space: "main", bytes: [0xC1]},
+      ]}, keys: "Z"},
+    ],
+    final: {address: 0x0202, space: "main", bytes: [3]},
+    timeoutMs: 2000,
+    startExecution: true,
+  })
+  assert.equal(conditionalRun.result.structuredContent.value.outcome, "completed")
+  const deliveries = conditionalRun.result.structuredContent.value.keyDeliveries
+  assert.deepEqual(deliveries.map(d => d.matchedBytes), [[[1]], [[2], [0xC1]]])
+  for (const delivery of deliveries) {
+    assert.equal(delivery.keyConsumptionCycles.length, 1)
+    assert.ok(delivery.keyConsumptionCycles[0] > delivery.predicateMatchCycle)
+  }
+  assert.ok(deliveries[1].predicateMatchCycle >= deliveries[0].keyConsumptionCycles[0])
+  assert.equal(
+    conditionalRun.result.structuredContent.value.execution.executionSequence,
+    pausedExecution.state.executionSequence + 2,
+  )
+  assert.equal(conditionalRun.result.structuredContent.value.execution.pauseReason, "input-sequence")
+  const conditionalKeys = await call("real-conditional-memory", "read_memory", {
+    address: 0x0210,
+    length: 2,
+    space: "main",
+  })
+  assert.deepEqual(conditionalKeys.result.structuredContent.value.bytes, [0xC1, 0xDA])
 
   processState.child.stdin.end()
   assert.deepEqual(await processState.waitForExit(), { code: 0, signal: null, error: null })
