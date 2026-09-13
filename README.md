@@ -169,9 +169,23 @@ condition that establishes the intended result.
 Use a versioned local installation when MCP clients should not depend on a
 development checkout. The installer is independent of the MCP host and model.
 It requires Node.js 24+, npm 11+, and Git. Installation and activation target
-macOS and Linux; Windows is not supported yet.
+macOS and Linux. On Windows, commands exit with an unsupported-platform error
+before making changes; `--help` remains available.
 
-From this repository, assemble clean, committed server and browser sources:
+For a source pair already known to be compatible, install and activate it in
+one command:
+
+```bash
+npm run --silent runtime -- install --server /path/to/apple2ts-server \
+  --browser /path/to/apple2ts --id release-1
+```
+
+This assembles, verifies the files, and activates the build. It does not run
+emulator acceptance automatically. If activation fails, the completed build
+remains available for a later `activate` command; the previous selection is
+unchanged.
+
+To test a new candidate before activation, keep the steps separate:
 
 ```bash
 npm run --silent runtime -- assemble --server /path/to/apple2ts-server \
@@ -185,7 +199,10 @@ source: that build script executes with the installer's permissions. The
 result contains its own server dependencies and browser assets, plus a
 `manifest.json` recording both commits and file hashes. Verification detects
 accidental changes; the manifest is not a signature or an authorization boundary.
-The install root defaults to `~/.local/share/apple2ts` when omitted.
+The default root is `~/Library/Application Support/Apple2TS` on macOS.
+On Linux it is `$XDG_DATA_HOME/apple2ts`, falling back to
+`~/.local/share/apple2ts` when that variable is empty or not absolute.
+Use `--root` to choose another location; use the same root for later commands.
 
 Before activation, test `builds/candidate-1/bin/apple2ts-mcp.mjs` directly with
 your MCP client and Chrome configuration. Verify the tools your workflow needs

@@ -1,11 +1,12 @@
 import assert from "node:assert/strict"
 import {execFileSync, spawn} from "node:child_process"
 import {once} from "node:events"
-import {mkdtemp, mkdir, readdir, rm, symlink, writeFile} from "node:fs/promises"
+import {lstat, mkdtemp, mkdir, readdir, rm, symlink, writeFile} from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import {fileURLToPath} from "node:url"
 import test from "node:test"
+import {defaultInstallRoot, main} from "../scripts/runtime-install.mjs"
 
 const installer = fileURLToPath(new URL("../scripts/runtime-install.mjs", import.meta.url))
 const invoke = (args) => new Promise((resolve) => {
@@ -70,11 +71,10 @@ process.stdin.on("data", () => process.stdout.write(fs.readFileSync(process.env.
   assert.notEqual((await assemble("dirty")).code, 0)
   git(browser, "add", "build.mjs")
   git(browser, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", "second build")
-  const second = await assemble("B")
+  const second = await command("install", "B", ["--server", server, "--browser", browser])
   assert.equal(second.code, 0, second.stderr)
-  const activation = await command("activate", "B")
-  assert.equal(activation.code, 0, activation.stderr)
-  assert.equal(JSON.parse(activation.stdout).previous, "builds/A")
+  assert.equal(JSON.parse(second.stdout).operation, "install")
+  assert.equal(JSON.parse(second.stdout).previous, "builds/A")
   assert.equal(await probe(), "A", "live process must retain its old browser")
   assert.equal(execFileSync(process.execPath, [launcher], {input: "probe\n", encoding: "utf8"}).trim(), "B")
   assert.equal((await command("activate", "A")).code, 0)
@@ -98,6 +98,10 @@ process.stdin.on("data", () => process.stdout.write(fs.readFileSync(process.env.
   await rm(path.join(root, "current"), {recursive: true})
   await symlink("../unrelated", path.join(root, "current"))
   assert.notEqual((await command("activate", "A")).code, 0, "must preserve unrelated current link")
+  const partial = await command("install", "C", ["--server", server, "--browser", browser])
+  assert.equal(partial.code, 1)
+  assert.match(partial.stderr, /assembled but not activated/)
+  assert.equal((await command("verify", "C")).code, 0, "completed build retained for recovery")
 })
 
 test("failed and interrupted assembly leave no candidate or activation", {timeout: 30_000, skip: process.platform === "win32"}, async (t) => {
@@ -133,4 +137,22 @@ test("help and malformed command discovery", async () => {
   assert.match((await invoke(["--help"])).stdout, /assemble.*--server/)
   assert.equal((await invoke(["delete", "--id", "A"])).code, 1)
   assert.equal((await invoke(["activate", "--id", "A", "--id", "B"])).code, 1)
+})
+
+test("platform defaults and Windows refusal before filesystem changes", async (t) => {
+  assert.equal(defaultInstallRoot("darwin", "/home/user", {}), path.join("/home/user", "Library/Application Support/Apple2TS"))
+  assert.equal(defaultInstallRoot("linux", "/home/user", {}), path.join("/home/user", ".local/share/apple2ts"))
+  assert.equal(defaultInstallRoot("linux", "/home/user", {XDG_DATA_HOME: "/data"}), path.join("/data", "apple2ts"))
+  assert.equal(defaultInstallRoot("linux", "/home/user", {XDG_DATA_HOME: "relative"}), path.join("/home/user", ".local/share/apple2ts"))
+  const scratch = await mkdtemp(path.join(os.tmpdir(), "apple2ts-install-windows-"))
+  t.after(() => rm(scratch, {recursive: true, force: true}))
+  const root = path.join(scratch, "must-not-exist")
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform")
+  try {
+    Object.defineProperty(process, "platform", {value: "win32"})
+    for (const command of ["install", "assemble", "verify", "activate"]) {
+      await assert.rejects(main([command, "--root", root, "--id", "A"]), /not supported on Windows.*No changes/)
+    }
+  } finally { Object.defineProperty(process, "platform", descriptor) }
+  await assert.rejects(lstat(root), {code: "ENOENT"})
 })

@@ -7,17 +7,25 @@ import path from "node:path"
 import {fileURLToPath} from "node:url"
 
 const help = `Apple2TS local runtime installation (macOS/Linux, Node 24+, npm, Git)
+  install --server CHECKOUT --browser CHECKOUT --id NAME [--root DIRECTORY]
   assemble --server CHECKOUT --browser CHECKOUT --id NAME [--root DIRECTORY]
   verify --id NAME [--root DIRECTORY]
   activate --id NAME [--root DIRECTORY]
 
-Default root: ~/.local/share/apple2ts
+Default root: ~/Library/Application Support/Apple2TS on macOS;
+  $XDG_DATA_HOME/apple2ts or ~/.local/share/apple2ts on Linux.
+Install assembles, verifies, and activates a matched source pair in one command.
 Assemble builds committed HEADs, installs locked dependencies, and does not activate.
-Verify checks recorded contents, not emulator compatibility. Run private MCP acceptance
-before activation. Activate also verifies; use it with an older ID to roll back.
+Verify checks recorded contents, not emulator compatibility. Use assemble for candidates
+needing emulator acceptance before activation. Activate also verifies; use it to roll back.
 No command edits MCP configuration, stops sessions, or removes previous builds.
 Success prints a JSON receipt to stdout; build output and errors go to stderr.
+Windows: --help works; installation commands exit 1 without making changes.
 `
+
+export const defaultInstallRoot = (platform = process.platform, home = os.homedir(), env = process.env) =>
+  platform === "darwin" ? path.join(home, "Library", "Application Support", "Apple2TS")
+    : path.join(env.XDG_DATA_HOME && path.isAbsolute(env.XDG_DATA_HOME) ? env.XDG_DATA_HOME : path.join(home, ".local/share"), "apple2ts")
 
 const interrupted = new AbortController()
 const run = (command, args, cwd) => new Promise((resolve, reject) => {
@@ -165,25 +173,30 @@ async function activate(root, id) {
 
 export async function main(args) {
   if (!args.length || args.includes("--help")) { process.stdout.write(help); return }
-  if (process.platform === "win32") throw new Error("Installation activation and cleanup are not yet validated on Windows")
+  if (process.platform === "win32") throw new Error("Apple2TS runtime installation is not supported on Windows yet. No changes were made.")
   const [command, ...rest] = args
-  if (!["assemble", "verify", "activate"].includes(command)) throw new Error("Unknown command; use --help")
+  if (!["install", "assemble", "verify", "activate"].includes(command)) throw new Error("Unknown command; use --help")
+  const builds = command === "install" || command === "assemble"
   const options = {}
   for (let i = 0; i < rest.length; i += 2) {
     const key = rest[i]
-    if (!["--root", "--id", ...(command === "assemble" ? ["--server", "--browser"] : [])].includes(key) ||
+    if (!["--root", "--id", ...(builds ? ["--server", "--browser"] : [])].includes(key) ||
         !rest[i + 1] || rest[i + 1].startsWith("--") || key in options) throw new Error("Invalid options; use --help")
     options[key] = rest[i + 1]
   }
   const id = options["--id"]
   if (!id || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/.test(id)) throw new Error("Invalid or missing build ID")
-  const requestedRoot = path.resolve(options["--root"] || path.join(os.homedir(), ".local/share/apple2ts"))
-  if (command === "assemble" && (!options["--server"] || !options["--browser"])) throw new Error("Both source checkouts are required")
-  if (command === "assemble") await mkdir(requestedRoot, {recursive: true})
+  const requestedRoot = path.resolve(options["--root"] || defaultInstallRoot())
+  if (builds && (!options["--server"] || !options["--browser"])) throw new Error("Both source checkouts are required")
+  if (builds) await mkdir(requestedRoot, {recursive: true})
   const root = await realpath(requestedRoot)
-  const result = command === "assemble"
+  let result = builds
     ? await assemble(root, id, path.resolve(options["--server"]), path.resolve(options["--browser"]))
     : command === "verify" ? await verify(root, id) : await activate(root, id)
+  if (command === "install") {
+    try { result = await activate(root, id) }
+    catch (error) { throw new Error(`Build ${id} was assembled but not activated: ${error.message}. Retry activate with this ID and root.`) }
+  }
   process.stdout.write(JSON.stringify({operation: command, ...result}) + "\n")
 }
 
