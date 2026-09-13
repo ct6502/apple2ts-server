@@ -15,15 +15,40 @@ const printReceipt = (receipt) => {
 }
 
 const readTicket = async () => {
-  let input = ""
-  for await (const chunk of process.stdin) {
-    input += chunk
-    if (input.length > 4096) throw new Error("Upload ticket input is too long")
-  }
-  if (!/^[^\r\n]+(?:\r?\n)?$/.test(input)) {
-    throw new Error("Write exactly one upload ticket line to apple2ts-upload stdin")
-  }
-  return input.trimEnd()
+  process.stdin.setEncoding("utf8")
+  return new Promise((resolve, reject) => {
+    let input = ""
+    const cleanup = () => {
+      process.stdin.off("data", onData)
+      process.stdin.off("end", onEnd)
+      process.stdin.off("error", onError)
+      process.stdin.destroy()
+    }
+    const finish = (line) => {
+      cleanup()
+      const ticket = line.replace(/\r$/, "")
+      if (ticket.length === 0) reject(new Error("Write one upload ticket line to apple2ts-upload stdin"))
+      else if (ticket.length > 4096) reject(new Error("Upload ticket input is too long"))
+      else resolve(ticket)
+    }
+    const onData = (chunk) => {
+      input += chunk
+      const newline = input.indexOf("\n")
+      if (newline >= 0) finish(input.slice(0, newline))
+      else if (input.length > 4096) {
+        cleanup()
+        reject(new Error("Upload ticket input is too long"))
+      }
+    }
+    const onEnd = () => finish(input)
+    const onError = (error) => {
+      cleanup()
+      reject(error)
+    }
+    process.stdin.on("data", onData)
+    process.stdin.once("end", onEnd)
+    process.stdin.once("error", onError)
+  })
 }
 
 if (process.argv.length === 3 && ["-h", "--help"].includes(process.argv[2])) {

@@ -19,6 +19,7 @@ import {
   stopApple2tsServer,
 } from "./server.mjs"
 import { UploadTickets } from "./upload_tickets.mjs"
+import { validateConditionalInputResult } from "./input_sequence.mjs"
 
 const SERVER_NAME = "apple2ts"
 const SERVER_VERSION = "0.1.0"
@@ -294,7 +295,7 @@ const executionSnapshotSchema = {
     state: { type: "string", enum: ["running", "paused"] },
     pauseReason: {
       type: ["string", "null"],
-      enum: [null, "idle", "explicit", "breakpoint", "watchpoint", "step", "cycle-limit"],
+      enum: [null, "idle", "explicit", "breakpoint", "watchpoint", "input-sequence", "step", "cycle-limit"],
     },
     breakpoint: {
       oneOf: [
@@ -655,6 +656,137 @@ const keySequenceOutputSchema = fromJsonSchema({
         keyMayHaveBeenObserved: { type: "boolean" },
       },
       required: ["outcome", "keysDelivered", "keyMayHaveBeenObserved"],
+      additionalProperties: false,
+    },
+  },
+  required: ["emulator", "value"],
+  additionalProperties: false,
+})
+
+const memoryPredicateSchema = {
+  type: "object",
+  properties: {
+    address: { type: "integer", minimum: 0, maximum: 65535 },
+    space: { type: "string", enum: ["active", "main", "aux"], default: "active" },
+    auxBank: { type: "integer", minimum: 0, maximum: 127 },
+    bytes: {
+      type: "array",
+      items: { type: "integer", minimum: 0, maximum: 255 },
+      minItems: 1,
+      maxItems: 32,
+    },
+    mask: {
+      type: "array",
+      description: "Optional per-byte mask; its length must match bytes.",
+      items: { type: "integer", minimum: 0, maximum: 255 },
+      minItems: 1,
+      maxItems: 32,
+    },
+  },
+  required: ["address", "bytes"],
+  additionalProperties: false,
+}
+
+const memoryConditionSchema = {oneOf: [memoryPredicateSchema, {
+  type: "object",
+  properties: {all: {type: "array", minItems: 1, maxItems: 8, items: memoryPredicateSchema}},
+  required: ["all"],
+  additionalProperties: false,
+}]}
+
+const conditionBytesSchema = {
+  type: "array", maxItems: 8,
+  items: {type: "array", minItems: 1, maxItems: 32,
+    items: {type: "integer", minimum: 0, maximum: 255}},
+}
+
+const conditionalInputSequenceInputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    phases: {
+      type: "array",
+      minItems: 1,
+      maxItems: 16,
+      items: {
+        type: "object",
+        properties: {
+          when: memoryConditionSchema,
+          keys: {
+            type: "string",
+            minLength: 1,
+            maxLength: 32,
+            pattern: "^[\\u0001-\\u00FF]+$",
+            description: "Discrete keys sent after this phase predicate matches. Omit when to send immediately.",
+          },
+        },
+        required: ["keys"],
+        additionalProperties: false,
+      },
+    },
+    final: memoryConditionSchema,
+    timeoutMs: { type: "integer", minimum: 1, maximum: 120000 },
+    startExecution: {
+      type: "boolean",
+      description: "When true, a paused emulator arms the sequence before resuming execution.",
+    },
+  },
+  required: ["phases", "final", "timeoutMs"],
+  additionalProperties: false,
+})
+
+const conditionalInputSequenceOutputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    emulator: emulatorIdentitySchema,
+    value: {
+      type: "object",
+      properties: {
+        outcome: {
+          type: "string",
+          enum: [
+            "completed", "timeout", "cancelled", "unexpected_stop",
+            "not_running", "input_busy",
+          ],
+        },
+        completedPhases: { type: "integer", minimum: 0, maximum: 16 },
+        failurePhase: { type: ["integer", "null"], minimum: 0, maximum: 16 },
+        keyDeliveries: {
+          type: "array",
+          maxItems: 16,
+          items: {
+            type: "object",
+            properties: {
+              phase: { type: "integer", minimum: 0, maximum: 15 },
+              outcome: {
+                type: "string",
+                enum: ["completed", "timeout", "interrupted", "not_running", "input_busy"],
+              },
+              keysDelivered: { type: "integer", minimum: 0, maximum: 32 },
+              keyMayHaveBeenObserved: { type: "boolean" },
+              predicateMatchCycle: {type: ["integer", "null"], minimum: 0},
+              matchedBytes: conditionBytesSchema,
+              keyConsumptionCycles: {type: "array", maxItems: 32,
+                items: {type: "integer", minimum: 0}},
+            },
+            required: ["phase", "outcome", "keysDelivered", "keyMayHaveBeenObserved",
+              "predicateMatchCycle", "matchedBytes", "keyConsumptionCycles"],
+            additionalProperties: false,
+          },
+        },
+        cyclesElapsed: { type: "integer", minimum: 0 },
+        timeout: {
+          type: "object",
+          properties: {
+            waitingFor: {type: "string", enum: ["condition", "key_consumption"]},
+            actualBytes: conditionBytesSchema,
+          },
+          required: ["waitingFor", "actualBytes"], additionalProperties: false,
+        },
+        execution: executionSnapshotSchema,
+      },
+      required: [
+        "outcome", "completedPhases", "failurePhase", "keyDeliveries", "cyclesElapsed", "execution",
+      ],
       additionalProperties: false,
     },
   },
@@ -1349,6 +1481,55 @@ export class Apple2tsCore {
     }, signal)
   }
 
+  runInputSequence(input, signal) {
+    if (signal?.aborted) return Promise.reject(signal.reason)
+    return this.serializeMutation(async () => {
+      if (signal?.aborted) {
+        throw new ConfirmedMutationRejection(signal.reason ?? new Error("Input sequence cancelled"))
+      }
+      let cancellation
+      const onAbort = () => {
+        cancellation = this.request(
+          "/api/private/input/conditional-sequence/cancel",
+          { method: "POST", body: {} },
+          this.signal,
+        ).then(
+          (value) => ({value}),
+          (error) => ({error}),
+        )
+      }
+      signal?.addEventListener("abort", onAbort, { once: true })
+      try {
+        const result = await this.request(
+          "/api/private/input/conditional-sequence",
+          { method: "POST", body: input },
+          this.signal,
+          input.timeoutMs + MUTATION_RESPONSE_MARGIN_MS,
+        )
+        if (signal?.aborted) {
+          const cancellationResult = await cancellation
+          if (cancellationResult.error) throw cancellationResult.error
+          throw new ConfirmedMutationRejection(signal.reason ?? new Error("Input sequence cancelled"))
+        }
+        const state = validateConditionalInputResult(result.state, input)
+        return {
+          emulator: result.emulator,
+          value: {
+            outcome: state.outcome,
+            completedPhases: state.completedPhases,
+            failurePhase: state.failurePhase,
+            keyDeliveries: state.keyDeliveries,
+            cyclesElapsed: state.cyclesElapsed,
+            ...(state.timeout ? {timeout: state.timeout} : {}),
+            execution: state.status.machine.execution,
+          },
+        }
+      } finally {
+        signal?.removeEventListener("abort", onAbort)
+      }
+    }, null)
+  }
+
   async releaseHeldKeyboard() {
     if (this.heldKey === null) return
     const key = this.heldKey
@@ -1699,6 +1880,16 @@ const mutationTools = [
     destructiveHint: false,
     idempotentHint: false,
     execute: (core, input, signal) => core.sendKeys(input.keys, input.timeoutMs, signal),
+  },
+  {
+    name: "run_input_sequence",
+    title: "Run conditional input sequence",
+    description: "Wait for ordered bounded memory predicates and deliver consumption-safe key sequences. Use all for up to eight non-nested predicates checked together. Set startExecution to arm the sequence before resuming a paused emulator. Key consumption is not action completion: supply an appropriate final condition. Receipts include matched bytes and instruction-boundary match/consumption cycles; timeouts identify the wait stage and actual predicate bytes. The emulator pauses only when the sequence completes, times out, is cancelled or interrupted, or encounters another execution stop.",
+    inputSchema: conditionalInputSequenceInputSchema,
+    outputSchema: conditionalInputSequenceOutputSchema,
+    destructiveHint: false,
+    idempotentHint: false,
+    execute: (core, input, signal) => core.runInputSequence(input, signal),
   },
   {
     name: "eject_disk",
