@@ -1384,6 +1384,42 @@ const server = createServer(async (req, res) => {
       return
     }
 
+    if (
+      (req.method === "PUT" || req.method === "POST")
+      && url.pathname === "/api/private/session-snapshot"
+    ) {
+      if (!privateRenderer) {
+        writeErrorEnvelope(res, 404, "NOT_FOUND", "Session snapshots require a private emulator session.")
+        return
+      }
+      const client = getConnectedClient()
+      if (!client) {
+        writeNoConnectedClientError(res)
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        if (
+          typeof body.snapshotId !== "string"
+          || !/^session-snapshot:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(body.snapshotId)
+        ) {
+          throw new Error("snapshotId is invalid")
+        }
+        const action = req.method === "PUT" ? "createSessionSnapshot" : "restoreSessionSnapshot"
+        writeEnvelope(res, 200, (await dispatchCommand(client, action, {
+          snapshotId: body.snapshotId,
+        }, true)).result)
+      } catch (error) {
+        writeErrorEnvelope(
+          res,
+          400,
+          "BAD_REQUEST",
+          error instanceof Error ? error.message : String(error),
+        )
+      }
+      return
+    }
+
     if (req.method === "GET" && url.pathname === "/api/private/memory") {
       if (!privateRenderer) {
         writeErrorEnvelope(res, 404, "NOT_FOUND", "Physical memory requires a private emulator session.")
