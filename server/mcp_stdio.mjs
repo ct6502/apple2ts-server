@@ -203,6 +203,18 @@ const sessionStopResultSchema = fromJsonSchema({
   additionalProperties: false,
 })
 
+const sessionSnapshotInputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    snapshotId: {
+      type: "string",
+      pattern: "^session-snapshot:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    },
+  },
+  required: ["snapshotId"],
+  additionalProperties: false,
+})
+
 const driveReceiptSchema = {
   type: "object",
   properties: {
@@ -322,6 +334,25 @@ const executionSnapshotSchema = {
   ],
   additionalProperties: false,
 }
+
+const sessionSnapshotResultSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    emulator: emulatorIdentitySchema,
+    value: {
+      type: "object",
+      properties: {
+        snapshotId: { type: "string" },
+        cycleCount: { type: "integer", minimum: 0 },
+        execution: executionSnapshotSchema,
+      },
+      required: ["snapshotId", "cycleCount", "execution"],
+      additionalProperties: false,
+    },
+  },
+  required: ["emulator", "value"],
+  additionalProperties: false,
+})
 
 const executionWaitInputSchema = fromJsonSchema({
   type: "object",
@@ -935,6 +966,7 @@ export class Apple2tsCore {
     this.executionWaiters = new Set()
     this.executionReaders = new Set()
     this.executionClosed = false
+    this.sessionSnapshotId = null
   }
 
   async request(pathname, options, signal = this.signal, timeoutMs) {
@@ -1087,8 +1119,75 @@ export class Apple2tsCore {
   closeExecution() {
     if (this.executionClosed) return
     this.executionClosed = true
+    this.sessionSnapshotId = null
     for (const reader of [...this.executionReaders]) reader(null)
     for (const waiter of [...this.executionWaiters]) waiter.close()
+  }
+
+  saveSessionSnapshot(signal) {
+    return this.serializeMutation(async () => {
+      const current = await this.readExecution()
+      if (current.state.state !== "paused") {
+        throw new ConfirmedMutationRejection(
+          new Error("Session snapshots can be created only while the emulator is paused"),
+        )
+      }
+      const snapshotId = `session-snapshot:${randomUUID()}`
+      this.sessionSnapshotId = null
+      const result = await this.request(
+        "/api/private/session-snapshot",
+        { method: "PUT", body: {snapshotId} },
+        signal,
+      )
+      const value = this.confirmSessionSnapshot(result, snapshotId)
+      this.sessionSnapshotId = snapshotId
+      return value
+    }, signal, {prepare: true})
+  }
+
+  restoreSessionSnapshot(snapshotId, signal) {
+    return this.serializeMutation(async (startMutation) => {
+      if (snapshotId !== this.sessionSnapshotId) {
+        throw new ConfirmedMutationRejection(new Error("Session snapshot not found"))
+      }
+      const current = await this.readExecution()
+      if (current.state.state !== "paused") {
+        throw new ConfirmedMutationRejection(
+          new Error("Session snapshots can be restored only while the emulator is paused"),
+        )
+      }
+      startMutation()
+      const result = await this.request(
+        "/api/private/session-snapshot",
+        { method: "POST", body: {snapshotId} },
+        signal,
+      )
+      return this.confirmSessionSnapshot(result, snapshotId)
+    }, signal, {prepare: true})
+  }
+
+  confirmSessionSnapshot(result, snapshotId) {
+    const receipt = result.state?.snapshot
+    const status = result.state?.status
+    const execution = status?.machine?.execution
+    if (
+      receipt?.snapshotId !== snapshotId
+      || !Number.isInteger(receipt.cycleCount)
+      || receipt.cycleCount < 0
+      || execution?.state !== "paused"
+      || !Number.isInteger(execution.executionSequence)
+    ) {
+      throw new Error("Apple2TS did not confirm the requested session snapshot")
+    }
+    this.observeExecution(status)
+    return {
+      emulator: result.emulator,
+      value: {
+        snapshotId,
+        cycleCount: receipt.cycleCount,
+        execution: structuredClone(execution),
+      },
+    }
   }
 
   readCpu() {
@@ -1541,6 +1640,26 @@ export class Apple2tsCore {
 }
 
 const mutationTools = [
+  {
+    name: "save_session_snapshot",
+    title: "Save private session snapshot",
+    description: "Save or replace the private session's paused emulator baseline. The snapshot remains inside this emulator session and is removed when the session ends.",
+    inputSchema: noInputSchema,
+    outputSchema: sessionSnapshotResultSchema,
+    destructiveHint: false,
+    idempotentHint: false,
+    execute: (core, _input, signal) => core.saveSessionSnapshot(signal),
+  },
+  {
+    name: "restore_session_snapshot",
+    title: "Restore private session snapshot",
+    description: "Restore the private session's saved baseline while the emulator is paused. This restores emulated CPU, memory, soft-switch, card, and bounded media state without changing the configured speed or caller-owned debugger entries.",
+    inputSchema: sessionSnapshotInputSchema,
+    outputSchema: sessionSnapshotResultSchema,
+    destructiveHint: true,
+    idempotentHint: false,
+    execute: (core, input, signal) => core.restoreSessionSnapshot(input.snapshotId, signal),
+  },
   {
     name: "prepare_mount_disk",
     title: "Prepare a disk mount",

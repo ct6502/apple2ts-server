@@ -574,6 +574,46 @@ test("private bridge captures the current renderer screen", async (t) => {
   })
 })
 
+test("private bridge creates and restores an identified session snapshot", async (t) => {
+  const listener = await startApple2tsServer({
+    port: 0,
+    privateRenderer: { remoteControlToken: token, rendererId, controllerToken },
+    logger: { log() {} },
+  })
+  t.after(stopApple2tsServer)
+  const renderer = await connectFakeRenderer(listener.url, { autoServe: false })
+  t.after(() => renderer.stop())
+  const snapshotId = "session-snapshot:123e4567-e89b-42d3-a456-426614174000"
+
+  for (const [method, action] of [
+    ["PUT", "createSessionSnapshot"],
+    ["POST", "restoreSessionSnapshot"],
+  ]) {
+    const responsePromise = fetch(new URL("/api/private/session-snapshot", listener.url), {
+      method,
+      headers: {
+        Authorization: `Bearer ${controllerToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({snapshotId}),
+    })
+    const command = await renderer.nextCommand()
+    assert.deepEqual({action: command.action, payload: command.payload}, {
+      action,
+      payload: {snapshotId},
+    })
+    await renderer.reply(command, {
+      result: {
+        snapshot: {snapshotId, cycleCount: 1234},
+        status: {machine: {execution: executionSnapshot(2, "paused")}},
+      },
+    })
+    const response = await responsePromise
+    assert.equal(response.status, 200)
+    assert.equal((await response.json()).data.snapshot.snapshotId, snapshotId)
+  }
+})
+
 test("private bridge rejects invalid and unavailable memory ranges", async (t) => {
   const listener = await startApple2tsServer({
     port: 0,
@@ -885,6 +925,76 @@ test("a failed mutation prevents later mutations in the same session", async (t)
   await assert.rejects(core.pause(), /uncertain mutation/)
   await assert.rejects(core.resume(), /call stop_session, then start_session/)
   assert.equal(requests, 1)
+})
+
+test("session snapshots are paused, private, replaceable baselines", async () => {
+  const core = new Apple2tsCore(
+    "http://unused.test",
+    controllerToken,
+    { serverInstanceId: "server", rendererId, targetId: "server:test-renderer" },
+  )
+  core.observeExecution(executionSnapshot(1, "paused", {PC: 0x6000}))
+  const requests = []
+  core.request = async (pathname, options) => {
+    requests.push({pathname, options})
+    const snapshotId = options.body.snapshotId
+    return {
+      emulator: core.identity,
+      state: {
+        snapshot: {snapshotId, cycleCount: 1234},
+        status: {machine: {execution: executionSnapshot(
+          options.method === "PUT" ? 1 : 2,
+          "paused",
+          {PC: 0x6000},
+        )}},
+      },
+    }
+  }
+
+  const first = await core.saveSessionSnapshot()
+  assert.match(first.value.snapshotId, /^session-snapshot:/)
+  assert.equal(first.value.cycleCount, 1234)
+  const second = await core.saveSessionSnapshot()
+  assert.notEqual(second.value.snapshotId, first.value.snapshotId)
+  await assert.rejects(
+    core.restoreSessionSnapshot(first.value.snapshotId),
+    /Session snapshot not found/,
+  )
+  assert.equal((await core.restoreSessionSnapshot(second.value.snapshotId)).value.execution.PC, 0x6000)
+  assert.deepEqual(requests.map(({pathname, options}) => [pathname, options.method]), [
+    ["/api/private/session-snapshot", "PUT"],
+    ["/api/private/session-snapshot", "PUT"],
+    ["/api/private/session-snapshot", "POST"],
+  ])
+
+  core.observeExecution(executionSnapshot(3, "running"))
+  await assert.rejects(core.saveSessionSnapshot(), /only while the emulator is paused/)
+  await assert.rejects(
+    core.restoreSessionSnapshot(second.value.snapshotId),
+    /only while the emulator is paused/,
+  )
+  assert.equal(requests.length, 3)
+
+  core.observeExecution(executionSnapshot(4, "paused"))
+  core.request = async () => {
+    throw new Error("lost snapshot response")
+  }
+  await assert.rejects(core.saveSessionSnapshot(), /lost snapshot response/)
+  await assert.rejects(
+    core.restoreSessionSnapshot(second.value.snapshotId),
+    /Session snapshot not found/,
+  )
+  core.request = async () => ({
+    emulator: core.identity,
+    state: {runMode: "paused", speedMode: 0},
+  })
+  assert.equal((await core.pause()).state.runMode, "paused")
+
+  core.closeExecution()
+  await assert.rejects(
+    core.restoreSessionSnapshot(second.value.snapshotId),
+    /Session snapshot not found/,
+  )
 })
 
 test("setBreakpoint creates and confirms pause address semantics", async () => {
@@ -1710,7 +1820,7 @@ test("write watchpoint mutations require matching worker confirmations", async (
     core.setMemoryWriteWatchpoint({address: 0x03A4, length: 4, space: "main"}),
     /did not confirm the requested memory write watchpoint/,
   )
-  await assert.rejects(core.pause(), /restart this MCP session/)
+  await assert.rejects(core.pause(), /call stop_session, then start_session/)
 
   const clearCore = new Apple2tsCore("http://unused.invalid", controllerToken, identity)
   clearCore.request = async () => ({emulator: identity, state: {cleared: "yes"}})
@@ -1898,6 +2008,8 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
       "wait_for_execution_stop",
       "capture_screen",
       "write_memory",
+      "save_session_snapshot",
+      "restore_session_snapshot",
       "prepare_mount_disk",
       "prepare_load_binary",
       "set_keyboard_key",
@@ -1974,6 +2086,16 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.match(writeMemoryTool.description, /never pauses implicitly/)
   assert.match(writeMemoryTool.description, /Completion does not verify stored bytes/)
   assert.equal(writeMemoryTool.annotations.idempotentHint, false)
+  const saveSnapshotTool = tools.result.tools.find((tool) => tool.name === "save_session_snapshot")
+  const restoreSnapshotTool = tools.result.tools.find((tool) => tool.name === "restore_session_snapshot")
+  assert.match(saveSnapshotTool.description, /Save or replace/)
+  assert.equal(saveSnapshotTool.annotations.idempotentHint, false)
+  assert.equal(restoreSnapshotTool.inputSchema.required[0], "snapshotId")
+  assert.equal(
+    restoreSnapshotTool.outputSchema.properties.value.properties.execution.properties.state.type,
+    "string",
+  )
+  assert.equal(restoreSnapshotTool.annotations.destructiveHint, true)
   const findMemoryTool = tools.result.tools.find((tool) => tool.name === "find_memory")
   assert.deepEqual(findMemoryTool.inputSchema.properties.bytes, {
     type: "array",
@@ -2759,7 +2881,7 @@ test("a timed-out write watchpoint leaves later mutations blocked", async (t) =>
     arguments: {},
   })
   assert.equal(blocked.result.isError, true)
-  assert.match(blocked.result.content[0].text, /restart this MCP session/)
+  assert.match(blocked.result.content[0].text, /call stop_session, then start_session/)
 })
 
 test("stdio cancellation aborts an execution wait without poisoning the session", async (t) => {
@@ -2811,7 +2933,7 @@ test("stdio cancellation aborts an execution wait without poisoning the session"
   assert.equal((await startMcpSession(processState, "cancel-restart")).result.isError, undefined)
 })
 
-test("real renderer searches memory and reports coherent breakpoint and write-watchpoint stops", {
+test("real renderer exercises memory, execution, input, and session snapshots", {
   skip: !process.env.APPLE2TS_REAL_CHROMIUM_EXECUTABLE || !process.env.APPLE2TS_REAL_DIST_DIR,
 }, async (t) => {
   const taskRoot = await mkdtemp(path.join(os.tmpdir(), "apple2ts-execution-acceptance-"))
@@ -2901,6 +3023,28 @@ test("real renderer searches memory and reports coherent breakpoint and write-wa
   assert.equal(truncatedSearch.value.totalMatchCount, 2)
   assert.equal(truncatedSearch.value.truncated, true)
   assert.deepEqual(await readExecution("real-after-search"), beforeSearch)
+
+  await call("real-snapshot-write-before", "write_memory", {
+    address: 0x0800,
+    bytes: [0x11, 0x22],
+  })
+  const saved = (await call("real-snapshot-save", "save_session_snapshot"))
+    .result.structuredContent
+  await call("real-snapshot-write-after", "write_memory", {
+    address: 0x0800,
+    bytes: [0xAA, 0xBB],
+  })
+  const restored = (await call("real-snapshot-restore", "restore_session_snapshot", {
+    snapshotId: saved.value.snapshotId,
+  })).result.structuredContent
+  const restoredMemory = (await call("real-snapshot-memory", "read_memory", {
+    address: 0x0800,
+    length: 2,
+    space: "main",
+  })).result.structuredContent
+  assert.deepEqual(restoredMemory.value.bytes, [0x11, 0x22])
+  assert.equal(restored.emulator.targetId, saved.emulator.targetId)
+  assert.equal(restored.value.execution.state, "paused")
 
   await call("real-resume-before-rejection", "resume")
   const runningSearch = await call("real-find-running", "find_memory", {

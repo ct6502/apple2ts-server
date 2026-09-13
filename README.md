@@ -139,6 +139,14 @@ changing execution. Pass the last observed `executionSequence` as
 `afterSequence` to avoid missing a fast stop; an unexpected breakpoint is
 returned immediately with `expectationMatched: false`.
 
+`save_session_snapshot` records one private paused baseline inside the current
+emulator. A later `restore_session_snapshot` call uses its opaque ID to restore
+the CPU, memory, soft switches, slot-card state, and media state captured by the
+worker. Saving again replaces the earlier baseline. The configured speed and
+caller-owned debugger entries remain unchanged, and session shutdown removes
+the baseline. Large hard-drive bytes are retained from the current mounted
+media rather than copied into the snapshot.
+
 ### Server Docs URLs
 
 - OpenAPI: `/openapi.json`
