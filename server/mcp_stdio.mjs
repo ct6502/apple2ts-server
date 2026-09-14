@@ -724,6 +724,18 @@ const conditionalInputSequenceInputSchema = fromJsonSchema({
       },
     },
     final: memoryConditionSchema,
+    stopConditions: {
+      type: "array", maxItems: 8,
+      description: "Named conditions checked throughout execution, including key delivery. First match in list order stops before further input or success. Names must be unique. The caller decides how to recover.",
+      items: {
+        type: "object",
+        properties: {
+          name: {type: "string", minLength: 1, maxLength: 64, pattern: "^[A-Za-z0-9_-]+$"},
+          when: memoryConditionSchema,
+        },
+        required: ["name", "when"], additionalProperties: false,
+      },
+    },
     timeoutMs: { type: "integer", minimum: 1, maximum: 120000 },
     startExecution: {
       type: "boolean",
@@ -746,6 +758,7 @@ const conditionalInputSequenceOutputSchema = fromJsonSchema({
           enum: [
             "completed", "timeout", "cancelled", "unexpected_stop",
             "not_running", "input_busy",
+            "condition_triggered",
           ],
         },
         completedPhases: { type: "integer", minimum: 0, maximum: 16 },
@@ -774,6 +787,15 @@ const conditionalInputSequenceOutputSchema = fromJsonSchema({
           },
         },
         cyclesElapsed: { type: "integer", minimum: 0 },
+        stopCondition: {
+          type: "object",
+          properties: {
+            name: {type: "string", minLength: 1, maxLength: 64, pattern: "^[A-Za-z0-9_-]+$"},
+            matchedBytes: conditionBytesSchema,
+          },
+          required: ["name", "matchedBytes"], additionalProperties: false,
+        },
+        stopConditionsArmed: {type: "integer", minimum: 1, maximum: 8},
         timeout: {
           type: "object",
           properties: {
@@ -1521,6 +1543,8 @@ export class Apple2tsCore {
             keyDeliveries: state.keyDeliveries,
             cyclesElapsed: state.cyclesElapsed,
             ...(state.timeout ? {timeout: state.timeout} : {}),
+            ...(state.stopCondition ? {stopCondition: state.stopCondition} : {}),
+            ...(state.stopConditionsArmed ? {stopConditionsArmed: state.stopConditionsArmed} : {}),
             execution: state.status.machine.execution,
           },
         }
@@ -1884,7 +1908,7 @@ const mutationTools = [
   {
     name: "run_input_sequence",
     title: "Run conditional input sequence",
-    description: "Wait for ordered bounded memory predicates and deliver consumption-safe key sequences. Use all for up to eight non-nested predicates checked together. Set startExecution to arm the sequence before resuming a paused emulator. Key consumption is not action completion: supply an appropriate final condition. Receipts include matched bytes and instruction-boundary match/consumption cycles; timeouts identify the wait stage and actual predicate bytes. The emulator pauses only when the sequence completes, times out, is cancelled or interrupted, or encounters another execution stop.",
+    description: "Wait for ordered bounded memory predicates and deliver consumption-safe key sequences. Use all for up to eight non-nested predicates checked together. Set startExecution to arm the sequence before resuming a paused emulator. Key consumption is not action completion: supply an appropriate final condition. Optional stopConditions pause early on a named memory match and report its actual bytes; the caller decides how to recover. Receipts include matched bytes and instruction-boundary match/consumption cycles; timeouts identify the wait stage and actual predicate bytes. The emulator pauses when the sequence completes, a stop condition matches, it times out, is cancelled or interrupted, or encounters another execution stop.",
     inputSchema: conditionalInputSequenceInputSchema,
     outputSchema: conditionalInputSequenceOutputSchema,
     destructiveHint: false,
