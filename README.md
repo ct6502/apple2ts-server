@@ -164,6 +164,87 @@ instruction boundaries, not wall-clock times. Timeout receipts distinguish
 bytes. Key consumption does not mean action completion; choose a final
 condition that establishes the intended result.
 
+### Install a matched runtime
+
+Use a versioned local installation when MCP clients should not depend on a
+development checkout. The installer is independent of the MCP host and model.
+It requires Node.js 24+, npm 11+, and Git. Installation and activation target
+macOS and Linux. On Windows, commands exit with an unsupported-platform error
+before making changes; `--help` remains available.
+
+For a source pair already known to be compatible, install and activate it in
+one command:
+
+```bash
+npm run --silent runtime -- install --server /path/to/apple2ts-server \
+  --browser /path/to/apple2ts --id release-1
+```
+
+This assembles, verifies the files, and activates the build. It does not run
+emulator acceptance automatically. If activation fails, the completed build
+remains available for a later `activate` command; the previous selection is
+unchanged.
+
+To test a new candidate before activation, keep the steps separate:
+
+```bash
+npm run --silent runtime -- assemble --server /path/to/apple2ts-server \
+  --browser /path/to/apple2ts --id candidate-1 --install-dir /path/to/install
+npm run --silent runtime -- verify --id candidate-1 --install-dir /path/to/install
+```
+
+Assembly exports both HEAD commits without changing the source checkouts,
+installs locked dependencies, and runs the browser's build script. Use trusted
+source: that build script executes with the installer's permissions. The
+result contains its own server dependencies and browser assets, plus a
+`manifest.json` recording both commits and file hashes. Verification detects
+accidental changes; the manifest is not a signature or an authorization boundary.
+The default installation directory is `~/Library/Application Support/Apple2TS` on macOS.
+On Linux it is `$XDG_DATA_HOME/apple2ts`, falling back to
+`~/.local/share/apple2ts` when that variable is empty or not absolute.
+Use `--install-dir` to choose another location; use the same directory for later commands.
+
+Before activation, test `builds/candidate-1/bin/apple2ts-mcp.mjs` directly with
+your MCP client and Chrome configuration. Verify the tools your workflow needs
+and an isolated emulator's normal shutdown. The `verify` command checks file
+integrity, not compatibility between arbitrary server and browser revisions.
+The repository's opt-in synthetic acceptance can exercise the installed entry
+points without private media:
+
+```bash
+APPLE2TS_REAL_CHROMIUM_EXECUTABLE=/path/to/chrome \
+APPLE2TS_REAL_DIST_DIR=/path/to/install/builds/candidate-1/browser \
+APPLE2TS_REAL_MCP_ENTRY=/path/to/install/builds/candidate-1/bin/apple2ts-mcp.mjs \
+APPLE2TS_REAL_UPLOAD_ENTRY=/path/to/install/builds/candidate-1/bin/apple2ts-upload.mjs \
+node --test --test-name-pattern='real renderer exercises' test/mcp_stdio.test.mjs
+```
+
+After acceptance:
+
+```bash
+npm run --silent runtime -- activate --id candidate-1 --install-dir /path/to/install
+```
+
+Configure any stdio MCP host once with command `node`, argument
+`/path/to/install/current/bin/apple2ts-mcp.mjs`, and the existing
+`APPLE2TS_CHROMIUM_EXECUTABLE` environment setting. Do not configure a separate
+`APPLE2TS_DIST_DIR`: the launcher pins it to the selected installation.
+The matching upload helper is `node /path/to/install/current/bin/apple2ts-upload.mjs`.
+Keep private session data outside the installation, using the MCP server's
+existing temporary storage defaults.
+
+Activation atomically replaces `current`; existing MCP processes retain both
+their server and browser version. New processes use the selected build. Hosts
+may need to reconnect their MCP client to see an update. Run `activate` with
+the previous ID to roll back. Existing checkout-based commands remain valid.
+
+Installations are retained and must not be edited in place. Run one installer
+at a time. Failed assembly removes its private intermediate directory, and
+SIGINT/SIGTERM stop its build processes before cleanup. SIGKILL or power loss
+can leave a `.assemble-*` directory; inspect ownership before removing it.
+The installer never prunes builds, stops emulator sessions, or edits host
+configuration. Retain old builds until their MCP processes have exited.
+
 ### Server Docs URLs
 
 - OpenAPI: `/openapi.json`
