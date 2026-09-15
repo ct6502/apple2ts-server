@@ -605,20 +605,22 @@ const memorySearchOutputSchema = fromJsonSchema({
   additionalProperties: false,
 })
 
+const screenImageSchema = {
+  type: "object",
+  properties: {
+    mimeType: { type: "string", enum: ["image/png"] },
+    width: { type: "integer", minimum: 1 },
+    height: { type: "integer", minimum: 1 },
+  },
+  required: ["mimeType", "width", "height"],
+  additionalProperties: false,
+}
+
 const screenCaptureOutputSchema = fromJsonSchema({
   type: "object",
   properties: {
     emulator: emulatorIdentitySchema,
-    image: {
-      type: "object",
-      properties: {
-        mimeType: { type: "string", enum: ["image/png"] },
-        width: { type: "integer", minimum: 1 },
-        height: { type: "integer", minimum: 1 },
-      },
-      required: ["mimeType", "width", "height"],
-      additionalProperties: false,
-    },
+    image: screenImageSchema,
   },
   required: ["emulator", "image"],
   additionalProperties: false,
@@ -703,6 +705,10 @@ const conditionBytesSchema = {
 const conditionalInputSequenceInputSchema = fromJsonSchema({
   type: "object",
   properties: {
+    captureScreen: {
+      type: "boolean",
+      description: "When true, append a best-effort rendered screen after the terminal receipt, with a separate two-second read budget. This is not an exact cycle-aligned image. Capture failure or cancellation preserves the sequence receipt.",
+    },
     phases: {
       type: "array",
       minItems: 1,
@@ -750,6 +756,23 @@ const conditionalInputSequenceOutputSchema = fromJsonSchema({
   type: "object",
   properties: {
     emulator: emulatorIdentitySchema,
+    capture: {
+      oneOf: [
+        {
+          type: "object",
+          properties: {status: {const: "captured"}, image: screenImageSchema},
+          required: ["status", "image"], additionalProperties: false,
+        },
+        {
+          type: "object",
+          properties: {
+            status: {type: "string", enum: ["failed", "cancelled"]},
+            reason: {type: "string", enum: ["screen_unavailable", "cancelled"]},
+          },
+          required: ["status", "reason"], additionalProperties: false,
+        },
+      ],
+    },
     value: {
       type: "object",
       properties: {
@@ -1369,8 +1392,8 @@ export class Apple2tsCore {
     }
   }
 
-  async captureScreen() {
-    const result = await this.request("/api/private/screen")
+  async captureScreen(signal) {
+    const result = await this.request("/api/private/screen", undefined, signal)
     return {
       emulator: result.emulator,
       image: {
@@ -1505,6 +1528,7 @@ export class Apple2tsCore {
 
   runInputSequence(input, signal) {
     if (signal?.aborted) return Promise.reject(signal.reason)
+    const {captureScreen, ...sequenceInput} = input
     return this.serializeMutation(async () => {
       if (signal?.aborted) {
         throw new ConfirmedMutationRejection(signal.reason ?? new Error("Input sequence cancelled"))
@@ -1524,7 +1548,7 @@ export class Apple2tsCore {
       try {
         const result = await this.request(
           "/api/private/input/conditional-sequence",
-          { method: "POST", body: input },
+          { method: "POST", body: sequenceInput },
           this.signal,
           input.timeoutMs + MUTATION_RESPONSE_MARGIN_MS,
         )
@@ -1533,8 +1557,11 @@ export class Apple2tsCore {
           if (cancellationResult.error) throw cancellationResult.error
           throw new ConfirmedMutationRejection(signal.reason ?? new Error("Input sequence cancelled"))
         }
-        const state = validateConditionalInputResult(result.state, input)
-        return {
+        const state = validateConditionalInputResult(result.state, sequenceInput)
+        // The worker is finished. Later cancellation must cancel only the read,
+        // not send another sequence cancellation or hide this terminal receipt.
+        signal?.removeEventListener("abort", onAbort)
+        const receipt = {
           emulator: result.emulator,
           value: {
             outcome: state.outcome,
@@ -1548,6 +1575,20 @@ export class Apple2tsCore {
             execution: state.status.machine.execution,
           },
         }
+        if (captureScreen) {
+          const captureSignal = signal ? AbortSignal.any([this.signal, signal]) : this.signal
+          try {
+            captureSignal.throwIfAborted()
+            const screen = await this.captureScreen(captureSignal)
+            receipt.capture = {status: "captured", image: screen.image}
+            receipt.dataBase64 = screen.dataBase64
+          } catch {
+            receipt.capture = captureSignal.aborted
+              ? {status: "cancelled", reason: "cancelled"}
+              : {status: "failed", reason: "screen_unavailable"}
+          }
+        }
+        return receipt
       } finally {
         signal?.removeEventListener("abort", onAbort)
       }
@@ -1914,6 +1955,13 @@ const mutationTools = [
     destructiveHint: false,
     idempotentHint: false,
     execute: (core, input, signal) => core.runInputSequence(input, signal),
+    formatResult: ({dataBase64, ...result}) => {
+      const response = toolResult(result)
+      if (dataBase64 !== undefined) response.content.unshift({
+        type: "image", data: dataBase64, mimeType: result.capture.image.mimeType,
+      })
+      return response
+    },
   },
   {
     name: "eject_disk",
@@ -2370,7 +2418,7 @@ export const createMcpServer = (session) => {
           openWorldHint: false,
         },
       },
-      async (input, context) => toolResult(
+      async (input, context) => (tool.formatResult ?? toolResult)(
         await tool.execute(core(), input, context.mcpReq.signal, session),
       ),
     )
