@@ -155,6 +155,15 @@ condition ends the sequence; completion, timeout, cancellation, or another
 execution stop pauses the emulator and returns the final execution state. Set
 `startExecution` to arm the sequence before resuming a paused emulator.
 
+Set `captureScreen: true` to return a rendered screen with the final execution
+receipt in the same call. The capture runs after the sequence receipt, before
+the next queued mutation, with a separate two-second read budget. It is not an
+exact cycle-aligned image. The optional `capture` field reports `captured`
+with image metadata, or `failed`/`cancelled` with a bounded reason; capture
+failure does not discard the sequence receipt. Image bytes appear once in MCP
+image content, not in structured content. Omitting the option leaves the
+existing response unchanged.
+
 Use `{all: [predicate, ...]}` to require up to eight non-nested predicates at
 the same instruction boundary. Each delivery reports `predicateMatchCycle`
 (`null` for an immediate phase), `matchedBytes` in predicate order, and

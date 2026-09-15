@@ -1947,6 +1947,78 @@ test("conditional input preserves its bounded worker receipt", async () => {
     cyclesElapsed: 20,
     execution: executionSnapshot(2, "paused", {pauseReason: "input-sequence"}),
   })
+  assert.deepEqual(await core.runInputSequence({...input, captureScreen: false}), result)
+})
+
+test("conditional final capture stays inside the mutation queue and preserves terminal outcomes", async () => {
+  for (const outcome of ["completed", "timeout", "unexpected_stop", "cancelled", "not_running", "input_busy", "condition_triggered"]) {
+    const core = new Apple2tsCore("http://unused.invalid", controllerToken, {})
+    const input = {phases: [{keys: "A"}], final: {address: 512, bytes: [1]}, timeoutMs: 100}
+    const state = conditionalResult(outcome)
+    if (outcome === "timeout") {
+      input.phases[0].when = input.final
+      state.timeout = {waitingFor: "condition", actualBytes: [[0]]}
+    }
+    if (outcome === "condition_triggered") {
+      input.stopConditions = [{name: "danger", when: input.final}]
+      state.stopConditionsArmed = 1
+      state.stopCondition = {name: "danger", matchedBytes: [[1]]}
+    }
+    let finishCapture
+    let captureStarted
+    const started = new Promise(resolve => {captureStarted = resolve})
+    core.request = async (pathname, options) => {
+      if (pathname.endsWith("conditional-sequence")) {
+        assert.deepEqual(options.body, input)
+        return {emulator: core.identity, state}
+      }
+      assert.equal(pathname, "/api/private/screen")
+      captureStarted()
+      await new Promise(resolve => {finishCapture = resolve})
+      return {emulator: core.identity, state: {mimeType: "image/png", width: 560, height: 384, dataBase64: "aW1hZ2U="}}
+    }
+    const operation = core.runInputSequence({...input, captureScreen: true})
+    await Promise.race([started, operation.then(() => {throw new Error("Capture did not start")})])
+    let nextRan = false
+    const next = core.serializeMutation(async () => {nextRan = true})
+    await Promise.resolve()
+    assert.equal(nextRan, false)
+    finishCapture()
+    const result = await operation
+    assert.equal(result.value.outcome, outcome)
+    assert.deepEqual(result.capture, {status: "captured", image: {mimeType: "image/png", width: 560, height: 384}})
+    assert.equal(result.dataBase64, "aW1hZ2U=")
+    await next
+    assert.equal(nextRan, true)
+  }
+})
+
+test("failed or cancelled final capture retains receipt and leaves mutations usable", async () => {
+  for (const cancelled of [false, true]) {
+    const core = new Apple2tsCore("http://unused.invalid", controllerToken, {})
+    const controller = new AbortController()
+    const paths = []
+    core.request = async (pathname, _options, signal) => {
+      paths.push(pathname)
+      if (pathname.endsWith("conditional-sequence")) return {emulator: core.identity, state: conditionalResult()}
+      if (cancelled) {
+        const aborted = new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), {once: true}))
+        controller.abort(new Error("private reason"))
+        return aborted
+      }
+      throw new Error("secret token or URL must not escape")
+    }
+    const result = await core.runInputSequence({
+      phases: [{keys: "A"}], final: {address: 512, bytes: [1]}, timeoutMs: 100, captureScreen: true,
+    }, controller.signal)
+    assert.equal(result.value.outcome, "completed")
+    assert.deepEqual(result.capture, cancelled
+      ? {status: "cancelled", reason: "cancelled"}
+      : {status: "failed", reason: "screen_unavailable"})
+    assert.equal(result.dataBase64, undefined)
+    assert.deepEqual(paths, ["/api/private/input/conditional-sequence", "/api/private/screen"])
+    assert.equal(await core.serializeMutation(async () => "usable"), "usable")
+  }
 })
 
 test("conditional evidence validates compound matches and timeout stages", () => {
@@ -2421,6 +2493,8 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   assert.equal(conditionalInputTool.inputSchema.properties.final.oneOf[1].properties.all.maxItems, 8)
   assert.equal(conditionalInputTool.outputSchema.properties.value.properties.keyDeliveries.maxItems, 16)
   assert.equal(conditionalInputTool.inputSchema.properties.startExecution.type, "boolean")
+  assert.equal(conditionalInputTool.inputSchema.properties.captureScreen.type, "boolean")
+  assert.match(conditionalInputTool.inputSchema.properties.captureScreen.description, /not an exact cycle-aligned image/)
   assert.equal(conditionalInputTool.inputSchema.properties.stopConditions.maxItems, 8)
   assert.ok(conditionalInputTool.outputSchema.properties.value.properties.outcome.enum.includes("condition_triggered"))
   assert.match(conditionalInputTool.description, /arm the sequence before resuming/)
@@ -2874,6 +2948,15 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   })
   assert.equal(conditional.value.outcome, "completed")
   assert.equal(conditional.value.execution.pauseReason, "input-sequence")
+  assert.equal(conditional.capture, undefined)
+  const capturedSequence = await requestTool("conditional-capture", "run_input_sequence", {
+    phases: [{keys: "A"}], final: {address: 0x0200, space: "main", bytes: [1]},
+    timeoutMs: 5000, captureScreen: true,
+  })
+  assert.equal(capturedSequence.result.structuredContent.capture.status, "captured")
+  assert.equal(capturedSequence.result.content.filter(item => item.type === "image").length, 1)
+  assert.equal(capturedSequence.result.structuredContent.dataBase64, undefined)
+  assert.deepEqual(JSON.parse(capturedSequence.result.content.find(item => item.type === "text").text), capturedSequence.result.structuredContent)
 
   assert.equal((await callTool(24, "set_keyboard_key", { key: "j" })).value.heldKey, "j")
   assert.equal((await callTool(25, "set_keyboard_key", { key: "j", repeat: true })).value.heldKey, "j")
@@ -3477,8 +3560,14 @@ test("real renderer exercises memory, execution, input, and session snapshots", 
     final: {address: 0x0202, space: "main", bytes: [3]},
     timeoutMs: 2000,
     startExecution: true,
+    captureScreen: true,
   })
   assert.equal(conditionalRun.result.structuredContent.value.outcome, "completed")
+  assert.equal(conditionalRun.result.structuredContent.value.execution.state, "paused")
+  assert.equal(conditionalRun.result.structuredContent.capture.status, "captured")
+  assert.equal(conditionalRun.result.structuredContent.capture.image.mimeType, "image/png")
+  assert.equal(conditionalRun.result.structuredContent.dataBase64, undefined)
+  assert.equal(conditionalRun.result.content.filter(item => item.type === "image").length, 1)
   const deliveries = conditionalRun.result.structuredContent.value.keyDeliveries
   assert.deepEqual(deliveries.map(d => d.matchedBytes), [[[1]], [[2], [0xC1]]])
   for (const delivery of deliveries) {
@@ -3564,6 +3653,16 @@ test("stdio rejects an invalid rendered screen", async (t) => {
   )
   assert.equal(response.result.isError, true)
   assert.match(response.result.content[0].text, /Rendered screen was not available/)
+  const sequence = await sendMcpRequest(processState, "invalid-final-screen", "tools/call", {
+    name: "run_input_sequence",
+    arguments: {phases: [{keys: "A"}], final: {address: 512, bytes: [1]}, timeoutMs: 100, captureScreen: true},
+  })
+  assert.equal(sequence.result.isError, undefined)
+  assert.equal(sequence.result.structuredContent.value.outcome, "completed")
+  assert.deepEqual(sequence.result.structuredContent.capture, {status: "failed", reason: "screen_unavailable"})
+  assert.equal(sequence.result.content.some(item => item.type === "image"), false)
+  const pause = await sendMcpRequest(processState, "after-invalid-final-screen", "tools/call", {name: "pause", arguments: {}})
+  assert.equal(pause.result.isError, undefined)
 
   processState.child.stdin.end()
   assert.equal((await processState.waitForExit()).code, 0)
