@@ -147,6 +147,19 @@ caller-owned debugger entries remain unchanged, and session shutdown removes
 the baseline. Large hard-drive bytes are retained from the current mounted
 media rather than copied into the snapshot.
 
+`compare_session_memory` compares a paused physical RAM range with that saved
+baseline without restoring it. Supply `snapshotId`, `address`, and `length`;
+`space` defaults to `main`, or use `aux` with an optional `auxBank`. The range
+must fit within `$0000-$BFFF`. An omitted auxiliary bank selects the current
+bank for both ends of the comparison. The result contains ascending
+`{address, before, after}` differences, `totalChangeCount`, and `truncated`.
+`maxChanges` defaults to 32 and can be 1-64. `currentMapping` describes current
+soft switches, not historical CPU mapping. These differences are not a history
+of writes; bytes changed and then restored do not appear. Saving another
+baseline invalidates the old ID. Active CPU mapping, I/O, another session's
+snapshot, and unavailable historical machine or auxiliary configurations are
+not supported.
+
 `run_input_sequence` keeps execution continuous while it waits for up to 16
 ordered memory conditions and sends each phase's discrete keys. A phase may
 omit `when` to send its keys immediately. Conditions compare 1-32 active,
