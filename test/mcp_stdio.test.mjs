@@ -669,6 +669,43 @@ test("private bridge creates and restores an identified session snapshot", async
   }
 })
 
+test("private bridge compares bounded session memory and rejects inconsistent evidence", async (t) => {
+  const listener = await startApple2tsServer({
+    port: 0,
+    privateRenderer: {remoteControlToken: token, rendererId, controllerToken},
+    logger: {log() {}},
+  })
+  t.after(stopApple2tsServer)
+  const renderer = await connectFakeRenderer(listener.url, {autoServe: false})
+  t.after(() => renderer.stop())
+  const snapshotId = "session-snapshot:123e4567-e89b-42d3-a456-426614174000"
+  const input = {snapshotId, address: 0x800, length: 2, maxChanges: 1}
+  const post = (body, credential = controllerToken) => fetch(new URL("/api/private/session-snapshot/compare-memory", listener.url), {
+    method: "POST", headers: {Authorization: `Bearer ${credential}`, "Content-Type": "application/json"},
+    body: JSON.stringify(body),
+  })
+  assert.equal((await post(input, "wrong-token")).status, 401)
+  assert.equal((await post({...input, space: "active"})).status, 400)
+  for (const invalid of [false, true]) {
+    const response = post(input)
+    const command = await renderer.nextCommand()
+    assert.equal(command.action, "compareSessionMemory")
+    assert.deepEqual(command.payload, {...input, space: "main"})
+    await renderer.reply(command, {result: {
+      snapshotId, address: 0x800, length: 2, requestedSpace: "main",
+      requestedAuxBank: null, effectiveAuxBank: null,
+      effectiveSegments: [{address: 0x800, length: 2, space: "main"}],
+      baselineCycleCount: 10, currentCycleCount: 12,
+      currentMapping: {RAMRD: false, RAMWRT: false, ALTZP: false, "80STORE": false, PAGE2: false, HIRES: false},
+      changes: [{address: 0x800, before: 0x11, after: 0xAA}],
+      totalChangeCount: 2, truncated: !invalid,
+    }})
+    const result = await response
+    assert.equal(result.status, invalid ? 400 : 200)
+    if (!invalid) assert.equal((await result.json()).data.totalChangeCount, 2)
+  }
+})
+
 test("private bridge rejects invalid and unavailable memory ranges", async (t) => {
   const listener = await startApple2tsServer({
     port: 0,
@@ -2458,6 +2495,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
       "start_session",
       "stop_session",
       "read_memory",
+      "compare_session_memory",
       "find_memory",
       "wait_for_execution_stop",
       "capture_screen",
@@ -2551,6 +2589,12 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
     "string",
   )
   assert.equal(restoreSnapshotTool.annotations.destructiveHint, true)
+  const comparisonTool = tools.result.tools.find((tool) => tool.name === "compare_session_memory")
+  assert.deepEqual(comparisonTool.annotations, readMemoryTool.annotations)
+  assert.deepEqual(comparisonTool.inputSchema.properties.space.enum, ["main", "aux"])
+  assert.equal(comparisonTool.inputSchema.properties.maxChanges.maximum, 64)
+  assert.equal(comparisonTool.outputSchema.properties.value.properties.changes.maxItems, 64)
+  assert.equal(comparisonTool.outputSchema.properties.value.properties.bytes, undefined)
   const findMemoryTool = tools.result.tools.find((tool) => tool.name === "find_memory")
   assert.deepEqual(findMemoryTool.inputSchema.properties.bytes, {
     type: "array",
@@ -3519,6 +3563,18 @@ test("real renderer exercises memory, execution, input, and session snapshots", 
     address: 0x0800,
     bytes: [0xAA, 0xBB],
   })
+  const beforeComparison = await readExecution("real-before-comparison")
+  const comparison = (await call("real-snapshot-compare", "compare_session_memory", {
+    snapshotId: saved.value.snapshotId, address: 0x0800, length: 2, maxChanges: 1,
+  })).result.structuredContent
+  assert.deepEqual(comparison.value.changes, [{address: 0x0800, before: 0x11, after: 0xAA}])
+  assert.equal(comparison.value.totalChangeCount, 2)
+  assert.equal(comparison.value.truncated, true)
+  assert.deepEqual(await readExecution("real-after-comparison"), beforeComparison)
+  const afterComparison = (await call("real-comparison-memory", "read_memory", {
+    address: 0x0800, length: 2, space: "main",
+  })).result.structuredContent
+  assert.deepEqual(afterComparison.value.bytes, [0xAA, 0xBB])
   const restored = (await call("real-snapshot-restore", "restore_session_snapshot", {
     snapshotId: saved.value.snapshotId,
   })).result.structuredContent
