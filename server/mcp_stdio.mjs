@@ -20,6 +20,7 @@ import {
 } from "./server.mjs"
 import { UploadTickets } from "./upload_tickets.mjs"
 import { validateConditionalInputResult } from "./input_sequence.mjs"
+import { readInstalledBuild } from "./runtime_provenance.mjs"
 
 const SERVER_NAME = "apple2ts"
 const SERVER_VERSION = "0.1.0"
@@ -2083,6 +2084,13 @@ export const createMcpServer = (session) => {
 
   const resources = [
     {
+      name: "session-info",
+      uri: "apple2ts://session/info",
+      title: "Apple2TS session information",
+      description: "MCP process, recorded installed-build provenance, and current owned session. Does not start a browser or attest running browser code.",
+      read: () => session.readInfo(),
+    },
+    {
       name: "session-lifecycle",
       uri: SESSION_LIFECYCLE_URI,
       title: "Apple2TS session lifecycle",
@@ -2514,6 +2522,12 @@ const launchChromium = async ({ executable, bridgeUrl, remoteControlToken, rende
 }
 
 export const runStdio = async (options = {}) => {
+  const processInfo = {
+    name: SERVER_NAME,
+    version: SERVER_VERSION,
+    pid: process.pid,
+    startedAt: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+  }
   const shutdownController = new AbortController()
   let stdioHandle = null
   let stopping = null
@@ -2539,6 +2553,27 @@ export const runStdio = async (options = {}) => {
     },
     readLifecycle() {
       return lifecycleState
+    },
+    async readInfo() {
+      // Resolve from this module, never argv or cwd. Recheck the selected browser
+      // path on each read; configuration or a mutable link is not provenance.
+      let installedBuild = null
+      try {
+        installedBuild = await readInstalledBuild(
+          fileURLToPath(import.meta.url), resolveBrowserBuildDir(options.distDir),
+        )
+      } catch { /* Invalid browser configuration leaves provenance unknown. */ }
+      return {
+        server: processInfo,
+        installedBuild,
+        session: {
+          state: stoppingSession ? "stopping" : startingSession ? "starting" : lifecycleState.state,
+          reason: lifecycleState.reason,
+          emulator: activeSession?.core.identity ?? null,
+          visibility: activeSession?.visibility ?? null,
+          startedAt: activeSession?.startedAt ?? null,
+        },
+      }
     },
     async reportRendererClosed(emulator, cleanup, eventFile, event, reason) {
       lifecycleState = {
@@ -2695,6 +2730,7 @@ export const runStdio = async (options = {}) => {
             sessionEventFile,
             uploadTickets,
             visibility: chromiumMode,
+            startedAt: new Date().toISOString(),
           }
           activeSession = created
           lifecycleState = {
