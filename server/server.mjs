@@ -5,6 +5,7 @@ import path from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 
 import { validateConditionalInputRequest, validateConditionalInputResult } from "./input_sequence.mjs"
+import { validateSessionMemoryRequest, validateSessionMemoryResult } from "./session_memory.mjs"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -1504,6 +1505,26 @@ const server = createServer(async (req, res) => {
             ? "Memory dump unavailable for the requested range. Pause the emulator first."
             : detail,
         )
+      }
+      return
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/private/session-snapshot/compare-memory") {
+      if (!privateRenderer) {
+        writeErrorEnvelope(res, 404, "NOT_FOUND", "Session memory comparison requires a private emulator session.")
+        return
+      }
+      const client = getConnectedClient()
+      if (!client) {
+        writeNoConnectedClientError(res)
+        return
+      }
+      try {
+        const request = validateSessionMemoryRequest(await readJsonBody(req))
+        const reply = await dispatchCommand(client, "compareSessionMemory", request, true)
+        writeEnvelope(res, 200, validateSessionMemoryResult(request, reply.result))
+      } catch (error) {
+        writeErrorEnvelope(res, 400, "BAD_REQUEST", error instanceof Error ? error.message : String(error))
       }
       return
     }

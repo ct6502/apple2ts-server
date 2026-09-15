@@ -20,6 +20,7 @@ import {
 } from "./server.mjs"
 import { UploadTickets } from "./upload_tickets.mjs"
 import { validateConditionalInputResult } from "./input_sequence.mjs"
+import { validateSessionMemoryRequest, validateSessionMemoryResult } from "./session_memory.mjs"
 
 const SERVER_NAME = "apple2ts"
 const SERVER_VERSION = "0.1.0"
@@ -546,6 +547,57 @@ const memoryReadOutputSchema = fromJsonSchema({
   },
   required: ["emulator", "value"],
   additionalProperties: false,
+})
+
+const sessionMemoryInputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    snapshotId: {type: "string"},
+    address: {type: "integer", minimum: 0, maximum: 49151},
+    length: {type: "integer", minimum: 1, maximum: 49152},
+    space: {type: "string", enum: ["main", "aux"], default: "main"},
+    auxBank: {type: "integer", minimum: 0, maximum: 127},
+    maxChanges: {type: "integer", minimum: 1, maximum: 64, default: 32},
+  },
+  required: ["snapshotId", "address", "length"],
+  additionalProperties: false,
+})
+
+const sessionMemoryOutputSchema = fromJsonSchema({
+  type: "object",
+  properties: {
+    emulator: emulatorIdentitySchema,
+    value: {
+      type: "object",
+      properties: {
+        snapshotId: {type: "string"},
+        address: {type: "integer", minimum: 0, maximum: 49151},
+        length: {type: "integer", minimum: 1, maximum: 49152},
+        requestedSpace: {type: "string", enum: ["main", "aux"]},
+        requestedAuxBank: {type: ["integer", "null"], minimum: 0, maximum: 127},
+        effectiveAuxBank: {type: ["integer", "null"], minimum: 0, maximum: 127},
+        effectiveSegments: {type: "array", minItems: 1, maxItems: 1, items: memorySegmentSchema(49152)},
+        baselineCycleCount: {type: "integer", minimum: 0},
+        currentCycleCount: {type: "integer", minimum: 0},
+        currentMapping: memoryMappingSchema,
+        changes: {type: "array", maxItems: 64, items: {
+          type: "object",
+          properties: {
+            address: {type: "integer", minimum: 0, maximum: 49151},
+            before: {type: "integer", minimum: 0, maximum: 255},
+            after: {type: "integer", minimum: 0, maximum: 255},
+          },
+          required: ["address", "before", "after"], additionalProperties: false,
+        }},
+        totalChangeCount: {type: "integer", minimum: 0, maximum: 49152},
+        truncated: {type: "boolean"},
+      },
+      required: ["snapshotId", "address", "length", "requestedSpace", "requestedAuxBank", "effectiveAuxBank",
+        "effectiveSegments", "baselineCycleCount", "currentCycleCount", "currentMapping", "changes", "totalChangeCount", "truncated"],
+      additionalProperties: false,
+    },
+  },
+  required: ["emulator", "value"], additionalProperties: false,
 })
 
 const memorySearchInputSchema = fromJsonSchema({
@@ -1340,6 +1392,20 @@ export class Apple2tsCore {
         signal,
       )
       return this.confirmSessionSnapshot(result, snapshotId)
+    }, signal, {prepare: true})
+  }
+
+  compareSessionMemory(input, signal) {
+    const request = validateSessionMemoryRequest(input)
+    // Reuse the existing queue without starting a mutation. Read failure or
+    // cancellation must not poison subsequent operations or release held keys.
+    return this.serializeMutation(async () => {
+      if (request.snapshotId !== this.sessionSnapshotId) throw new Error("Session snapshot not found")
+      const requestSignal = signal ? AbortSignal.any([this.signal, signal]) : this.signal
+      const result = await this.request("/api/private/session-snapshot/compare-memory", {
+        method: "POST", body: request,
+      }, requestSignal, READ_TIMEOUT_MS)
+      return {emulator: result.emulator, value: validateSessionMemoryResult(request, result.state)}
     }, signal, {prepare: true})
   }
 
@@ -2294,6 +2360,29 @@ export const createMcpServer = (session) => {
           isError: true,
           content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
         }
+      }
+    },
+  )
+
+  server.registerTool(
+    "compare_session_memory",
+    {
+      title: "Compare memory with the private session snapshot",
+      description: "Compare paused physical main or auxiliary RAM at $0000-$BFFF with save_session_snapshot. Returns ascending capped byte differences, not write history or full memory. Replacing the snapshot invalidates its old ID. Both ends use the same physical bank; an omitted auxiliary bank selects the current bank. currentMapping describes only current soft switches. Active CPU mapping and I/O are unsupported. Never pauses or restores the emulator.",
+      inputSchema: sessionMemoryInputSchema,
+      outputSchema: sessionMemoryOutputSchema,
+      annotations: {readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false},
+    },
+    async (input, context) => {
+      try {
+        const result = await core().compareSessionMemory(input, context.mcpReq.signal)
+        const {totalChangeCount, changes, truncated} = result.value
+        return {
+          content: [{type: "text", text: `${totalChangeCount} bytes differ from the session snapshot${truncated ? `; returned the first ${changes.length}` : ""}.`}],
+          structuredContent: result,
+        }
+      } catch (error) {
+        return {isError: true, content: [{type: "text", text: error instanceof Error ? error.message : String(error)}]}
       }
     },
   )
