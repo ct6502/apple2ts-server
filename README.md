@@ -96,6 +96,20 @@ host closes the stdio connection, the server stops any active browser and
 removes its private profile.
 Closing the owned visible window also ends that emulator session. A direct MCP
 consumer may then call `start_session` again.
+
+Read `apple2ts://session/info` to identify the MCP process and its current owned
+emulator without starting a browser. It reports the server name, package
+version, PID and process start time, plus the session state, identity,
+visibility and ready time. Inactive sessions have no current emulator identity.
+`installedBuild` contains the installer's recorded build ID and paired source
+commits only when the resolved server and browser directory belong to that
+installation. Otherwise it is `null`, including for development checkouts or
+missing or malformed manifests. This is recorded provenance, not file-integrity
+verification or evidence of which code the browser is executing; the response
+marks it `source: "installer-manifest"` and `contentVerified: false`.
+The resource exposes no session credentials, private paths, or environment.
+Use `apple2ts://session/lifecycle` for cleanup results and notifications.
+
 Consumers can subscribe to `apple2ts://session/lifecycle`, then await its
 `notifications/resources/updated` notification instead of polling emulator
 state. The server sends this notification only after the renderer has failed

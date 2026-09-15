@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
-import { access, chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, truncate, writeFile } from "node:fs/promises"
+import { access, chmod, cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, truncate, writeFile } from "node:fs/promises"
 import { createServer } from "node:http"
 import os from "node:os"
 import path from "node:path"
@@ -2289,6 +2289,111 @@ test("execution state rejects inconsistent expectations and ignores stale observ
   assert.equal((await core.waitForExecutionStop({ timeoutMs: 10 })).outcome, "session_closed")
 })
 
+test("session information is discoverable and read-only before, during, and after a session", async (t) => {
+  const processState = await launchMcp()
+  t.after(processState.cleanup)
+  await initializeMcp(processState, "info-initialize")
+  const listed = await sendMcpRequest(processState, "info-list", "resources/list", {})
+  assert.ok(listed.result.resources.some(({ uri }) => uri === "apple2ts://session/info"))
+  const readInfo = async (id) => {
+    const response = await sendMcpRequest(processState, id, "resources/read", {
+      uri: "apple2ts://session/info",
+    })
+    assert.equal(response.result.contents[0].mimeType, "application/json")
+    const text = response.result.contents[0].text
+    for (const secret of [token, controllerToken, repoRoot, processState.receiptPath,
+      "remoteControlToken", "controllerToken", "profilePath", "process.env"]) {
+      assert.equal(text.includes(secret), false, secret)
+    }
+    return JSON.parse(text)
+  }
+  const idle = await readInfo("info-idle")
+  assert.deepEqual(idle.session, {
+    state: "idle", reason: null, emulator: null, visibility: null, startedAt: null,
+  })
+  assert.deepEqual(idle.server, {
+    name: "apple2ts", version: "0.1.0", pid: processState.child.pid,
+    startedAt: idle.server.startedAt,
+  })
+  assert.ok(Number.isFinite(Date.parse(idle.server.startedAt)))
+  assert.equal(idle.installedBuild, null)
+  await assert.rejects(access(processState.receiptPath), { code: "ENOENT" })
+  assert.equal(processState.getStderr().includes("private bridge listening"), false)
+
+  const started = await startMcpSession(processState, "info-start")
+  const active = await readInfo("info-active")
+  assert.deepEqual(active.server, idle.server)
+  assert.equal(active.session.state, "active")
+  assert.equal(active.session.visibility, "headless")
+  assert.deepEqual(active.session.emulator, started.result.structuredContent.emulator)
+  assert.ok(Date.parse(active.session.startedAt) >= Date.parse(idle.server.startedAt))
+  assert.deepEqual(await readInfo("info-repeat"), active)
+
+  const stopped = await sendMcpRequest(processState, "info-stop", "tools/call", {
+    name: "stop_session", arguments: {},
+  })
+  assert.equal(stopped.result.isError, undefined)
+  const after = await readInfo("info-stopped")
+  assert.deepEqual(after.server, idle.server)
+  assert.deepEqual(after.session, { ...idle.session, reason: "stopped" })
+  assert.equal(after.installedBuild, null)
+  const restarted = await startMcpSession(processState, "info-restart")
+  const second = await readInfo("info-second")
+  assert.deepEqual(second.server, idle.server)
+  assert.deepEqual(second.session.emulator, restarted.result.structuredContent.emulator)
+  assert.notEqual(second.session.emulator.targetId, active.session.emulator.targetId)
+})
+
+test("session information tolerates invalid browser configuration without launching", async (t) => {
+  const processState = await launchMcp({ APPLE2TS_DIST_DIR: "relative-invalid-path" })
+  t.after(processState.cleanup)
+  await initializeMcp(processState, "invalid-info-initialize")
+  const response = await sendMcpRequest(processState, "invalid-info-read", "resources/read", {
+    uri: "apple2ts://session/info",
+  })
+  const info = JSON.parse(response.result.contents[0].text)
+  assert.equal(info.installedBuild, null)
+  assert.equal(info.session.state, "idle")
+  await assert.rejects(access(processState.receiptPath), { code: "ENOENT" })
+})
+
+test("session information exposes only recorded provenance from its own installed pair", async (t) => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "apple2ts-info-runtime-")))
+  let processState
+  t.after(async () => {
+    await processState?.cleanup()
+    await rm(root, { recursive: true, force: true })
+  })
+  const build = path.join(root, "builds", "info-test")
+  await mkdir(path.join(build, "browser"), { recursive: true })
+  await cp(path.join(repoRoot, "server"), path.join(build, "server", "server"), { recursive: true })
+  await symlink(path.join(repoRoot, "node_modules"), path.join(build, "server", "node_modules"))
+  const manifest = {
+    format: 1, id: "info-test", serverCommit: "a".repeat(40), browserCommit: "b".repeat(40),
+    files: [{ path: "/private/path-must-not-leak" }], controllerToken: "secret-must-not-leak",
+  }
+  await writeFile(path.join(build, "manifest.json"), JSON.stringify(manifest))
+  processState = await launchMcp({ APPLE2TS_DIST_DIR: path.join(build, "browser") },
+    path.join(build, "server", "server", "mcp_stdio.mjs"))
+  await initializeMcp(processState, "installed-info-initialize")
+  const readInfo = async (id) => {
+    const response = await sendMcpRequest(processState, id, "resources/read", {
+      uri: "apple2ts://session/info",
+    })
+    return JSON.parse(response.result.contents[0].text)
+  }
+  const info = await readInfo("installed-info-known")
+  assert.deepEqual(info.installedBuild, {
+    source: "installer-manifest", id: manifest.id, serverCommit: manifest.serverCommit,
+    browserCommit: manifest.browserCommit, contentVerified: false,
+  })
+  assert.equal(info.session.emulator, null)
+  assert.equal(JSON.stringify(info).includes(root), false)
+  await assert.rejects(access(processState.receiptPath), { code: "ENOENT" })
+  await writeFile(path.join(build, "manifest.json"), "malformed")
+  assert.equal((await readInfo("installed-info-malformed")).installedBuild, null)
+})
+
 test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   const processState = await launchMcp()
   t.after(processState.cleanup)
@@ -2323,6 +2428,7 @@ test("stdio reads and controls one renderer and EOF cleans up", async (t) => {
   processState.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/list" })}\n`)
   const listed = JSON.parse(await processState.waitForStdout((line) => JSON.parse(line).id === 2))
   assert.deepEqual(listed.result.resources.map((resource) => resource.uri), [
+    "apple2ts://session/info",
     "apple2ts://session/lifecycle",
     "apple2ts://machine",
     "apple2ts://session/execution",
