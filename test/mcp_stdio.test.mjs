@@ -4242,7 +4242,80 @@ test("closing a visible renderer during startup releases its private resources",
   assert.equal(outcome.code, 0, interrupted.getStderr())
 })
 
-test("renderer disconnect reports a startup cleanup failure", async (t) => {
+test("a failed browser spawn does not leave a permanent cleanup obligation", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "apple2ts-spawn-retry-"))
+  t.after(() => rm(root, {recursive: true, force: true}))
+  const executable = path.join(root, "browser.mjs")
+  await writeFile(executable, "#!/nonexistent/apple2ts-test-interpreter\n", {mode: 0o700})
+  const running = await launchMcp({APPLE2TS_CHROMIUM_EXECUTABLE: executable})
+  t.after(running.cleanup)
+  await running.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(running, "spawn-retry-initialize")
+  const started = await startMcpSession(running, "spawn-retry-failure")
+  assert.equal(started.result.isError, true)
+  assert.match(started.result.content[0].text, /ENOENT/)
+  const stopped = await sendMcpRequest(running, "spawn-retry-stop", "tools/call", {
+    name: "stop_session", arguments: {},
+  })
+  assert.deepEqual(stopped.result.structuredContent, {stopped: false})
+  await writeFile(executable, `#!${process.execPath}\nimport ${JSON.stringify(fakeChromium)}\n`)
+  assert.equal((await startMcpSession(running, "spawn-retry-success")).result.isError, undefined)
+  const receipt = await running.readReceipt()
+  running.child.stdin.end()
+  assert.equal((await running.waitForExit()).code, 0, running.getStderr())
+  await waitForAbsent(receipt.profilePath)
+  await assertClosed(new URL(receipt.launchUrl).origin)
+})
+
+test("failed session cleanup can be retried before starting another emulator", async (t) => {
+  const running = await launchMcp()
+  t.after(running.cleanup)
+  await running.waitForStderr((line) => line.includes("MCP ready"))
+  await initializeMcp(running, "cleanup-retry-initialize")
+  const started = await startMcpSession(running, "cleanup-retry-start")
+  assert.equal(started.result.isError, undefined, JSON.stringify(started))
+  const receipt = await running.readReceipt()
+  const bridgeUrl = new URL(receipt.launchUrl).origin
+  t.after(async () => {
+    await chmod(receipt.profilePath, 0o700).catch(() => {})
+    await rm(receipt.profilePath, {recursive: true, force: true})
+  })
+  await writeFile(path.join(receipt.profilePath, "retained"), "owned test profile")
+  await chmod(receipt.profilePath, 0o000)
+  const call = (id, name) => sendMcpRequest(running, id, "tools/call", {name, arguments: {}})
+  const stopped = await call("cleanup-retry-stop", "stop_session")
+  assert.equal(stopped.result.isError, true)
+  await assertClosed(bridgeUrl)
+  assert.throws(() => process.kill(receipt.pid, 0), {code: "ESRCH"})
+  await access(receipt.profilePath)
+  const blocked = await call("cleanup-retry-blocked", "start_session")
+  assert.equal(blocked.result.isError, true)
+  assert.match(blocked.result.content[0].text, /cleanup.*stop_session/i)
+  assert.equal((await running.readReceipt()).pid, receipt.pid)
+  assert.equal((await call("cleanup-retry-no-control", "pause")).result.isError, true)
+  const lifecycle = await sendMcpRequest(running, "cleanup-retry-state", "resources/read", {
+    uri: "apple2ts://session/lifecycle",
+  })
+  const state = JSON.parse(lifecycle.result.contents[0].text)
+  assert.equal(state.cleanup, "failed")
+  assert.deepEqual(state.emulator, started.result.structuredContent.emulator)
+  // A retry must keep reporting the failure until the resource is removable.
+  assert.equal((await call("cleanup-retry-still-failed", "stop_session")).result.isError, true)
+  await chmod(receipt.profilePath, 0o700)
+  assert.deepEqual((await call("cleanup-retry-fixed", "stop_session")).result.structuredContent, {stopped: true})
+  await waitForAbsent(receipt.profilePath)
+  assert.deepEqual((await call("cleanup-retry-idempotent", "stop_session")).result.structuredContent, {stopped: false})
+  const restarted = await call("cleanup-retry-restart", "start_session")
+  assert.equal(restarted.result.isError, undefined)
+  assert.notDeepEqual(restarted.result.structuredContent.emulator, started.result.structuredContent.emulator)
+  const secondReceipt = await running.readReceipt()
+  running.child.stdin.end()
+  assert.equal((await running.waitForExit()).code, 0, running.getStderr())
+  await waitForAbsent(secondReceipt.profilePath)
+  await assertClosed(new URL(secondReceipt.launchUrl).origin)
+})
+
+test("renderer startup cleanup failure is retained for retry on EOF", async (t) => {
   const interrupted = await launchMcp({
     APPLE2TS_CHROMIUM_MODE: "visible",
     APPLE2TS_FAKE_CHROMIUM_MODE: "disconnect-before-ready-cleanup-failure",
@@ -4268,11 +4341,15 @@ test("renderer disconnect reports a startup cleanup failure", async (t) => {
   await assertClosed(bridgeUrl)
   assert.throws(() => process.kill(receipt.pid, 0), { code: "ESRCH" })
   await access(receipt.profilePath)
-  await removeRetainedProfile()
+  const blocked = await startMcpSession(interrupted, "startup-cleanup-blocked")
+  assert.equal(blocked.result.isError, true)
+  assert.match(blocked.result.content[0].text, /cleanup.*stop_session/i)
+  await chmod(receipt.profilePath, 0o700)
 
   interrupted.child.stdin.end()
   const outcome = await interrupted.waitForExit()
   assert.equal(outcome.code, 0, interrupted.getStderr())
+  await waitForAbsent(receipt.profilePath)
 })
 
 test("invalid Chromium mode fails session start before launch", async (t) => {

@@ -2608,7 +2608,6 @@ const launchChromium = async ({ executable, bridgeUrl, remoteControlToken, rende
     exited,
     async stop() {
       if (stopped) return
-      stopped = true
       let failure = null
       let exitConfirmed = exitOutcome !== null
       try {
@@ -2628,10 +2627,9 @@ const launchChromium = async ({ executable, bridgeUrl, remoteControlToken, rende
             }
           }
         }
-        if (exitConfirmed) {
-          const outcome = exitOutcome || await exited
-          if (outcome.error && !failure) failure = outcome.error
-        } else {
+        // Startup reports spawn errors. A confirmed close leaves only profile
+        // removal to finish, not a launch error to replay on every cleanup retry.
+        if (!exitConfirmed) {
           child.stderr.destroy()
           child.unref()
         }
@@ -2645,6 +2643,7 @@ const launchChromium = async ({ executable, bridgeUrl, remoteControlToken, rende
         }
       }
       if (failure) throw failure
+      stopped = true
     },
     describeExit(outcome) {
       const detail = outcome.error
@@ -2669,6 +2668,7 @@ export const runStdio = async (options = {}) => {
   let stdioHandle = null
   let stopping = null
   let activeSession = null
+  let pendingCleanup = null
   let startingSession = null
   let startingSessionVisibility = null
   let stoppingSession = null
@@ -2755,6 +2755,9 @@ export const runStdio = async (options = {}) => {
       throwIfShuttingDown()
       if (stoppingSession) await stoppingSession
       throwIfShuttingDown()
+      if (pendingCleanup) {
+        throw new Error("Previous session cleanup failed; call stop_session to retry before start_session")
+      }
       if (activeSession) {
         if (visibility !== undefined && activeSession.visibility !== chromiumMode) {
           throw new Error(
@@ -2915,6 +2918,14 @@ export const runStdio = async (options = {}) => {
             ).catch((failure) => cleanupFailures.push(failure))
           }
           if (cleanupFailures.length) {
+            pendingCleanup = {core, renderer}
+            lifecycleState = {
+              ...lifecycleState,
+              state: "closed",
+              reason: "cleanup_failed",
+              cleanup: "failed",
+              emulator: core?.identity ?? null,
+            }
             const details = cleanupFailures
               .map((failure) => failure instanceof Error ? failure.message : String(failure))
               .join("; ")
@@ -2939,16 +2950,22 @@ export const runStdio = async (options = {}) => {
       if (stoppingSession) return stoppingSession
       stoppingSession = (async () => {
         if (startingSession) await startingSession.catch(() => {})
-        if (!activeSession) return { stopped: false }
-        const current = activeSession
+        const current = activeSession ?? pendingCleanup
+        if (!current) return { stopped: false }
         const failures = []
-        current.core.closeExecution()
-        current.controller.abort(new Error(reason))
-        current.uploadTickets.close()
-        await current.core.neutralizeKeyboard().catch((error) => failures.push(error))
-        await current.renderer.stop().catch((error) => failures.push(error))
+        if (activeSession) {
+          pendingCleanup = current
+          activeSession = null
+          current.core.closeExecution()
+          current.controller.abort(new Error(reason))
+          current.uploadTickets.close()
+          await current.core.neutralizeKeyboard().catch((error) => failures.push(error))
+        }
+        // Retain ownership until browser/profile and listener cleanup succeed.
+        // Input release is attempted before teardown, not retried against a dead bridge.
+        await current.renderer?.stop().catch((error) => failures.push(error))
         await stopApple2tsServer().catch((error) => failures.push(error))
-        if (activeSession === current) activeSession = null
+        if (!failures.length) pendingCleanup = null
         if (rendererClosedEmulator) {
           await session.reportRendererClosed(
             rendererClosedEmulator,
@@ -2960,10 +2977,10 @@ export const runStdio = async (options = {}) => {
         } else {
           lifecycleState = {
             ...lifecycleState,
-            state: "idle",
-            reason: "stopped",
+            state: failures.length ? "closed" : "idle",
+            reason: failures.length ? "cleanup_failed" : "stopped",
             cleanup: failures.length ? "failed" : "complete",
-            emulator: null,
+            emulator: failures.length ? current.core?.identity ?? null : null,
           }
         }
         if (failures.length) throw new AggregateError(failures, "Apple2TS MCP session cleanup failed")

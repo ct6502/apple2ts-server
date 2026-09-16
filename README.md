@@ -109,6 +109,9 @@ verification or evidence of which code the browser is executing; the response
 marks it `source: "installer-manifest"` and `contentVerified: false`.
 The resource exposes no session credentials, private paths, or environment.
 Use `apple2ts://session/lifecycle` for cleanup results and notifications.
+If cleanup fails, the server retains the unfinished cleanup and refuses a new
+session. Correct the underlying problem, then call `stop_session` to retry.
+Closing stdin also retries retained cleanup before the MCP process exits.
 
 Consumers can subscribe to `apple2ts://session/lifecycle`, then await its
 `notifications/resources/updated` notification instead of polling emulator
