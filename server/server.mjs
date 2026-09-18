@@ -2250,10 +2250,12 @@ const server = createServer(async (req, res) => {
 
     await serveStaticFile(res, url.pathname)
   } catch (error) {
-    writeJson(res, 500, {
-      error: "Internal server error",
-      details: error instanceof Error ? error.message : String(error),
-    })
+    writeErrorEnvelope(
+      res,
+      500,
+      "INTERNAL_ERROR",
+      error instanceof Error ? error.message : String(error),
+    )
   }
 })
 
